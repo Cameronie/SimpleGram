@@ -685,7 +685,7 @@ test('search: Posts & Reels shows a grid; opening one and coming back restores s
   await page.waitForURL(/\/p\/KEYW001\/$/);
   assert.equal(await searchText(page), null);
   // The test page cannot render posts, so the app falls back to a full load; Back returns to search.
-  await page.waitForTimeout(1800);
+  await page.waitForTimeout(2600);
   await page.goBack();
   await page.waitForFunction(() => { const h = document.getElementById('sg-search'); return h && h.style.display !== 'none' && h.shadowRoot.querySelectorAll('.cell').length === 2; });
 });
@@ -727,7 +727,7 @@ test('search: when the old endpoints fail, the website\'s current requests are u
   await page.keyboard.type('oracle');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('SF Giants'));
   await shadowClick(page, 'Places');
-  assert.ok((await searchText(page)).includes('Oracle Park'));
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('Oracle Park'));
   await shadowClick(page, 'Posts & Reels');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
   const badge = await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell .badge').length);
@@ -738,4 +738,81 @@ test('search: place links use Instagram\'s own slug rule', async () => {
   const page = await open('https://www.instagram.com/', BLANK);
   const out = await page.evaluate(() => window.__sg.search && true);
   assert.equal(out, true);
+});
+
+test('feed: the no-repeats list is used once; reloading Following shows everything', async () => {
+  const page = await open('https://www.instagram.com/', BLANK);
+  await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([edge({ media: media('SEEN001', user('a', true)) })]));
+  await Promise.all([page.waitForURL(/variant=following/), page.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' }))]);
+  const first = await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([edge({ media: media('SEEN001', user('a', true)) }), edge({ media: media('NEW0001', user('b', true)) })]));
+  assert.deepEqual(codes(first), ['NEW0001']);
+  await page.reload();
+  const again = await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([edge({ media: media('SEEN001', user('a', true)) }), edge({ media: media('NEW0001', user('b', true)) })]));
+  assert.deepEqual(codes(again), ['SEEN001', 'NEW0001']);
+});
+
+test('feed: no end-of-Home card on a page without a feed (e.g. the login screen)', async () => {
+  const page = await open('https://www.instagram.com/', '<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body><form><input name="username"></form></body></html>');
+  await page.waitForTimeout(6500);
+  assert.equal((await sent(page, 'feedEnd')).filter(m => m.on).length, 0);
+});
+
+test('search: typing on Posts & Reels, then switching to Accounts, loads accounts (no endless spinner)', async () => {
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
+  await openSearchTab(page);
+  await shadowClick(page, 'Posts & Reels');
+  await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelector('input').focus());
+  await page.keyboard.type('sharks');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
+  await shadowClick(page, 'Accounts');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
+});
+
+test('search: a pause in typing asks Instagram once, not a chain of requests', async () => {
+  let calls = 0;
+  const api = Object.assign({}, SEARCH_API, { '/web/search/topsearch/': () => { calls++; return { body: SEARCH_API['/web/search/topsearch/'] }; } });
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api });
+  await openSearchTab(page);
+  for (const ch of 'sha') { await page.keyboard.type(ch); await page.waitForTimeout(600); }
+  await page.waitForTimeout(500);
+  assert.ok(calls <= 3, 'calls: ' + calls);
+  // Coming back to an earlier query uses the answer already received.
+  await page.keyboard.press('Backspace');
+  await page.waitForTimeout(700);
+  assert.ok(calls <= 3, 'calls after backspace: ' + calls);
+});
+
+test('search: after opening a result, going Home later does not reopen search', async () => {
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
+  await openSearchTab(page);
+  await page.keyboard.type('sharks');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
+  await shadowClick(page, 'sanjosesharks');
+  await page.waitForURL(/\/sanjosesharks\/$/);
+  // Instagram's own Home tab (an in-app navigation), not Back:
+  await page.evaluate(() => history.pushState({}, '', '/'));
+  await page.waitForTimeout(300);
+  assert.equal(await searchText(page), null);
+});
+
+test('search: a video playing underneath is paused while search is open', async () => {
+  const html = NAVPAGE.replace('<main>home</main>', '<main><video id="v" muted loop playsinline style="width:300px;height:200px"></video></main>');
+  const page = await open('https://www.instagram.com/', html, { api: SEARCH_API });
+  await page.evaluate(() => { const v = document.getElementById('v'); Object.defineProperty(v, 'paused', { configurable: true, get() { return !!this.__p; } }); v.__p = false; v.pause = function () { this.__p = true; }; v.play = function () { this.__p = false; return Promise.resolve(); }; });
+  await openSearchTab(page);
+  assert.equal(await page.evaluate(() => document.getElementById('v').paused), true);
+  await page.evaluate(() => window.__sg.back());
+  assert.equal(await page.evaluate(() => document.getElementById('v').paused), false);
+});
+
+test('autoplay: a carousel\'s next slide waiting off to the side is not started', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0;overflow-x:hidden">
+    <div style="position:relative;width:412px;height:732px;overflow:hidden"><div style="display:flex;width:824px">
+      <img src="https://scontent.cdninstagram.com/a.jpg" style="width:412px;height:732px">
+      <div style="position:relative"><video id="v" playsinline style="width:412px;height:732px"></video><svg aria-label="Play" width="40" height="40"></svg></div>
+    </div></div><script>window.__plays=0;document.querySelector('svg').addEventListener('click',()=>{window.__plays++;});</script></body></html>`;
+  const page = await open('https://www.instagram.com/p/ABCDEFG/', html);
+  await page.evaluate(() => document.getElementById('v').dispatchEvent(new Event('loadedmetadata')));
+  await page.waitForTimeout(700);
+  assert.equal(await page.evaluate(() => window.__plays), 0);
 });

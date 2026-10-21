@@ -185,6 +185,7 @@
   const SEARCH_KEY = /fbsearch|top_serp|keyword_search|^media_grid$|serp_/i;
   const AD_LIST_KEY = /^(edges|items|feed_items|reels_media|reels|medias|media|stories|clips|tray|story_items|fill_items)$/;
   let streamed = false;
+  let ownFetch = false;     // SimpleGram's own search requests
 
   function nonEmptyId(v) {
     return v != null && v !== '' && v !== 0 && v !== '0' && v !== false;
@@ -288,7 +289,14 @@
   }
   SG.feedVerdict = feedVerdict;
 
-  const feedState = { emptyStreak: 0, seenStreak: 0, ended: false, caughtUp: false };
+  let feedState = null;
+  function currentFeed() {
+    const key = location.pathname + '|' + feedVariant();
+    if (!feedState || feedState.key !== key) {
+      feedState = { key: key, emptyStreak: 0, seenStreak: 0, ended: false, caughtUp: false, homePages: 0 };
+    }
+    return feedState;
+  }
 
   // Which home feed is showing: home (Instagram's picks), following or favorites.
   function feedVariant() {
@@ -299,15 +307,18 @@
   // continue from the end of Home.
   const homeSeen = new Set();
   const SKIP_KEY = 'sg_skip_seen';
+  // Used once, by the page the end-of-Home buttons open, then forgotten:
+  // opening Following or Favorites any other way shows everything.
   let skip = null;
   try {
     const saved = JSON.parse(sessionStorage.getItem(SKIP_KEY) || 'null');
-    if (saved && saved.variant && Array.isArray(saved.codes) && Date.now() - saved.at < 6 * 3600 * 1000) {
-      skip = { variant: saved.variant, codes: new Set(saved.codes) };
+    sessionStorage.removeItem(SKIP_KEY);
+    if (saved && saved.variant === feedVariant() && Array.isArray(saved.codes) && Date.now() - saved.at < 60 * 1000) {
+      skip = { variant: saved.variant, path: location.pathname + location.search, codes: new Set(saved.codes) };
     }
   } catch (e) { /* storage unavailable */ }
   function skipping() {
-    return skip && route() === 'home' && feedVariant() === skip.variant ? skip.codes : null;
+    return skip && location.pathname + location.search === skip.path ? skip.codes : null;
   }
   function continueFeed(variant) {
     try {
@@ -347,6 +358,7 @@
     }
     const seenCodes = skipping();
     const onHome = route() === 'home' && feedVariant() === 'home';
+    const fs = currentFeed();
     const kept = [];
     let keptMedia = 0, alreadySeen = 0;
     verdicts.forEach((x, i) => {
@@ -361,8 +373,9 @@
           if (onHome && code) { homeSeen.add(code); if (homeSeen.size > 4000) homeSeen.delete(homeSeen.values().next().value); }
         }
       }
-      if (!x.drop && list[i] && (list[i].node || list[i]).end_of_feed_demarcator) feedState.caughtUp = true;
+      if (!x.drop && list[i] && (list[i].node || list[i]).end_of_feed_demarcator) fs.caughtUp = true;
     });
+    if (onHome && keptMedia > 0) fs.homePages++;
     stats.feed.kept += keptMedia;
     stats.feed.lastPageKept = keptMedia;
     if (kept.length !== list.length) list.splice(0, list.length, ...kept);
@@ -370,18 +383,18 @@
     if (keptMedia === 0 && more) {
       if (alreadySeen > 0) {
         // Paging past posts you already saw in Home: keep going (a while).
-        if (++feedState.seenStreak >= 40) { stopPagination(owner); feedState.ended = true; }
-      } else if (++feedState.emptyStreak >= 4) {
-        stopPagination(owner); stats.feed.stopped++; feedState.ended = true;
+        if (++fs.seenStreak >= 40) { stopPagination(owner); fs.ended = true; }
+      } else if (++fs.emptyStreak >= 4) {
+        stopPagination(owner); stats.feed.stopped++; fs.ended = true;
       }
-      if (more && !feedState.ended) scheduleNudge(true);
+      if (!fs.ended) scheduleNudge(true);
     } else if (keptMedia > 0) {
-      feedState.emptyStreak = 0;
-      feedState.seenStreak = 0;
+      fs.emptyStreak = 0;
+      fs.seenStreak = 0;
       // Only a post or two came through: ask for the next batch early.
       if (keptMedia <= 2 && more) scheduleNudge(false);
     }
-    if (!more) feedState.ended = true;
+    if (!more) fs.ended = true;
     setTimeout(safe(checkFeedEnd), 300);
   }
   function edgeCode(e) {
@@ -449,10 +462,10 @@
       else if (k === 'feed_items' && Array.isArray(v)) filterFeedList(o, v);
       else if (CHAINING_KEY.test(k)) trimChaining(v);
       else if (EXPLORE_KEY.test(k)) blankLists(v, 'exploreBlanked');
-      else if (k === 'sectional_items' && Array.isArray(v) && route() !== 'search') { blankLists(v, 'exploreBlanked'); stopPagination(o); }
+      else if (k === 'sectional_items' && Array.isArray(v) && route() !== 'search' && !ownFetch) { blankLists(v, 'exploreBlanked'); stopPagination(o); }
       else if (SUGGEST_KEY.test(k)) blankLists(v, 'suggestionsBlanked');
       else if (AD_CONTAINER_KEY.test(k)) blankLists(v, 'ads');
-      else if (SEARCH_KEY.test(k) && route() === 'search') limitSearch(v);
+      else if (SEARCH_KEY.test(k) && route() === 'search' && !ownFetch) limitSearch(v);
       if (Array.isArray(v) && v.length && AD_LIST_KEY.test(k)) dropAds(v);
     }
     if (looksLikeMedia(o)) indexMedia(o);
@@ -466,7 +479,7 @@
     stats.payloads++;
     searchCounted = false;
     streamed = root.hasNext === true || !!(root.extensions && root.extensions.is_final === false);
-    if (Array.isArray(root.sectional_items) && route() !== 'search') {
+    if (Array.isArray(root.sectional_items) && route() !== 'search' && !ownFetch) {
       blankLists(root.sectional_items, 'exploreBlanked');
       stopPagination(root);
     }
@@ -527,7 +540,10 @@
   // Instagram loads the next batch when the end of the list comes into
   // view. When a batch adds little or nothing, the end never "arrives", so
   // give Instagram a scroll signal. `hard` also handles a page too short to scroll.
-  let nudgeTimer = 0;
+  let nudgeTimer = 0, touching = false, lastUserScroll = 0;
+  window.addEventListener('touchstart', () => { touching = true; }, { capture: true, passive: true });
+  window.addEventListener('touchend', () => { touching = false; lastUserScroll = Date.now(); }, { capture: true, passive: true });
+  window.addEventListener('touchcancel', () => { touching = false; }, { capture: true, passive: true });
   function scheduleNudge(hard) {
     clearTimeout(nudgeTimer);
     nudgeTimer = setTimeout(safe(() => {
@@ -537,10 +553,13 @@
       stats.feed.nudges = (stats.feed.nudges || 0) + 1;
       window.dispatchEvent(new Event('scroll'));
       document.dispatchEvent(new Event('scroll'));
+      // Never move the page under your finger or during a fling.
+      if (touching || Date.now() - lastUserScroll < 400) return;
       const y = se.scrollTop;
       if (se.scrollHeight - innerHeight > 4) {
-        se.scrollTop = Math.max(0, y - 2) === y ? y + 2 : y - 2;
-        requestAnimationFrame(() => { se.scrollTop = y; });
+        const d = y >= 2 ? -2 : 2;
+        se.scrollTop += d;
+        requestAnimationFrame(() => { se.scrollTop -= d; });
       } else if (hard && document.body) {
         // Nothing to scroll: briefly add room below so the list's end leaves and re-enters view.
         const pad = document.createElement('div');
@@ -557,25 +576,28 @@
    * End of Home: offer Following and Favorites (newest first), skipping
    * what you already saw. Shown by the app, outside Instagram's page.
    * ------------------------------------------------------------------ */
-  let feedEndShown = false, atBottomSince = 0;
-  function checkFeedEnd() {
+  let feedEndShown = null, atBottomSince = 0;
+  function checkFeedEnd(force) {
     if (CFG.role !== 'main') return;
     let show = false;
-    if (route() === 'home' && feedVariant() === 'home') {
+    const fs = currentFeed();
+    const searching = typeof search !== 'undefined' && search.open;
+    if (route() === 'home' && feedVariant() === 'home' && fs.homePages > 0 && !searching) {
       const se = document.scrollingElement || document.documentElement;
       const nearBottom = se.scrollHeight - (se.scrollTop + innerHeight) < Math.max(400, innerHeight * 0.6);
       if (nearBottom) { if (!atBottomSince) atBottomSince = Date.now(); } else atBottomSince = 0;
-      show = nearBottom && (feedState.ended || (atBottomSince && Date.now() - atBottomSince > 4000));
+      show = nearBottom && (fs.ended || (atBottomSince && Date.now() - atBottomSince > 4000));
     } else {
       atBottomSince = 0;
     }
-    if (show !== feedEndShown) {
+    if (show !== feedEndShown || force) {
       feedEndShown = show;
-      post('feedEnd', { on: show, caughtUp: feedState.caughtUp || feedState.ended });
+      post('feedEnd', { on: show, caughtUp: fs.caughtUp || fs.ended });
     }
   }
   let feedEndTimer = 0;
-  window.addEventListener('scroll', () => {
+  window.addEventListener('scroll', e => {
+    if (e.isTrusted) lastUserScroll = Date.now();
     if (feedEndTimer) return;
     feedEndTimer = setTimeout(() => { feedEndTimer = 0; safe(checkFeedEnd)(); }, 250);
   }, { passive: true, capture: true });
@@ -890,9 +912,11 @@
       return;
     }
     if (CFG.role === 'main') {
-      if (search.open) { hideSearch(); search.suspended = false; clearSaved(); }
+      if (search.open) { hideSearch(false); search.suspended = false; clearSaved(); }
       restoreSearch();
       if (route() === 'explore' && !search.open && !search.suspended) openSearch(true);
+      atBottomSince = 0;
+      safe(checkFeedEnd)(true);
     }
     if (CFG.role === 'main' && route() === 'comments' && previous !== 'comments' && !split) {
       // Instagram opened its full-page comments by itself; show them in the
@@ -918,7 +942,7 @@
     safe(routeChanged)();
     return out;
   };
-  window.addEventListener('popstate', safe(() => { routeChanged(); restoreScroll(); }));
+  window.addEventListener('popstate', safe(() => { routeChanged(); if (!syntheticPop) restoreScroll(); }));
 
   /* ------------------------------------------------------------------ *
    * No endless Reels: vertical swipes cannot move a Reel viewer on to
@@ -977,8 +1001,7 @@
     const r = route();
     if (r === 'story' || r === 'reel') return true;
     if (!(v instanceof HTMLVideoElement)) return false;
-    const b = v.getBoundingClientRect();
-    if (r === 'direct' || r === 'post') return b.width * b.height > 0.45 * innerWidth * innerHeight;
+    if (r === 'direct' || r === 'post') return onScreenArea(v) > 0.45 * innerWidth * innerHeight;
     return false;
   }
   // Instagram's controls are labelled on the button or on its icon; the
@@ -998,7 +1021,14 @@
   }
   function shown(el) {
     const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+  }
+  // How much of an element is on screen, in square pixels.
+  function onScreenArea(el) {
+    const r = el.getBoundingClientRect();
+    const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+    const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+    return w * h;
   }
   function findControl(media, re, wide) {
     const test = el => re.test(controlLabel(el)) && shown(el);
@@ -1014,8 +1044,20 @@
     }
     return null;
   }
+  // Click the control itself. A bare icon's own small button wrapper is
+  // used only if it is right around the icon; never a link or the media's tap area.
   function press(el) {
-    const target = el.closest('button,[role="button"],a') || el;
+    let target = el;
+    const icon = el.getBoundingClientRect();
+    let n = el.parentElement;
+    for (let i = 0; n && i < 3; i++, n = n.parentElement) {
+      if (n.tagName === 'A' || n.querySelector('video,img[srcset]')) break;
+      if (n.matches('button,[role="button"]')) {
+        const r = n.getBoundingClientRect();
+        if (r.width * r.height <= Math.max(icon.width * icon.height * 9, 64 * 64)) target = n;
+        break;
+      }
+    }
     if (typeof target.click === 'function') target.click();
     else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
   }
@@ -1062,8 +1104,8 @@
     for (const v of document.getElementsByTagName('video')) {
       if (autoStarted.has(v) || v.ended) continue;
       if (!v.paused) { autoStarted.add(v); continue; }
-      const b = v.getBoundingClientRect();
-      if (b.width * b.height < 0.4 * innerWidth * innerHeight || b.bottom <= 0 || b.top >= innerHeight) continue;
+      // Mostly on screen; a carousel's next slide waiting to the side doesn't count.
+      if (onScreenArea(v) < 0.4 * innerWidth * innerHeight) continue;
       autoStarted.add(v);
       if (v.currentTime > 0.3) continue;            // it has played before: you paused it
       stats.autoplayed++;
@@ -1181,6 +1223,10 @@
   // above, so whatever they contain is indexed automatically.
   // Parses an Instagram answer: strips "for (;;);", keeps long id lists exact,
   // and merges streamed answers (several JSON objects, one per line).
+  function ownCleanse(data) {
+    ownFetch = true;
+    try { cleanse(data); } finally { ownFetch = false; }
+  }
   function parseIg(text) {
     if (typeof text !== 'string') return null;
     text = text.replace(/^for \(;;\);/, '').replace(/"next_media_ids":\[([^\]]*)\]/g,
@@ -1204,7 +1250,7 @@
       });
       if (!res.ok) return null;
       const data = parseIg(await res.text());
-      if (data && typeof data === 'object') cleanse(data);
+      if (data && typeof data === 'object') ownCleanse(data);
       return data && data.status !== 'fail' ? data : null;
     } catch (e) { return null; }
   }
@@ -1239,7 +1285,7 @@
       const re = /__d\("([A-Za-z0-9_]+)_instagramRelayOperation",\[\],\(function\([^)]*\)\{[^}]*?exports="(\d+)"/g;
       let n = 0;
       for (const u of urls) {
-        if (!/cdninstagram\.com|instagram\.com/.test(u) || n++ > 80) continue;
+        if (!/cdninstagram\.com|instagram\.com/.test(u) || n++ > 25) continue;
         try {
           const text = await (await fetch(u, { cache: 'force-cache' })).text();
           let m;
@@ -1288,7 +1334,7 @@
         });
         if (!res.ok) continue;
         const data = parseIg(await res.text());
-        if (data && typeof data === 'object') cleanse(data);
+        if (data && typeof data === 'object') ownCleanse(data);
         const out = data && data.data && data.data[root];
         if (out) return out;
       } catch (e) { /* try the other path */ }
@@ -1547,7 +1593,8 @@
   const search = {
     host: null, root: null, open: false, suspended: false,
     tab: 'accounts', query: '', view: null,       // view: {kind:'tag'|'place', id, name, sub:'top'|'recent'}
-    top: null, posts: null, grid: null, seq: 0, timer: 0, returnUrl: null,
+    results: {}, pending: null, posts: null, grid: null, seqTop: 0, seqPosts: 0, seqGrid: 0, timer: 0,
+    returnUrl: null, token: null, paused: [],
   };
   SG.search = search;
 
@@ -1565,7 +1612,10 @@
         },
         body: new URLSearchParams(form).toString(),
       });
-      return res.ok ? await res.json() : null;
+      if (!res.ok) return null;
+      const data = parseIg(await res.text());
+      if (data && typeof data === 'object') ownCleanse(data);
+      return data && data.status !== 'fail' ? data : null;
     } catch (e) { return null; }
   }
   // Every post object inside a results payload, in order, once each.
@@ -1637,34 +1687,57 @@
       return { id: String(id), name: p.title || name, sub: p.subtitle || loc.address || loc.city || '', slug: p.slug || slugify(loc.name || name) };
     }).filter(Boolean);
   }
-  async function loadTop(q) {
-    let u = [], t = [], pl = [];
-    const blended = await igGet('/web/search/topsearch/?context=blended&include_reel=true&query=' + encodeURIComponent(q));
-    if (blended) { u = users(blended.users); t = hashtags(blended.hashtags); pl = places(blended.places); }
-    // Blended search has lately left out tags and places; ask for those directly.
-    const [tg, pg] = await Promise.all([
-      t.length ? null : igGet('/web/search/topsearch/?context=hashtag&query=' + encodeURIComponent(q.replace(/^#/, ''))),
-      pl.length ? null : igGet('/web/search/topsearch/?context=place&query=' + encodeURIComponent(q)),
-    ]);
-    if (tg) t = hashtags(tg.hashtags);
-    if (pg) pl = places(pg.places);
-    if (!pl.length) {
-      const fp = await igGet('/api/v1/fbsearch/places/?query=' + encodeURIComponent(q));
-      if (fp) pl = places(fp.items);
-    }
-    if (!u.length || !t.length || !pl.length) {
-      const c = await igGraphQL('PolarisSearchBoxRefetchableQuery', {
-        data: { context: 'blended', include_reel: 'true', query: q, rank_token: '', search_session_id: uuid(), search_surface: 'web_top_search' },
-        hasQuery: true,
-      }, 'xdt_api__v1__fbsearch__topsearch_connection');
-      if (c) {
-        if (!u.length) u = users(c.users);
-        if (!t.length) t = hashtags(c.hashtags);
-        if (!pl.length) pl = places(c.places);
+  // One query's answers, shared by the tabs, so switching tabs or retyping
+  // the same word asks Instagram again only when needed.
+  const topCache = new Map();
+  function cacheFor(q) {
+    let c = topCache.get(q);
+    if (!c) { c = {}; topCache.set(q, c); cap(topCache, 30); }
+    return c;
+  }
+  async function cached(c, key, make) {
+    if (!(key in c)) c[key] = make();
+    const v = await c[key];
+    if (v == null) delete c[key];          // failures are not remembered
+    return v;
+  }
+  // Results for one tab. `stale()` says the user has typed something else:
+  // then stop before asking Instagram for anything more.
+  async function loadTab(tab, q, stale) {
+    const c = cacheFor(q);
+    const enc = encodeURIComponent;
+    const blended = await cached(c, 'blended', () => igGet('/web/search/topsearch/?context=blended&include_reel=true&query=' + enc(q)));
+    let list = [];
+    if (tab === 'accounts') list = blended ? users(blended.users) : [];
+    if (tab === 'tags') {
+      list = blended ? hashtags(blended.hashtags) : [];
+      if (!list.length && !stale()) {
+        const r = await cached(c, 'tags', () => igGet('/web/search/topsearch/?context=hashtag&query=' + enc(q.replace(/^#/, ''))));
+        if (r) list = hashtags(r.hashtags);
       }
     }
-    if (!blended && !u.length && !t.length && !pl.length) return null;
-    return { users: u, tags: t, places: pl };
+    if (tab === 'places') {
+      list = blended ? places(blended.places) : [];
+      if (!list.length && !stale()) {
+        const r = await cached(c, 'places', () => igGet('/web/search/topsearch/?context=place&query=' + enc(q)));
+        if (r) list = places(r.places);
+      }
+      if (!list.length && !stale()) {
+        const r = await cached(c, 'fbplaces', () => igGet('/api/v1/fbsearch/places/?query=' + enc(q)));
+        if (r) list = places(r.items);
+      }
+    }
+    if (stale()) return null;
+    if (!list.length) {
+      // The website's own search request, only when the older ones gave nothing.
+      const g = await cached(c, 'gql', () => igGraphQL('PolarisSearchBoxRefetchableQuery', {
+        data: { context: 'blended', include_reel: 'true', query: q, rank_token: '', search_session_id: uuid(), search_surface: 'web_top_search' },
+        hasQuery: true,
+      }, 'xdt_api__v1__fbsearch__topsearch_connection'));
+      if (g) list = tab === 'accounts' ? users(g.users) : tab === 'tags' ? hashtags(g.hashtags) : places(g.places);
+      if (!list.length && !blended && !g) return { error: true, list: [] };
+    }
+    return { list: list };
   }
   // Keyword grid: posts and Reels, and hashtags, which Instagram now shows the same way.
   async function loadKeyword(q, cursor) {
@@ -1861,8 +1934,8 @@
   function saveSearch() {
     try {
       sessionStorage.setItem(SEARCH_STATE, JSON.stringify({
-        tab: search.tab, query: search.query, view: search.view, returnUrl: search.returnUrl,
-        top: search.top, posts: search.posts, grid: search.grid,
+        tab: search.tab, query: search.query, view: search.view, returnUrl: search.returnUrl, token: search.token,
+        results: search.results, posts: search.posts, grid: search.grid,
         scroll: search.body ? search.body.scrollTop : 0, suspended: search.suspended, at: Date.now(),
       }));
     } catch (e) { /* storage full or unavailable */ }
@@ -1891,7 +1964,7 @@
     const tabs = el('div', 'tabs');
     for (const [key, label] of TABS) {
       const b = el('button', 'tab' + (search.tab === key ? ' on' : ''), label);
-      b.onclick = () => { search.tab = key; render(); if (key === 'posts') runPosts(false); };
+      b.onclick = () => { search.tab = key; render(); runQuery(); };
       tabs.appendChild(b);
     }
     const body = el('div', 'body');
@@ -1901,12 +1974,12 @@
       search.query = input.value;
       clear.style.display = input.value ? 'block' : 'none';
       clearTimeout(search.timer);
-      search.timer = setTimeout(() => runQuery(), 280);
+      search.timer = setTimeout(() => runQuery(), 400);
     });
     input.addEventListener('keydown', e => {
       if (e.key === 'Enter') { input.blur(); clearTimeout(search.timer); runQuery(); }
     });
-    clear.onclick = e => { e.preventDefault(); search.query = ''; search.top = null; search.posts = null; render(); focusInput(); };
+    clear.onclick = e => { e.preventDefault(); search.query = ''; search.posts = null; render(); focusInput(); };
     cancel.onclick = () => closeSearch(true);
     search.input = input;
     renderBody();
@@ -1926,10 +1999,19 @@
       for (const it of items) body.appendChild(resultRow(it));
       return;
     }
-    if (search.tab === 'posts') return renderGrid(body, search.posts, () => runPosts(true), q);
-    const top = search.top;
-    if (!top || top.q !== q) { body.appendChild(el('div', 'spin')); return; }
-    if (top.error) return renderFailure(body, q);
+    if (search.tab === 'posts') {
+      if (!search.posts || search.posts.q !== q) { body.appendChild(el('div', 'spin')); return; }
+      return renderGrid(body, search.posts, () => runPosts(true), q);
+    }
+    const res = search.results[topKey()];
+    if (!res) {
+      body.appendChild(el('div', 'spin'));
+      if (search.pending !== topKey()) setTimeout(runTop, 0);   // nothing on its way: ask
+      return;
+    }
+    if (res.error) return renderFailure(body, q);
+    const top = { users: [], tags: [], places: [] };
+    top[search.tab === 'accounts' ? 'users' : search.tab] = res.list;
     let items = [];
     if (search.tab === 'accounts') items = top.users.map(u => ({ kind: 'user', id: u.username, title: u.username, sub: u.full_name || '', pic: u.profile_pic_url || '', verified: !!u.is_verified }));
     if (search.tab === 'tags') items = top.tags.map(h => ({ kind: 'tag', id: h.name, title: '#' + h.name, sub: h.media_count != null ? Number(h.media_count).toLocaleString() + ' posts' : '' }));
@@ -2048,16 +2130,30 @@
       reel: m.product_type === 'clips' || m.media_type === 2, multi: Array.isArray(m.carousel_media) && m.carousel_media.length > 1,
     })).filter(m => m.thumb);
   }
+  function topKey() { return search.tab + '\n' + search.query.trim(); }
   async function runQuery() {
     const q = search.query.trim();
     if (!q) { renderBody(); return; }
-    if (search.tab === 'posts') { runPosts(false); return; }
-    const seq = ++search.seq;
-    if (!search.top || search.top.q !== q) renderBody();
-    const top = await loadTop(q);
-    if (seq !== search.seq) return;
-    search.top = top ? Object.assign({ q: q }, top) : { q: q, error: true, users: [], tags: [], places: [] };
-    if (!search.view) renderBody();
+    if (search.tab === 'posts') {
+      if (!search.posts || search.posts.q !== q) runPosts(false);
+      else renderBody();
+      return;
+    }
+    runTop();
+  }
+  async function runTop() {
+    const q = search.query.trim(), tab = search.tab, key = topKey();
+    if (!q || tab === 'posts' || search.results[key] || search.pending === key) { renderBody(); return; }
+    const seq = ++search.seqTop;
+    search.pending = key;
+    renderBody();
+    const res = await loadTab(tab, q, () => seq !== search.seqTop || search.query.trim() !== q);
+    if (search.pending === key) search.pending = null;
+    if (!res) return;                                   // you typed something else
+    search.results[key] = res;
+    const keys = Object.keys(search.results);
+    if (keys.length > 60) delete search.results[keys[0]];
+    if (!search.view && topKey() === key) renderBody();
   }
   async function runPosts(more) {
     const q = search.query.trim();
@@ -2066,9 +2162,9 @@
     if (!more || !st || st.q !== q) st = search.posts = { q: q, media: [], more: null, pages: 0, loading: true };
     else { if (!st.more || st.loading) return; st.loading = true; }
     renderBody();
-    const seq = ++search.seq;
+    const seq = ++search.seqPosts;
     const res = await loadPosts(q, more ? st.more : null);
-    if (seq !== search.seq || search.posts !== st) return;
+    if (seq !== search.seqPosts || search.posts !== st) return;
     st.loading = false;
     if (!res) { if (!st.media.length) st.error = true; }
     else { st.media = addNew(st.media, slim(res.media)); st.more = res.more; st.pages++; }
@@ -2081,9 +2177,9 @@
     if (!more || !st) st = search.grid = { media: [], more: null, pages: 0, loading: true };
     else { if (!st.more || st.loading) return; st.loading = true; }
     render();
-    const seq = ++search.seq;
+    const seq = ++search.seqGrid;
     const res = await loadTagOrPlace(v, more ? st.more : null);
-    if (seq !== search.seq || search.grid !== st || search.view !== v) return;
+    if (seq !== search.seqGrid || search.grid !== st || search.view !== v) return;
     st.loading = false;
     if (!res) { if (!st.media.length) st.error = true; }
     else { st.media = addNew(st.media, slim(res.media)); st.more = res.more; st.pages++; st.noRecent = !!res.noRecent; st.unordered = !!res.unordered; }
@@ -2091,31 +2187,56 @@
   }
 
   // Open a profile/post from search. Try Instagram's in-app navigation;
-  // if the page doesn't change, load it normally. Back brings search back.
+  // if Instagram doesn't draw the new page, load it normally. Back to the
+  // page search was opened from brings search back as you left it.
+  let openTimer = 0, syntheticPop = false;
+  function pageSig() {
+    const m = document.querySelector('main') || document.body;
+    return document.title + '|' + (m ? m.textContent.slice(0, 400) : '');
+  }
   function openPath(path) {
+    search.token = String(Date.now()) + Math.random().toString(16).slice(2, 6);
     search.suspended = true;
+    try { nativeReplace.call(history, Object.assign({}, history.state || {}, { sgSearch: search.token }), ''); } catch (e) { /* ignore */ }
     saveSearch();
-    hideSearch();
-    const before = document.title, from = location.href;
+    hideSearch(false);
+    const target = new URL(path, location.href);
+    const before = pageSig();
+    clearTimeout(openTimer);
     try {
       history.pushState(null, '', path);
+      syntheticPop = true;
       window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
-    } catch (e) { location.assign(path); return; }
-    setTimeout(() => {
-      if (location.href !== from && document.title === before) location.replace(path);
-    }, 1500);
+    } catch (e) {
+      location.assign(path);
+      return;
+    } finally {
+      syntheticPop = false;
+    }
+    openTimer = setTimeout(() => {
+      if (location.pathname + location.search === target.pathname + target.search && pageSig() === before) location.replace(path);
+    }, 1800);
   }
   function showSearch() {
     buildSearch();
     search.host.style.display = '';
     search.open = true;
+    // Nothing keeps playing (or keeps the screen on) behind search.
+    search.paused = [];
+    for (const m of document.querySelectorAll('video,audio')) {
+      if (!m.paused) { m.pause(); search.paused.push(m); }
+    }
     post('search', { open: true });
+    safe(checkFeedEnd)(true);
   }
-  function hideSearch() {
+  function hideSearch(resume) {
     if (search.body) search.lastScroll = search.body.scrollTop;
     if (search.host) search.host.style.display = 'none';
     search.open = false;
+    if (resume) for (const m of search.paused) if (m.isConnected) m.play().catch(() => {});
+    search.paused = [];
     post('search', { open: false });
+    safe(checkFeedEnd)(true);
   }
   function openSearch(fresh) {
     if (CFG.role !== 'main') return;
@@ -2129,7 +2250,7 @@
     stats.searchOpened = (stats.searchOpened || 0) + 1;
   }
   function closeSearch(leaveExplore) {
-    hideSearch();
+    hideSearch(true);
     search.suspended = false;
     clearSaved();
     if (leaveExplore && route() === 'explore') {
@@ -2145,16 +2266,20 @@
   };
   // Returning to the page search was opened from brings it back as you left it.
   function restoreSearch() {
-    if (CFG.role !== 'main' || search.open) return;
+    if (CFG.role !== 'main' || search.open || syntheticPop) return;
+    const mark = history.state && history.state.sgSearch;
+    if (!mark) return;
     let saved = null;
-    if (search.suspended) saved = { returnUrl: search.returnUrl, scroll: search.lastScroll };
+    if (search.suspended && search.token === mark) saved = { scroll: search.lastScroll };
     else {
       try { saved = JSON.parse(sessionStorage.getItem(SEARCH_STATE) || 'null'); } catch (e) { saved = null; }
-      if (!saved || !saved.suspended || Date.now() - saved.at > 30 * 60 * 1000) return;
-      Object.assign(search, { tab: saved.tab, query: saved.query, view: saved.view, top: saved.top, posts: saved.posts, grid: saved.grid, returnUrl: saved.returnUrl });
-      search.suspended = true;
+      if (!saved || !saved.suspended || saved.token !== mark || Date.now() - saved.at > 30 * 60 * 1000) return;
+      Object.assign(search, { tab: saved.tab, query: saved.query, view: saved.view, results: saved.results || {}, posts: saved.posts, grid: saved.grid, returnUrl: saved.returnUrl, token: saved.token });
+      for (const st of [search.posts, search.grid]) if (st && st.loading) st.loading = false;
+      search.pending = null;
     }
-    if (location.pathname + location.search !== search.returnUrl) return;
+    // Only this one time: later visits to the page don't reopen search.
+    try { const st = Object.assign({}, history.state); delete st.sgSearch; nativeReplace.call(history, st, ''); } catch (e) { /* ignore */ }
     search.suspended = false;
     showSearch();
     render();

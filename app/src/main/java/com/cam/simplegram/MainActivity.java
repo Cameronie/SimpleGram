@@ -87,6 +87,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private TextView menuButton;
     private TextView zoomChip;
     private View feedBar;
+    private boolean feedWanted;
+    private boolean searchOpen;
     private View screenshotShield;
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
@@ -465,17 +467,28 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             case "route":
                 if (main) {
                     route = m.optString("route", "other");
-                    if (!"home".equals(route)) showFeedBar(false);
+                    if ("ready".equals(action)) {
+                        // A new page: nothing from the old one carries over.
+                        searchOpen = false;
+                        feedWanted = false;
+                        refreshViewer();
+                    }
+                    updateFeedBar();
                 } else {
                     comments.pageReady();
                 }
-                if (main && "ready".equals(action)) refreshViewer();
                 break;
             case "feedEnd":
-                if (main) showFeedBar(m.optBoolean("on"));
+                if (main) {
+                    feedWanted = m.optBoolean("on");
+                    updateFeedBar();
+                }
                 break;
             case "search":
-                if (main && m.optBoolean("open")) showFeedBar(false);
+                if (main) {
+                    searchOpen = m.optBoolean("open");
+                    updateFeedBar();
+                }
                 break;
             case "awake":
                 if (main) setAwake(m.optBoolean("on"));
@@ -526,6 +539,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         } else {
             zoomChip.setVisibility(View.GONE);
         }
+        updateFeedBar();
         if (zoomed && !zoomedStory && storyMode()) {
             zoomedStory = true;
             storyHold(true);
@@ -574,6 +588,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bg.setStroke(dp(1), dark ? 0x33FFFFFF : 0x22000000);
         bar.setBackground(bg);
         bar.setElevation(dp(8));
+        // The card is solid: a tap on its text must not like the post underneath.
+        bar.setClickable(true);
 
         TextView title = new TextView(this);
         title.setText("You're all caught up on Home");
@@ -614,7 +630,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bg.setCornerRadius(dp(10));
         b.setBackground(bg);
         b.setOnClickListener(v -> {
-            showFeedBar(false);
+            feedWanted = false;
+            updateFeedBar();
             try {
                 js(new JSONObject().put("type", "continueFeed").put("variant", variant));
             } catch (JSONException ignored) {
@@ -625,12 +642,23 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private void showFeedBar(boolean on) {
+        feedWanted = on;
+        updateFeedBar();
+    }
+
+    /** The card shows when the page asks for it and nothing else is in the way. */
+    private void updateFeedBar() {
+        boolean show = feedWanted && "home".equals(route) && !screenshotMode && !comments.isOpen()
+                && !zoom.isZoomed() && !searchOpen && customView == null;
         boolean visible = feedBar.getVisibility() == View.VISIBLE;
-        if (on && !screenshotMode && !comments.isOpen() && !zoom.isZoomed()) {
-            if (visible) return;
-            feedBar.setAlpha(0f);
-            feedBar.setTranslationY(dp(16));
-            feedBar.setVisibility(View.VISIBLE);
+        if (show && visible && feedBar.getAlpha() >= 1f) return;
+        feedBar.animate().cancel();
+        if (show) {
+            if (!visible) {
+                feedBar.setAlpha(0f);
+                feedBar.setTranslationY(dp(16));
+                feedBar.setVisibility(View.VISIBLE);
+            }
             feedBar.animate().alpha(1f).translationY(0f).setDuration(180).start();
         } else if (visible) {
             feedBar.animate().alpha(0f).translationY(dp(16)).setDuration(150)
@@ -656,6 +684,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         splitDpr = (float) m.optDouble("dpr", density);
         if (screenshotMode) exitScreenshot();
         if (zoom.isZoomed()) zoom.reset(false);
+        updateFeedBar();
         if (!comments.isOpen()) {
             // Keep the page its full size underneath so nothing on it re-lays out.
             ViewGroup.LayoutParams lp = zoom.getLayoutParams();
@@ -689,6 +718,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
         zoom.setLayoutParams(lp);
         js("splitClosed");
+        updateFeedBar();
     }
 
     /**
@@ -864,6 +894,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     loadMain(FAVORITES);
                     break;
                 case 5:
+                    feedWanted = false;
+                    updateFeedBar();
                     web.reload();
                     break;
                 case 6:
@@ -913,6 +945,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private void loadMain(String url) {
+        feedWanted = false;
+        updateFeedBar();
         closeComments();
         if (zoom.isZoomed()) zoom.reset(false);
         web.loadUrl(url);
@@ -1092,6 +1126,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (customView == null) setSystemBarsHidden(false);
         onZoomChanged(zoom.scale());
         zoom.releaseHold();
+        updateFeedBar();
     }
 
     @SuppressWarnings("deprecation")
@@ -1150,14 +1185,31 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             zoom.reset(true);
         } else if (comments.isOpen()) {
             if (!comments.goBack()) closeComments();
-        } else {
-            // The page may have its own screen to close first (SimpleGram search).
+        } else if (searchOpen) {
+            // SimpleGram's search screen closes first (a tag/place page, then search).
+            final boolean[] done = {false};
+            Runnable fallback = () -> {
+                if (done[0]) return;
+                done[0] = true;
+                pageBack();
+            };
             web.evaluateJavascript("!!(window.__sg&&window.__sg.back&&window.__sg.back())", handled -> {
-                if ("true".equals(handled)) return;
-                if (!"home".equals(route) && web.canGoBack()) web.goBack();
-                else moveTaskToBack(true);
+                if (done[0]) return;
+                done[0] = true;
+                if (!"true".equals(handled)) pageBack();
             });
+            ui.postDelayed(fallback, 600);
+        } else {
+            pageBack();
         }
+    }
+
+    /** Back within Instagram's pages; from the Home feed itself, leave the app like Instagram does. */
+    private void pageBack() {
+        String url = web.getUrl();
+        boolean feedVariant = url != null && url.contains("variant=") && !url.contains("variant=home");
+        if (web.canGoBack() && (!"home".equals(route) || feedVariant)) web.goBack();
+        else moveTaskToBack(true);
     }
 
     private void setAwake(boolean on) {
