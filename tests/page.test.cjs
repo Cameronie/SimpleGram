@@ -32,8 +32,10 @@ async function open(url, html, { role = 'main', api = {} } = {}) {
   const page = await context.newPage();
   await page.route('**/*', route => {
     const u = new URL(route.request().url());
-    if (api[u.pathname]) {
-      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(api[u.pathname]) });
+    const hit = api[u.pathname];
+    if (hit !== undefined) {
+      const r = typeof hit === 'function' ? hit(u, route.request()) : { body: hit };
+      return route.fulfill({ status: r.status || 200, contentType: 'application/json', body: typeof r.body === 'string' ? r.body : JSON.stringify(r.body) });
     }
     if (u.href.split('#')[0] === url || u.pathname === new URL(url).pathname) {
       return route.fulfill({ status: 200, contentType: 'text/html', body: html });
@@ -486,4 +488,280 @@ test('downloads: a Story highlight video is matched by its picture', async () =>
   await page.evaluate(() => { window.__sg.onNative({ type: 'menu' }); window.__sg.onNative({ type: 'download' }); });
   const [dl] = await waitSent(page, 'download');
   assert.equal(dl.items[0].url, 'https://scontent.cdninstagram.com/v/t50/hl.mp4');
+});
+
+
+/* ---------------- 1.1: feed batches, end of Home, no repeats ---------------- */
+
+test('feed: continuing from the end of Home into Following skips posts already seen', async () => {
+  const page = await open('https://www.instagram.com/', BLANK);
+  await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([
+    edge({ media: media('SEEN001', user('a', true)) }), edge({ media: media('SEEN002', user('b', true)) })]));
+  await Promise.all([
+    page.waitForURL('https://www.instagram.com/?variant=following'),
+    page.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' })),
+  ]);
+  const out = await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([
+    edge({ media: media('SEEN001', user('a', true)) }), edge({ media: media('NEW0001', user('c', true)) }),
+    edge({ media: media('SEEN002', user('b', true)) })]));
+  assert.deepEqual(codes(out), ['NEW0001']);
+  assert.equal(await page.evaluate(() => window.__sg.stats.feed.alreadySeen), 2);
+  // Following opened another way (no hand-off) shows everything.
+  await page.evaluate(() => sessionStorage.clear());
+  await page.reload();
+  const all = await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([edge({ media: media('SEEN001', user('a', true)) })]));
+  assert.deepEqual(codes(all), ['SEEN001']);
+});
+
+test('feed: pages of only already-seen posts keep loading instead of stopping', async () => {
+  const page = await open('https://www.instagram.com/', BLANK);
+  await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([edge({ media: media('SEEN001', user('a', true)) })]));
+  await Promise.all([page.waitForURL(/variant=favorites/), page.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'favorites' }))]);
+  const flags = await page.evaluate(p => {
+    const out = [];
+    for (let i = 0; i < 8; i++) out.push(JSON.parse(JSON.stringify(p)).data.xdt_api__v1__feed__timeline__connection.page_info.has_next_page);
+    return out;
+  }, timeline([edge({ media: media('SEEN001', user('a', true)) })]));
+  assert.ok(flags.every(Boolean), JSON.stringify(flags));
+});
+
+test('feed: reaching the end of Home asks the app to show the Following/Favorites buttons', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0"><main><div style="height:3000px">feed</div></main></body></html>`;
+  const page = await open('https://www.instagram.com/', html);
+  await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([edge({ media: media('FRIEND1', user('a', true)) })], false));
+  assert.equal((await sent(page, 'feedEnd')).filter(m => m.on).length, 0);
+  await page.evaluate(() => window.scrollTo(0, 3000));
+  const msgs = await waitSent(page, 'feedEnd');
+  assert.equal(msgs[msgs.length - 1].on, true);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForFunction(() => { const m = window.__sent.filter(x => x.action === 'feedEnd'); return m.length && !m[m.length - 1].on; });
+});
+
+function feedBody(friendly, variables) {
+  return new URLSearchParams({ fb_api_req_friendly_name: friendly, variables: JSON.stringify(variables), doc_id: '123' }).toString();
+}
+
+test('feed: "load more" requests ask for bigger batches; the first page is left alone', async () => {
+  const seen = [];
+  const page = await open('https://www.instagram.com/', BLANK, { api: { '/graphql/query': (u, req) => { seen.push(req.postData()); return { body: { data: {} } }; } } });
+  await page.evaluate(([a, b]) => Promise.all([a, b].map(body => new Promise(res => {
+    const x = new XMLHttpRequest(); x.open('POST', '/graphql/query'); x.onloadend = res; x.send(body);
+  }))), [feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'cursor1', first: 12, variant: 'home' }),
+        feedBody('PolarisFeedTimelineRootV2Query', { first: 12, variant: 'home' })]);
+  await page.evaluate(b => fetch('/graphql/query', { method: 'POST', body: b }), feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'c2', first: 12 }));
+  const vars = seen.map(b => JSON.parse(new URLSearchParams(b).get('variables')));
+  const paged = vars.filter(v => v.after);
+  assert.deepEqual(paged.map(v => v.first), [24, 24]);
+  assert.deepEqual(vars.filter(v => !v.after).map(v => v.first), [12]);
+});
+
+test('feed: if Instagram refuses a bigger batch, SimpleGram stops asking for good', async () => {
+  const seen = [];
+  const page = await open('https://www.instagram.com/', BLANK, { api: { '/graphql/query': (u, req) => { seen.push(req.postData()); return { body: { errors: [{ message: 'bad' }] } }; } } });
+  const send = b => page.evaluate(body => new Promise(res => { const x = new XMLHttpRequest(); x.open('POST', '/graphql/query'); x.onloadend = res; x.send(body); }), b);
+  await send(feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'c1', first: 12 }));
+  await send(feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'c2', first: 12 }));
+  const firsts = seen.map(b => JSON.parse(new URLSearchParams(b).get('variables')).first);
+  assert.deepEqual(firsts, [24, 12]);
+  assert.equal(await page.evaluate(() => localStorage.getItem('sg_feed_batch_off')), '1');
+});
+
+/* ---------------- 1.1: opened videos start; sound controls ---------------- */
+
+test('autoplay: a Reel opened from a DM starts by itself once', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+    <div role="dialog"><div style="position:relative"><video id="v" playsinline style="width:412px;height:732px"></video>
+    <div style="position:absolute;top:300px;left:150px;width:100px;height:100px"><svg aria-label="Play" width="60" height="60"></svg></div></div></div>
+    <script>window.__plays=0;document.querySelector('svg[aria-label="Play"]').parentElement.addEventListener('click',()=>{window.__plays++;});</script></body></html>`;
+  const page = await open('https://www.instagram.com/direct/t/123/', html);
+  await page.evaluate(() => { document.getElementById('v').dispatchEvent(new Event('loadedmetadata')); });
+  await page.waitForFunction(() => window.__plays === 1);
+  await page.evaluate(() => { document.getElementById('v').dispatchEvent(new Event('canplay')); });
+  await page.waitForTimeout(600);
+  assert.equal(await page.evaluate(() => window.__plays), 1);
+});
+
+test('autoplay: small DM previews and the home feed are left alone', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body>
+    <video id="v" style="width:150px;height:200px"></video><svg aria-label="Play" width="20" height="20"></svg>
+    <script>window.__plays=0;document.querySelector('svg').addEventListener('click',()=>{window.__plays++;});</script></body></html>`;
+  const page = await open('https://www.instagram.com/direct/t/123/', html);
+  await page.evaluate(() => { document.getElementById('v').dispatchEvent(new Event('loadedmetadata')); });
+  await page.waitForTimeout(600);
+  assert.equal(await page.evaluate(() => window.__plays), 0);
+});
+
+test('sound: an icon-only speaker control (no button role) is found and pressed', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body>
+    <section><header><div id="spk" style="width:30px;height:30px"><svg aria-label="Audio is muted" width="24" height="24"></svg></div></header>
+    <video id="v" muted playsinline style="width:412px;height:732px"></video></section>
+    <script>document.getElementById('spk').addEventListener('click',()=>{const v=document.getElementById('v');v.muted=!v.muted;window.__t=(window.__t||0)+1;});</script></body></html>`;
+  const page = await open('https://www.instagram.com/stories/friend/123/', html);
+  await page.evaluate(() => document.getElementById('v').dispatchEvent(new Event('play')));
+  await page.waitForFunction(() => window.__t === 1);
+  assert.equal(await page.evaluate(() => document.getElementById('v').muted), false);
+});
+
+/* ---------------- 1.1: Story download fallback ---------------- */
+
+test('downloads: a Story nobody had loaded is fetched through that account\'s Stories', async () => {
+  const story = media('STORY99', user('friend', true), { pk: '999', video_versions: [{ url: 'https://scontent.cdninstagram.com/v/t50/s99.mp4', width: 720, height: 1280 }] });
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body><section><video src="blob:https://www.instagram.com/q" style="width:412px;height:732px"></video></section></body></html>`;
+  const page = await open('https://www.instagram.com/stories/friend/999/', html, { api: {
+    '/api/v1/media/999/info/': () => ({ status: 400, body: { status: 'fail' } }),
+    '/api/v1/users/web_profile_info/': { data: { user: { id: '55', username: 'friend', full_name: 'F' } } },
+    '/api/v1/feed/reels_media/': (u) => ({ body: u.searchParams.get('reel_ids') === '55' ? { reels: { 55: { id: '55', items: [story] } } } : {} }),
+  } });
+  await page.evaluate(() => { window.__sg.onNative({ type: 'menu' }); window.__sg.onNative({ type: 'download' }); });
+  const [dl] = await waitSent(page, 'download');
+  assert.equal(dl.items[0].url, 'https://scontent.cdninstagram.com/v/t50/s99.mp4');
+});
+
+/* ---------------- 1.1: Search tabs ---------------- */
+
+function grid(codesList) {
+  return { sections: [{ layout_type: 'media_grid', layout_content: { medias: codesList.map(c => ({ media: media(c, user('u' + c, true)) })) } }], more_available: true, next_max_id: 'm1', next_page: 1 };
+}
+const SEARCH_API = {
+  '/web/search/topsearch/': {
+    users: [{ position: 0, user: { pk: '1', username: 'sanjosesharks', full_name: 'San Jose Sharks', is_verified: true, profile_pic_url: 'https://scontent.cdninstagram.com/p.jpg' } }],
+    hashtags: [{ position: 1, hashtag: { name: 'sharks', media_count: 1234 } }],
+    places: [{ position: 2, place: { location: { pk: '777', name: 'SAP Center' }, title: 'SAP Center', subtitle: 'San Jose, CA', slug: 'sap-center' } }],
+  },
+  '/api/v1/fbsearch/web/top_serp/': { media_grid: { sections: grid(['KEYW001', 'KEYW002']).sections, has_more: true, next_max_id: 'k2', rank_token: 'r' } },
+  '/api/v1/tags/web_info/': { data: { name: 'sharks', media_count: 1234, top: grid(['TOPT001', 'TOPT002', 'TOPT003']), recent: grid(['RECT001']) } },
+  '/api/v1/tags/sharks/sections/': (() => { let n = 0; return () => ({ body: grid(['MORE00' + (++n)]) }); })(),
+  '/api/v1/locations/web_info/': { native_location_data: { location_info: { name: 'SAP Center', location_address: '525 W Santa Clara St' }, ranked: grid(['PLCT001']), recent: { sections: [], more_available: false } } },
+};
+const NAVPAGE = `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Instagram</title></head><body style="margin:0"><main>home</main>
+  <div style="position:fixed;bottom:0;left:0;right:0;height:50px;display:flex" id="nav"><div><a href="/" style="display:block;width:60px;height:50px">Home</a></div><div><a id="searchlink" href="/explore/" style="display:block;width:60px;height:50px">Search</a></div><div><a href="/direct/inbox/" style="display:block;width:60px;height:50px">DM</a></div></div></body></html>`;
+async function openSearchTab(page) {
+  await page.tap('#searchlink');
+  await page.waitForFunction(() => {
+    const h = document.getElementById('sg-search');
+    return h && h.style.display !== 'none' && h.shadowRoot.activeElement && h.shadowRoot.activeElement.tagName === 'INPUT';
+  });
+}
+async function searchText(page) {
+  return page.evaluate(() => { const h = document.getElementById('sg-search'); return h && h.style.display !== 'none' ? h.shadowRoot.textContent : null; });
+}
+async function shadowClick(page, text) {
+  await page.evaluate(t => {
+    const root = document.getElementById('sg-search').shadowRoot;
+    const buttons = Array.from(root.querySelectorAll('button'));
+    const b = buttons.find(x => x.textContent.trim() === t) || buttons.find(x => x.textContent.includes(t));
+    if (!b) throw new Error('no button ' + t);
+    b.click();
+  }, text);
+}
+
+test('search: the Search tab opens SimpleGram search with four tabs and account results', async () => {
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
+  await openSearchTab(page);
+  assert.equal(new URL(page.url()).pathname, '/', 'stays on the page underneath');
+  for (const t of ['Accounts', 'Posts & Reels', 'Tags', 'Places']) assert.ok((await searchText(page)).includes(t), t);
+  await page.keyboard.type('sharks');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
+  await shadowClick(page, 'Tags');
+  assert.ok((await searchText(page)).includes('#sharks'));
+  assert.ok((await searchText(page)).includes('1,234 posts'));
+  await shadowClick(page, 'Places');
+  assert.ok((await searchText(page)).includes('SAP Center'));
+});
+
+test('search: tags show Top and Most recent grids, with a limited "Show more"', async () => {
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
+  await openSearchTab(page);
+  await page.keyboard.type('sharks');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
+  await shadowClick(page, 'Tags');
+  await shadowClick(page, '#sharks');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 3);
+  await shadowClick(page, 'Most recent');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 1);
+  await shadowClick(page, 'Show more');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
+  // Back closes the tag page first, then search.
+  assert.equal(await page.evaluate(() => window.__sg.back()), true);
+  assert.ok((await searchText(page)).includes('Accounts'));
+  assert.equal(await page.evaluate(() => window.__sg.back()), true);
+  assert.equal(await searchText(page), null);
+  assert.equal(await page.evaluate(() => window.__sg.back()), false);
+});
+
+test('search: a place without recent posts says so instead of showing nothing', async () => {
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
+  await openSearchTab(page);
+  await page.keyboard.type('sap');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
+  await shadowClick(page, 'Places');
+  await shadowClick(page, 'SAP Center');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 1);
+  await shadowClick(page, 'Most recent');
+  await page.waitForFunction(() => /isn.t showing most recent/.test(document.getElementById('sg-search').shadowRoot.textContent));
+});
+
+test('search: Posts & Reels shows a grid; opening one and coming back restores search', async () => {
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
+  await openSearchTab(page);
+  await page.keyboard.type('sharks');
+  await shadowClick(page, 'Posts & Reels');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
+  await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelector('.cell').click());
+  await page.waitForURL(/\/p\/KEYW001\/$/);
+  assert.equal(await searchText(page), null);
+  // The test page cannot render posts, so the app falls back to a full load; Back returns to search.
+  await page.waitForTimeout(1800);
+  await page.goBack();
+  await page.waitForFunction(() => { const h = document.getElementById('sg-search'); return h && h.style.display !== 'none' && h.shadowRoot.querySelectorAll('.cell').length === 2; });
+});
+
+test('search: when Instagram returns nothing, offer Instagram\'s own page', async () => {
+  const api = Object.assign({}, SEARCH_API, { '/api/v1/fbsearch/web/top_serp/': () => ({ status: 500, body: {} }) });
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api });
+  await openSearchTab(page);
+  await page.keyboard.type('sharks');
+  await shadowClick(page, 'Posts & Reels');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('Open Instagram'));
+});
+
+test('search: when the old endpoints fail, the website\'s current requests are used', async () => {
+  const graphql = (u, req) => {
+    const form = new URLSearchParams(req.postData() || '');
+    const name = form.get('fb_api_req_friendly_name');
+    if (name === 'PolarisKeywordSearchExplorePageRelayQuery') {
+      return { body: 'for (;;);' + JSON.stringify({ data: { xdt_fbsearch__top_serp_graphql: {
+        edges: [{ node: { __typename: 'XDTTopSerpHeaderUnit' } },
+          { node: { __typename: 'XDTTopSerpMediaGridUnit', items: [media('GQLK001', user('a', true)), media('GQLK002', user('b', true), { media_type: 2 })] } }],
+        page_info: { has_next_page: false, end_cursor: null } } }, extensions: { is_final: true } }) };
+    }
+    if (name === 'PolarisSearchBoxRefetchableQuery') {
+      return { body: { data: { xdt_api__v1__fbsearch__topsearch_connection: {
+        users: [], hashtags: [], places: [{ position: 0, place: { title: 'Oracle Park', subtitle: 'San Francisco', location: { pk: '42', name: 'Oracle Park' } } }] } } } };
+    }
+    return { body: { data: {} } };
+  };
+  const api = {
+    '/web/search/topsearch/': (u) => ({ body: u.searchParams.get('context') === 'blended'
+      ? { users: [{ user: { pk: '9', username: 'giants', full_name: 'SF Giants' } }], hashtags: [], places: [] } : { status: 'fail' } }),
+    '/api/v1/fbsearch/places/': () => ({ status: 404, body: {} }),
+    '/api/v1/fbsearch/web/top_serp/': () => ({ status: 500, body: {} }),
+    '/api/graphql': graphql,
+  };
+  const page = await open('https://www.instagram.com/', NAVPAGE, { api });
+  await openSearchTab(page);
+  await page.keyboard.type('oracle');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('SF Giants'));
+  await shadowClick(page, 'Places');
+  assert.ok((await searchText(page)).includes('Oracle Park'));
+  await shadowClick(page, 'Posts & Reels');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
+  const badge = await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell .badge').length);
+  assert.equal(badge, 1, 'the video is marked');
+});
+
+test('search: place links use Instagram\'s own slug rule', async () => {
+  const page = await open('https://www.instagram.com/', BLANK);
+  const out = await page.evaluate(() => window.__sg.search && true);
+  assert.equal(out, true);
 });

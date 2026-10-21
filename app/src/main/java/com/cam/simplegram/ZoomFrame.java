@@ -36,6 +36,10 @@ final class ZoomFrame extends FrameLayout {
     private final int slop;
     private float scale = 1f, tx = 0f, ty = 0f;
     private boolean pinching;
+    // Once two fingers touch, the whole gesture is the zoom's until the last
+    // finger lifts. Half a gesture must never leak to the page: a broken
+    // touch sequence can leave the page ignoring scrolls.
+    private boolean owned;
     private float startSpan, startScale, startTx, startTy, startFx, startFy;
     private int panPointer = -1;
     private float lastX, lastY, tapX, tapY, prevTapX, prevTapY;
@@ -84,11 +88,15 @@ final class ZoomFrame extends FrameLayout {
     public boolean dispatchTouchEvent(MotionEvent ev) {
         if (page() == null) return super.dispatchTouchEvent(ev);
         if (split) return dispatchSplit(ev);
-        if (isZoomed() || pinching) {
+        int action = ev.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) owned = isZoomed();
+        if (owned) {
             onZoomTouch(ev);
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) owned = false;
             return true;
         }
-        if (ev.getActionMasked() == MotionEvent.ACTION_POINTER_DOWN && ev.getPointerCount() == 2) {
+        if (action == MotionEvent.ACTION_POINTER_DOWN && ev.getPointerCount() == 2) {
+            owned = true;
             if (listener.storyMode() && !holding) {
                 // Leave the first finger down on the Story: Instagram pauses it.
                 holding = true;
@@ -194,7 +202,8 @@ final class ZoomFrame extends FrameLayout {
         float dx = ev.getX(1) - ev.getX(0), dy = ev.getY(1) - ev.getY(0);
         float span = Math.max(1f, (float) Math.hypot(dx, dy));
         float fx = (ev.getX(0) + ev.getX(1)) / 2f, fy = (ev.getY(0) + ev.getY(1)) / 2f;
-        float next = Math.max(0.85f, Math.min(MAX_SCALE, startScale * span / startSpan));
+        // Never smaller than the screen.
+        float next = Math.max(1f, Math.min(MAX_SCALE, startScale * span / startSpan));
         // Keep the page point that started under the fingers under the fingers.
         float cx = (startFx - startTx) / startScale, cy = (startFy - startTy) / startScale;
         scale = next;
@@ -206,13 +215,9 @@ final class ZoomFrame extends FrameLayout {
 
     private void clamp() {
         float w = getWidth(), h = getHeight();
-        if (scale >= 1f) {
-            tx = Math.min(0f, Math.max(w - w * scale, tx));
-            ty = Math.min(0f, Math.max(h - h * scale, ty));
-        } else {
-            tx = (w - w * scale) / 2f;
-            ty = (h - h * scale) / 2f;
-        }
+        scale = Math.max(1f, scale);
+        tx = Math.min(0f, Math.max(w - w * scale, tx));
+        ty = Math.min(0f, Math.max(h - h * scale, ty));
     }
 
     private void apply() {

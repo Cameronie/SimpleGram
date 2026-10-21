@@ -142,6 +142,80 @@ public class ShellTest {
     }
 
     @Test
+    public void pinchingInNeverShrinksThePage() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<ZoomFrame> ref = new AtomicReference<>();
+            s.onActivity(a -> ref.set(zoomOf(a)));
+            ZoomFrame z = ref.get();
+            // Fingers move together (zoom out), then one lifts before the other.
+            s.onActivity(a -> pinch(z, z.getWidth() / 2f, z.getHeight() / 2f, 300f, 80f));
+            SystemClock.sleep(400);
+            idle();
+            WebView page = (WebView) z.getChildAt(0);
+            assertEquals(1f, z.scale(), 0.001f);
+            assertEquals(1f, page.getScaleX(), 0.001f);
+            assertEquals(0f, page.getTranslationX(), 0.5f);
+            assertFalse(z.isZoomed());
+            // The next ordinary touch goes to the page again (not swallowed by the zoom).
+            s.onActivity(a -> {
+                long down = SystemClock.uptimeMillis();
+                z.dispatchTouchEvent(event(down, MotionEvent.ACTION_DOWN, new float[][]{{300, 800}}));
+                z.dispatchTouchEvent(event(down, MotionEvent.ACTION_MOVE, new float[][]{{300, 600}}));
+                z.dispatchTouchEvent(event(down, MotionEvent.ACTION_UP, new float[][]{{300, 600}}));
+            });
+            idle();
+            assertEquals(1f, z.scale(), 0.001f);
+        }
+    }
+
+    @Test
+    public void endOfHomeBarShowsBothFeedsAndHides() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            s.onActivity(x -> {
+                try {
+                    call(x, "showFeedBar", new Class<?>[]{boolean.class}, true);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(400);
+            idle();
+            ViewGroup content = act.get().findViewById(android.R.id.content);
+            ViewGroup root = (ViewGroup) content.getChildAt(0);
+            View bar = null;
+            for (int i = 0; i < root.getChildCount(); i++) {
+                View c = root.getChildAt(i);
+                if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE && textOf((ViewGroup) c).contains("Favorites")) bar = c;
+            }
+            assertNotNull("end-of-Home bar visible", bar);
+            String text = textOf((ViewGroup) bar);
+            assertTrue(text, text.contains("Following") && text.contains("Favorites"));
+            s.onActivity(x -> {
+                try {
+                    call(x, "showFeedBar", new Class<?>[]{boolean.class}, false);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(500);
+            idle();
+            assertEquals(View.GONE, bar.getVisibility());
+        }
+    }
+
+    private static String textOf(ViewGroup g) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            if (c instanceof android.widget.TextView) b.append(((android.widget.TextView) c).getText()).append(' ');
+            else if (c instanceof ViewGroup) b.append(textOf((ViewGroup) c));
+        }
+        return b.toString();
+    }
+
+    @Test
     public void backResetsZoomBeforeLeaving() throws Exception {
         try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
             AtomicReference<ZoomFrame> ref = new AtomicReference<>();
@@ -239,7 +313,12 @@ public class ShellTest {
             idle();
             ViewGroup content = act.get().findViewById(android.R.id.content);
             ViewGroup root = (ViewGroup) content.getChildAt(0);
-            View button = root.getChildAt(3);
+            View button = null;
+            for (int i = 0; i < root.getChildCount(); i++) {
+                CharSequence d = root.getChildAt(i).getContentDescription();
+                if (d != null && d.toString().equals("SimpleGram menu")) button = root.getChildAt(i);
+            }
+            assertNotNull(button);
             assertEquals(View.GONE, button.getVisibility());
             s.onActivity(MainActivity::onBackPressed);
             idle();

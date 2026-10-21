@@ -25,7 +25,8 @@
       streamed: 0, unknownPages: 0, stopped: 0 },
     ads: 0, chainingTrimmed: 0, exploreBlanked: 0, suggestionsBlanked: 0, searchStopped: 0,
     dom: { ads: 0, suggested: 0, reposts: 0, banners: 0, reelsTab: 0, exploreGrid: 0 },
-    swipesBlocked: 0, indexed: 0,
+    swipesBlocked: 0, indexed: 0, autoplayed: 0,
+    downloads: { ok: 0, failed: {} },
   });
 
   /* ------------------------------------------------------------------ *
@@ -73,6 +74,12 @@
     const m = /^\/stories\/([^/]+)\/(\d+)/.exec(p || location.pathname);
     return m && m[1] !== 'highlights' ? m[2] : null;
   }
+  // Whose Stories these are: {user} for /stories/<user>/<id>/, {highlight} for highlights.
+  function storyOwner(p) {
+    const m = /^\/stories\/([^/]+)\/(\d+)?/.exec(p || location.pathname);
+    if (!m) return null;
+    return m[1] === 'highlights' ? { highlight: m[2] || null } : { user: decodeURIComponent(m[1]) };
+  }
   SG.route = route;
 
   function viewerId() {
@@ -88,6 +95,7 @@
    * Media index (for exact downloads)
    * ------------------------------------------------------------------ */
   const index = { byCode: new Map(), byPk: new Map(), byFile: new Map(), children: new WeakSet() };
+  const userIds = new Map();
   function cap(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
   function fileOf(url) {
     if (typeof url !== 'string' || !url) return null;
@@ -280,7 +288,33 @@
   }
   SG.feedVerdict = feedVerdict;
 
-  const feedState = { emptyStreak: 0 };
+  const feedState = { emptyStreak: 0, seenStreak: 0, ended: false, caughtUp: false };
+
+  // Which home feed is showing: home (Instagram's picks), following or favorites.
+  function feedVariant() {
+    const v = new URLSearchParams(location.search).get('variant');
+    return v === 'following' || v === 'favorites' ? v : 'home';
+  }
+  // Posts Home has shown, so Following/Favorites can skip them when you
+  // continue from the end of Home.
+  const homeSeen = new Set();
+  const SKIP_KEY = 'sg_skip_seen';
+  let skip = null;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(SKIP_KEY) || 'null');
+    if (saved && saved.variant && Array.isArray(saved.codes) && Date.now() - saved.at < 6 * 3600 * 1000) {
+      skip = { variant: saved.variant, codes: new Set(saved.codes) };
+    }
+  } catch (e) { /* storage unavailable */ }
+  function skipping() {
+    return skip && route() === 'home' && feedVariant() === skip.variant ? skip.codes : null;
+  }
+  function continueFeed(variant) {
+    try {
+      sessionStorage.setItem(SKIP_KEY, JSON.stringify({ variant: variant, codes: Array.from(homeSeen).slice(-3000), at: Date.now() }));
+    } catch (e) { /* storage unavailable: no skipping */ }
+    location.assign('/?variant=' + variant);
+  }
   function stopPagination(o) {
     if (!o || typeof o !== 'object') return;
     const pi = o.page_info || o.pageInfo;
@@ -311,22 +345,44 @@
       stats.feed.followSuspect = (stats.feed.followSuspect || 0) + 1;
       for (const x of media) { x.drop = false; x.reason = ''; }
     }
+    const seenCodes = skipping();
+    const onHome = route() === 'home' && feedVariant() === 'home';
     const kept = [];
-    let keptMedia = 0;
+    let keptMedia = 0, alreadySeen = 0;
     verdicts.forEach((x, i) => {
       stats.feed.seen++;
-      if (x.drop) stats.feed[x.reason]++;
-      else { kept.push(list[i]); if (x.media) keptMedia++; }
+      const code = x.media ? edgeCode(list[i]) : null;
+      if (!x.drop && code && seenCodes && seenCodes.has(code)) { x.drop = true; x.reason = 'alreadySeen'; alreadySeen++; }
+      if (x.drop) stats.feed[x.reason] = (stats.feed[x.reason] || 0) + 1;
+      else {
+        kept.push(list[i]);
+        if (x.media) {
+          keptMedia++;
+          if (onHome && code) { homeSeen.add(code); if (homeSeen.size > 4000) homeSeen.delete(homeSeen.values().next().value); }
+        }
+      }
+      if (!x.drop && list[i] && (list[i].node || list[i]).end_of_feed_demarcator) feedState.caughtUp = true;
     });
     stats.feed.kept += keptMedia;
+    stats.feed.lastPageKept = keptMedia;
     if (kept.length !== list.length) list.splice(0, list.length, ...kept);
-    if (keptMedia === 0 && hasMore(owner)) {
-      feedState.emptyStreak++;
-      if (feedState.emptyStreak >= 4) { stopPagination(owner); stats.feed.stopped++; }
-      else scheduleNudge();
+    const more = hasMore(owner);
+    if (keptMedia === 0 && more) {
+      if (alreadySeen > 0) {
+        // Paging past posts you already saw in Home: keep going (a while).
+        if (++feedState.seenStreak >= 40) { stopPagination(owner); feedState.ended = true; }
+      } else if (++feedState.emptyStreak >= 4) {
+        stopPagination(owner); stats.feed.stopped++; feedState.ended = true;
+      }
+      if (more && !feedState.ended) scheduleNudge(true);
     } else if (keptMedia > 0) {
       feedState.emptyStreak = 0;
+      feedState.seenStreak = 0;
+      // Only a post or two came through: ask for the next batch early.
+      if (keptMedia <= 2 && more) scheduleNudge(false);
     }
+    if (!more) feedState.ended = true;
+    setTimeout(safe(checkFeedEnd), 300);
   }
   function edgeCode(e) {
     const n = e && e.node ? e.node : e;
@@ -400,6 +456,10 @@
       if (Array.isArray(v) && v.length && AD_LIST_KEY.test(k)) dropAds(v);
     }
     if (looksLikeMedia(o)) indexMedia(o);
+    else if (typeof o.username === 'string' && o.username && !o.image_versions2) {
+      const id = o.pk != null ? o.pk : (o.pk_id != null ? o.pk_id : o.id);
+      if (id != null && /^\d+$/.test(String(id))) { userIds.set(o.username.toLowerCase(), String(id)); cap(userIds, 5000); }
+    }
   }
   function cleanse(root) {
     if (!root || typeof root !== 'object') return;
@@ -464,20 +524,137 @@
     }
   }
 
+  // Instagram loads the next batch when the end of the list comes into
+  // view. When a batch adds little or nothing, the end never "arrives", so
+  // give Instagram a scroll signal. `hard` also handles a page too short to scroll.
   let nudgeTimer = 0;
-  function scheduleNudge() {
+  function scheduleNudge(hard) {
     clearTimeout(nudgeTimer);
     nudgeTimer = setTimeout(safe(() => {
       const se = document.scrollingElement;
-      if (!se) return;
-      if (se.scrollHeight - (se.scrollTop + innerHeight) > innerHeight * 1.5) return;
+      if (!se || route() !== 'home') return;
+      if (se.scrollHeight - (se.scrollTop + innerHeight) > innerHeight * 2) return;
+      stats.feed.nudges = (stats.feed.nudges || 0) + 1;
       window.dispatchEvent(new Event('scroll'));
+      document.dispatchEvent(new Event('scroll'));
       const y = se.scrollTop;
-      if (y > 2) {
-        se.scrollTop = y - 1;
+      if (se.scrollHeight - innerHeight > 4) {
+        se.scrollTop = Math.max(0, y - 2) === y ? y + 2 : y - 2;
         requestAnimationFrame(() => { se.scrollTop = y; });
+      } else if (hard && document.body) {
+        // Nothing to scroll: briefly add room below so the list's end leaves and re-enters view.
+        const pad = document.createElement('div');
+        pad.setAttribute('aria-hidden', 'true');
+        pad.style.cssText = 'height:' + (innerHeight * 3) + 'px;pointer-events:none';
+        document.body.appendChild(pad);
+        se.scrollTop = innerHeight * 2;
+        requestAnimationFrame(() => requestAnimationFrame(() => { se.scrollTop = y; pad.remove(); }));
       }
-    }), 700);
+    }), 600);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * End of Home: offer Following and Favorites (newest first), skipping
+   * what you already saw. Shown by the app, outside Instagram's page.
+   * ------------------------------------------------------------------ */
+  let feedEndShown = false, atBottomSince = 0;
+  function checkFeedEnd() {
+    if (CFG.role !== 'main') return;
+    let show = false;
+    if (route() === 'home' && feedVariant() === 'home') {
+      const se = document.scrollingElement || document.documentElement;
+      const nearBottom = se.scrollHeight - (se.scrollTop + innerHeight) < Math.max(400, innerHeight * 0.6);
+      if (nearBottom) { if (!atBottomSince) atBottomSince = Date.now(); } else atBottomSince = 0;
+      show = nearBottom && (feedState.ended || (atBottomSince && Date.now() - atBottomSince > 4000));
+    } else {
+      atBottomSince = 0;
+    }
+    if (show !== feedEndShown) {
+      feedEndShown = show;
+      post('feedEnd', { on: show, caughtUp: feedState.caughtUp || feedState.ended });
+    }
+  }
+  let feedEndTimer = 0;
+  window.addEventListener('scroll', () => {
+    if (feedEndTimer) return;
+    feedEndTimer = setTimeout(() => { feedEndTimer = 0; safe(checkFeedEnd)(); }, 250);
+  }, { passive: true, capture: true });
+  setInterval(() => { if (route() === 'home' && !document.hidden) safe(checkFeedEnd)(); }, 1500);
+
+  /* ------------------------------------------------------------------ *
+   * Bigger feed batches: ask Instagram for more posts per load when
+   * scrolling on, so fewer waits once ads/suggestions are removed.
+   * Turns itself off for good if Instagram ever refuses the request.
+   * ------------------------------------------------------------------ */
+  const BUMP_OFF = 'sg_feed_batch_off';
+  function bumpAllowed() {
+    try { return localStorage.getItem(BUMP_OFF) !== '1'; } catch (e) { return false; }
+  }
+  function bumpFailed() {
+    stats.feed.batchFailed = (stats.feed.batchFailed || 0) + 1;
+    try { localStorage.setItem(BUMP_OFF, '1'); } catch (e) { /* ignore */ }
+  }
+  // Returns a rewritten form body, or null to leave the request alone.
+  function biggerBatch(url, body) {
+    if (typeof body !== 'string' || !bumpAllowed() || CFG.role !== 'main') return null;
+    if (!/\/(graphql\/query|api\/graphql)\/?(\?|$)/.test(String(url || ''))) return null;
+    if (body.indexOf('variables=') < 0) return null;
+    let params;
+    try { params = new URLSearchParams(body); } catch (e) { return null; }
+    const name = params.get('fb_api_req_friendly_name') || '';
+    if (!/feed/i.test(name) || /clips|reel|story|stories|explore|search|comment/i.test(name)) return null;
+    let vars;
+    try { vars = nativeParse(params.get('variables') || ''); } catch (e) { return null; }
+    if (!vars || typeof vars !== 'object' || !vars.after) return null;   // only "load more", never the first page
+    let changed = false;
+    for (const k of ['first', 'count']) {
+      if (typeof vars[k] === 'number' && vars[k] > 0 && vars[k] < 24) { vars[k] = 24; changed = true; }
+    }
+    if (!changed) return null;
+    params.set('variables', JSON.stringify(vars));
+    stats.feed.batchBumped = (stats.feed.batchBumped || 0) + 1;
+    return params.toString();
+  }
+  function looksFailed(status, text) {
+    if (status >= 400) return true;
+    const head = typeof text === 'string' ? text.slice(0, 400) : '';
+    return /^(for \(;;\);)?\s*\{\s*"errors"/.test(head);
+  }
+  if (window.XMLHttpRequest) {
+    const XP = XMLHttpRequest.prototype;
+    const nativeOpen = XP.open, nativeSend = XP.send;
+    const urls = new WeakMap();
+    XP.open = function open(method, url) {
+      urls.set(this, url);
+      return nativeOpen.apply(this, arguments);
+    };
+    XP.send = function send(body) {
+      const bigger = safe(biggerBatch)(urls.get(this), body);
+      if (bigger) {
+        this.addEventListener('loadend', () => {
+          try {
+            const text = this.responseType === '' || this.responseType === 'text' ? this.responseText : '';
+            if (looksFailed(this.status, text)) bumpFailed();
+          } catch (e) { /* ignore */ }
+        }, { once: true });
+        return nativeSend.call(this, bigger);
+      }
+      return nativeSend.apply(this, arguments);
+    };
+  }
+  if (window.fetch) {
+    const nativeFetch = window.fetch;
+    window.fetch = function fetch(input, init) {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const bigger = init && safe(biggerBatch)(url, init.body);
+      if (!bigger) return nativeFetch.apply(this, arguments);
+      const original = init;
+      return nativeFetch.call(this, input, Object.assign({}, init, { body: bigger })).then(res => {
+        if (!res.ok) { bumpFailed(); return nativeFetch.call(window, input, original); }
+        res.clone().text().then(t => { if (looksFailed(res.status, t)) bumpFailed(); }, () => {});
+        return res;
+      });
+    };
   }
 
   /* ------------------------------------------------------------------ *
@@ -699,6 +876,7 @@
     safe(tidyExplore)();
     safe(tidyStory)();
     safe(tidyCommentsChild)();
+    safe(autoplay)();
   }
   let lastTidy = 0, lastBannerScan = 0;
   function queueTidy() {
@@ -785,6 +963,11 @@
       location.replace('/');
       return;
     }
+    if (CFG.role === 'main') {
+      if (search.open) { hideSearch(); search.suspended = false; clearSaved(); }
+      restoreSearch();
+      if (route() === 'explore' && !search.open && !search.suspended) openSearch(true);
+    }
     if (CFG.role === 'main' && route() === 'comments' && previous !== 'comments' && !split) {
       // Instagram opened its full-page comments by itself; show them in the
       // half-screen panel instead and put the post back.
@@ -867,53 +1050,105 @@
     if (CFG.role !== 'main') return false;
     const r = route();
     if (r === 'story' || r === 'reel') return true;
+    if (!(v instanceof HTMLVideoElement)) return false;
     const b = v.getBoundingClientRect();
     if (r === 'direct' || r === 'post') return b.width * b.height > 0.45 * innerWidth * innerHeight;
     return false;
   }
-  function audioLabel(el) {
-    const own = el.getAttribute && el.getAttribute('aria-label');
-    if (own && /audio|sound|mute/i.test(own)) return own;
+  // Instagram's controls are labelled on the button or on its icon; the
+  // icon is not always inside a <button>.
+  function controlLabel(el) {
+    if (!el || !el.getAttribute) return '';
+    const own = el.getAttribute('aria-label');
+    if (own) return own.trim();
     const svg = el.querySelector && el.querySelector('svg[aria-label]');
-    const l = svg && svg.getAttribute('aria-label');
-    return l && /audio|sound|mute/i.test(l) ? l : '';
+    if (svg) return svg.getAttribute('aria-label').trim();
+    const title = el.querySelector && el.querySelector('svg title');
+    return title ? norm(title) : '';
   }
-  function findAudioToggle(v) {
-    let scope = v.parentElement;
+  function audioLabel(el) {
+    const l = controlLabel(el);
+    return /audio|sound|mute/i.test(l) ? l : '';
+  }
+  function shown(el) {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+  }
+  function findControl(media, re, wide) {
+    const test = el => re.test(controlLabel(el)) && shown(el);
+    let scope = media.parentElement;
     for (let i = 0; scope && i < 8; i++, scope = scope.parentElement) {
-      for (const el of scope.querySelectorAll('button,[role="button"]')) {
-        if (audioLabel(el)) return el;
+      for (const el of scope.querySelectorAll('button,[role="button"],svg[aria-label]')) {
+        if (test(el)) return el;
       }
+    }
+    if (!wide) return null;
+    for (const el of document.querySelectorAll('button,[role="button"],svg[aria-label]')) {
+      if (test(el)) return el;
     }
     return null;
   }
-  function unmute(v) {
-    const used = unmuteBudget.get(v) || { n: 0, t: Date.now() };
+  function press(el) {
+    const target = el.closest('button,[role="button"],a') || el;
+    if (typeof target.click === 'function') target.click();
+    else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  }
+  function unmute(m) {
+    const used = unmuteBudget.get(m) || { n: 0, t: Date.now() };
     if (Date.now() - used.t > 10000) { used.n = 0; used.t = Date.now(); }
     if (used.n >= 4) return;
     used.n++;
-    unmuteBudget.set(v, used);
-    const toggle = findAudioToggle(v);
-    if (toggle) {
-      try { toggle.click(); } catch (e) { /* ignore */ }
-      setTimeout(() => { if (v.muted && !userMuted) v.muted = false; }, 300);
+    unmuteBudget.set(m, used);
+    const r = route();
+    const toggle = findControl(m, /audio|sound|mute/i, r === 'story' || r === 'reel');
+    const label = toggle ? controlLabel(toggle) : '';
+    // "Audio is playing" means Instagram already thinks sound is on.
+    if (toggle && !/playing|is on|^mute$|turn off/i.test(label)) {
+      try { press(toggle); } catch (e) { /* ignore */ }
+      setTimeout(() => { if (m.muted && !userMuted) m.muted = false; }, 300);
     } else {
-      v.muted = false;
+      m.muted = false;
     }
   }
   document.addEventListener('play', safe(e => {
-    const v = e.target;
-    if (!(v instanceof HTMLVideoElement)) return;
-    if (CFG.role !== 'main') { v.pause(); v.muted = true; return; }
+    const m = e.target;
+    if (!(m instanceof HTMLMediaElement)) return;
+    if (CFG.role !== 'main') { m.pause(); m.muted = true; return; }
     queueAwake();
-    if (v.muted && !userMuted && wantsSound(v)) unmute(v);
+    if (m.muted && !userMuted && wantsSound(m)) unmute(m);
   }), true);
   document.addEventListener('volumechange', safe(e => {
-    const v = e.target;
-    if (!(v instanceof HTMLVideoElement) || CFG.role !== 'main') return;
-    if (Date.now() - lastUserAudioTap < 800) { userMuted = v.muted; return; }
-    if (v.muted && !userMuted && !v.paused && wantsSound(v)) setTimeout(() => { if (v.muted && !userMuted) unmute(v); }, 150);
+    const m = e.target;
+    if (!(m instanceof HTMLMediaElement) || CFG.role !== 'main') return;
+    if (Date.now() - lastUserAudioTap < 800) { userMuted = m.muted; return; }
+    if (m.muted && !userMuted && !m.paused && wantsSound(m)) setTimeout(() => { if (m.muted && !userMuted) unmute(m); }, 150);
   }), true);
+
+  /* ------------------------------------------------------------------ *
+   * A video you open (a Reel from a DM, a post's video) starts by
+   * itself once. If you pause it, it stays paused.
+   * ------------------------------------------------------------------ */
+  const autoStarted = new WeakSet();
+  function autoplay() {
+    if (CFG.role !== 'main') return;
+    const r = route();
+    if (r !== 'direct' && r !== 'reel' && r !== 'post') return;
+    for (const v of document.getElementsByTagName('video')) {
+      if (autoStarted.has(v) || v.ended) continue;
+      if (!v.paused) { autoStarted.add(v); continue; }
+      const b = v.getBoundingClientRect();
+      if (b.width * b.height < 0.4 * innerWidth * innerHeight || b.bottom <= 0 || b.top >= innerHeight) continue;
+      autoStarted.add(v);
+      if (v.currentTime > 0.3) continue;            // it has played before: you paused it
+      stats.autoplayed++;
+      const play = findControl(v, /^play$/i, false);
+      if (play) { try { press(play); } catch (e) { /* ignore */ } }
+      setTimeout(() => { if (v.paused && !v.ended && v.currentTime < 0.3) v.play().catch(() => {}); }, 400);
+    }
+  }
+  ['loadedmetadata', 'canplay'].forEach(t => document.addEventListener(t, e => {
+    if (e.target instanceof HTMLVideoElement) setTimeout(safe(autoplay), 50);
+  }, true));
 
   /* ------------------------------------------------------------------ *
    * Keep the screen on while a visible video plays.
@@ -1016,17 +1251,147 @@
       return n.toString();
     } catch (e) { return null; }
   }
+  // Instagram's own website requests; responses pass through the hooks
+  // above, so whatever they contain is indexed automatically.
+  // Parses an Instagram answer: strips "for (;;);", keeps long id lists exact,
+  // and merges streamed answers (several JSON objects, one per line).
+  function parseIg(text) {
+    if (typeof text !== 'string') return null;
+    text = text.replace(/^for \(;;\);/, '').replace(/"next_media_ids":\[([^\]]*)\]/g,
+      (m, inner) => '"next_media_ids":[' + inner.replace(/(^|,)\s*(\d{16,})/g, '$1"$2"') + ']');
+    try { return nativeParse(text); } catch (e) { /* maybe several objects */ }
+    let merged = null;
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      let o;
+      try { o = nativeParse(line); } catch (e) { continue; }
+      if (!merged) { merged = o; continue; }
+      if (o && o.data && merged.data && !o.path) Object.assign(merged.data, o.data);
+    }
+    return merged;
+  }
+  async function igGet(path) {
+    try {
+      const res = await fetch(path, {
+        credentials: 'include',
+        headers: { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'X-IG-WWW-Claim': '0' },
+      });
+      if (!res.ok) return null;
+      const data = parseIg(await res.text());
+      if (data && typeof data === 'object') cleanse(data);
+      return data && data.status !== 'fail' ? data : null;
+    } catch (e) { return null; }
+  }
+
+  // The Instagram website's own GraphQL requests. Their ids change every few
+  // weeks, so they are looked up in the page's loaded code at run time.
+  function igModule(name) {
+    try { return typeof window.require === 'function' ? window.require(name) : null; } catch (e) { return null; }
+  }
+  const docIds = {};
+  // Last ids seen in public captures (Sept–Oct 2026), used only when the
+  // page's own code doesn't reveal the current one.
+  const KNOWN_DOC_IDS = {
+    PolarisSearchBoxRefetchableQuery: '27706427925724183',
+    PolarisKeywordSearchExplorePageRelayQuery: '37324993597144881',
+    PolarisKeywordSearchExplorePageRelayPaginationQuery: '28656899673911396',
+    PolarisLocationPageTabContentQuery: '28211016731901625',
+  };
+  let scannedBundles = null;
+  async function docIdFor(name) {
+    if (docIds[name]) return docIds[name];
+    const op = igModule(name + '_instagramRelayOperation');
+    if (typeof op === 'string' && /^\d+$/.test(op)) return (docIds[name] = op);
+    const gql = igModule(name + '.graphql');
+    if (gql && gql.params && /^\d+$/.test(String(gql.params.id))) return (docIds[name] = String(gql.params.id));
+    // Last resort: find it in the script files the page already downloaded (from cache).
+    if (!scannedBundles) {
+      scannedBundles = {};
+      const urls = new Set();
+      for (const sc of document.scripts) if (sc.src) urls.add(sc.src);
+      try { for (const e of performance.getEntriesByType('resource')) if (/\.js(\?|$)/.test(e.name)) urls.add(e.name); } catch (e) { /* ignore */ }
+      const re = /__d\("([A-Za-z0-9_]+)_instagramRelayOperation",\[\],\(function\([^)]*\)\{[^}]*?exports="(\d+)"/g;
+      let n = 0;
+      for (const u of urls) {
+        if (!/cdninstagram\.com|instagram\.com/.test(u) || n++ > 80) continue;
+        try {
+          const text = await (await fetch(u, { cache: 'force-cache' })).text();
+          let m;
+          while ((m = re.exec(text))) scannedBundles[m[1]] = m[2];
+        } catch (e) { /* skip this file */ }
+      }
+    }
+    if (scannedBundles[name]) return (docIds[name] = scannedBundles[name]);
+    return KNOWN_DOC_IDS[name] || null;
+  }
+  let homeHtml = null;
+  async function pageToken(module, re) {
+    const m = igModule(module);
+    if (m && m.token) return m.token;
+    for (const sc of document.querySelectorAll('script:not([src])')) {
+      const hit = re.exec(sc.textContent || '');
+      if (hit) return hit[1];
+    }
+    try {
+      if (homeHtml === null) homeHtml = await (await fetch('/', { credentials: 'include' })).text();
+      const hit = re.exec(homeHtml);
+      if (hit) return hit[1];
+    } catch (e) { homeHtml = ''; }
+    return '';
+  }
+  // Returns data[root] (the answer's main object), or null.
+  async function igGraphQL(name, variables, root) {
+    const id = await docIdFor(name);
+    if (!id) return null;
+    const lsd = await pageToken('LSD', /"LSD",\[\],\{"token":"([^"]+)"/);
+    const body = new URLSearchParams({
+      doc_id: id, variables: JSON.stringify(variables),
+      fb_dtsg: await pageToken('DTSGInitialData', /"DTSGInitialData",\[\],\{"token":"([^"]+)"/),
+      lsd: lsd, fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: name, server_timestamps: 'true',
+    }).toString();
+    // The website uses /api/graphql; some requests only answer on /graphql/query.
+    for (const path of ['/api/graphql', '/graphql/query']) {
+      try {
+        const res = await fetch(path, {
+          method: 'POST', credentials: 'include',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': csrf(), 'X-IG-App-ID': '936619743392459',
+            'X-FB-LSD': lsd, 'X-FB-Friendly-Name': name,
+          },
+          body: body,
+        });
+        if (!res.ok) continue;
+        const data = parseIg(await res.text());
+        if (data && typeof data === 'object') cleanse(data);
+        const out = data && data.data && data.data[root];
+        if (out) return out;
+      } catch (e) { /* try the other path */ }
+    }
+    return null;
+  }
+  function uuid() {
+    try { return crypto.randomUUID(); } catch (e) { return String(Date.now()) + Math.random().toString(16).slice(2); }
+  }
   async function fetchInfo(pk) {
     if (!pk) return null;
-    const res = await fetch('/api/v1/media/' + pk + '/info/', {
-      credentials: 'include',
-      headers: { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest' },
-    });
-    if (!res.ok) return null;
-    const data = await res.json();          // indexed by the Response.json hook
+    const data = await igGet('/api/v1/media/' + pk + '/info/');
     const item = data && Array.isArray(data.items) ? data.items[0] : null;
     if (item && looksLikeMedia(item)) indexMedia(item);
     return item ? (index.byPk.get(mediaPk(item)) || null) : null;
+  }
+  async function userIdFor(username) {
+    const key = username.toLowerCase();
+    if (!userIds.has(key)) await igGet('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(username));
+    return userIds.get(key) || null;
+  }
+  // Loads a person's current Stories (or a highlight) so the one on screen can be found.
+  async function fetchStories(owner) {
+    if (!owner) return false;
+    let reel = null;
+    if (owner.highlight) reel = 'highlight:' + owner.highlight;
+    else if (owner.user) { const id = await userIdFor(owner.user); if (id) reel = id; }
+    if (!reel) return false;
+    return !!(await igGet('/api/v1/feed/reels_media/?reel_ids=' + encodeURIComponent(reel)));
   }
   function httpSrc(v) {
     const s = v.currentSrc || v.src || '';
@@ -1051,6 +1416,7 @@
       kind: el ? (el.tagName === 'VIDEO' ? 'video' : 'image') : null,
       code: r === 'story' ? null : (el ? codeForElement(el) : codeFromPath()),
       storyPk: r === 'story' ? storyPk() : null,
+      owner: r === 'story' ? storyOwner() : null,
       file: el ? fileOf(el.tagName === 'VIDEO' ? (el.poster || httpSrc(el) || '') : srcsetBest(el)) : null,
       imgUrl: el && el.tagName === 'IMG' ? srcsetBest(el) : null,
       videoUrl: el && el.tagName === 'VIDEO' ? httpSrc(el) : null,
@@ -1070,9 +1436,13 @@
   async function recordFor(s) {
     const hit = (s.file && index.byFile.get(s.file)) || (s.posterFile && index.byFile.get(s.posterFile));
     if (s.route === 'story') {
-      if (s.storyPk && index.byPk.has(s.storyPk)) return index.byPk.get(s.storyPk);
-      if (hit) return hit.rec;
-      return s.storyPk ? await fetchInfo(s.storyPk) : null;
+      const known = () => (s.storyPk && index.byPk.get(s.storyPk)) ||
+        ((s.file && index.byFile.get(s.file)) || (s.posterFile && index.byFile.get(s.posterFile)) || {}).rec || null;
+      if (known()) return known();
+      if (s.storyPk) { const r = await fetchInfo(s.storyPk); if (r) return r; }
+      await fetchStories(s.owner);
+      if (!known()) s.reason = 'story-not-found';
+      return known();
     }
     if (hit && (!s.code || !hit.rec.code || hit.rec.code === s.code)) return hit.rec;
     if (s.code) return index.byCode.get(s.code) || await fetchInfo(pkFromCode(s.code));
@@ -1120,9 +1490,15 @@
     }
     if (current && current.url) out.items = [current];
     if (!out.items.length && !out.choices.length) {
-      out.error = s.kind === 'video'
-        ? 'This video could not be matched to a downloadable file. Try again after it plays for a moment.'
-        : 'This photo could not be found.';
+      out.error = s.reason === 'story-not-found'
+        ? 'Instagram didn\u2019t share this Story\u2019s file. Try again in a moment, or after reopening the Story.'
+        : s.kind === 'video'
+          ? 'This video could not be matched to a downloadable file. Try again after it plays for a moment.'
+          : 'This photo could not be found.';
+      const why = s.reason || (s.kind === 'video' ? 'video-unmatched' : 'photo-unmatched');
+      stats.downloads.failed[why] = (stats.downloads.failed[why] || 0) + 1;
+    } else {
+      stats.downloads.ok++;
     }
     return out;
   }
@@ -1202,6 +1578,13 @@
     if (route() === 'story') storyDirection = e.clientX < innerWidth / 3 ? 'back' : 'next';
     if (CFG.role !== 'main') return;
     const a = t.closest('a[href]');
+    if (a && new URL(a.href, location.href).pathname === '/explore/' && a.closest('nav,div')) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      openSearch(true);
+      return;
+    }
     let code = null, control = null;
     if (a) {
       const p = new URL(a.href, location.href);
@@ -1218,8 +1601,639 @@
     openComments(code, control);
   }), true);
   function findAudioToggleTarget(t) {
-    const btn = t.closest('button,[role="button"]');
+    const btn = t.closest('button,[role="button"],svg[aria-label]');
     return btn && audioLabel(btn) ? btn : null;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Search with tabs, like the app: Accounts · Posts & Reels · Tags ·
+   * Places. Tags and places offer Top / Most recent when Instagram's
+   * website still serves recent posts. Results stop after a few
+   * "Show more" taps: no endless scrolling.
+   *
+   * It is SimpleGram's own screen, drawn in an isolated layer above
+   * Instagram's page; it only reads Instagram's own search data.
+   * ------------------------------------------------------------------ */
+  const SEARCH_STATE = 'sg_search_state';
+  const RECENT_KEY = 'sg_recent_searches';
+  const MAX_MORE = 3;
+  const TABS = [['accounts', 'Accounts'], ['posts', 'Posts & Reels'], ['tags', 'Tags'], ['places', 'Places']];
+  const search = {
+    host: null, root: null, open: false, suspended: false,
+    tab: 'accounts', query: '', view: null,       // view: {kind:'tag'|'place', id, name, sub:'top'|'recent'}
+    top: null, posts: null, grid: null, seq: 0, timer: 0, returnUrl: null,
+  };
+  SG.search = search;
+
+  function csrf() {
+    const m = /(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '');
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+  async function igPost(path, form) {
+    try {
+      const res = await fetch(path, {
+        method: 'POST', credentials: 'include',
+        headers: {
+          'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest',
+          'X-CSRFToken': csrf(), 'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams(form).toString(),
+      });
+      return res.ok ? await res.json() : null;
+    } catch (e) { return null; }
+  }
+  // Every post object inside a results payload, in order, once each.
+  function collectMedia(root) {
+    const out = [], seen = new Set(), stack = [root];
+    let budget = 20000;
+    while (stack.length && budget-- > 0) {
+      const o = stack.shift();
+      if (!o || typeof o !== 'object') continue;
+      if (Array.isArray(o)) { for (const x of o) stack.push(x); continue; }
+      if (looksLikeMedia(o) && (o.code || o.shortcode)) {
+        const code = o.code || o.shortcode;
+        if (!seen.has(code)) { seen.add(code); out.push(o); }
+        continue;                                  // not its carousel children
+      }
+      for (const k in o) if (o[k] && typeof o[k] === 'object') stack.push(o[k]);
+    }
+    return out;
+  }
+  function thumbOf(m) {
+    const c = (m.image_versions2 && m.image_versions2.candidates) ||
+      (Array.isArray(m.carousel_media) && m.carousel_media[0] && m.carousel_media[0].image_versions2 &&
+        m.carousel_media[0].image_versions2.candidates) || [];
+    let best = null;
+    for (const x of c) {
+      if (!x || !x.url) continue;
+      if (!best || (x.width >= 300 && (best.width < 300 || x.width < best.width)) || (best.width < 300 && x.width > best.width)) best = x;
+    }
+    return best ? best.url : '';
+  }
+  function postPath(m) {
+    const code = m.code || m.shortcode;
+    return (m.product_type === 'clips' ? '/reel/' : '/p/') + code + '/';
+  }
+  function moreState(o) {
+    if (!o || typeof o !== 'object') return null;
+    const more = o.more_available || o.has_more || (o.page_info && o.page_info.has_next_page);
+    if (!more) return null;
+    return {
+      max_id: o.next_max_id || o.max_id || (o.page_info && o.page_info.end_cursor) || '',
+      page: o.next_page != null ? o.next_page : null,
+      media_ids: Array.isArray(o.next_media_ids) ? o.next_media_ids : null,
+      rank_token: o.rank_token || '',
+    };
+  }
+
+  /* Data: Instagram's long-standing web endpoints first, then the
+     website's current GraphQL requests, then Instagram's own page. */
+  const LATIN = 'àáâäæãåāăąçćčđďèéêëēėęěğǵḧîïíīįìłḿñńǹňôöòóœøōõőṕŕřßśšşșťțûüùúūǘůűųẃẍÿýžźż·/_,:;';
+  const PLAIN = 'aaaaaaaaaacccddeeeeeeeegghiiiiiilmnnnnoooooooooprrsssssttuuuuuuuuuwxyyzzz------';
+  // Instagram's own slug rule for place links.
+  function slugify(s) {
+    return String(s || '').toLowerCase().replace(new RegExp('[' + LATIN + ']', 'g'), ch => PLAIN.charAt(LATIN.indexOf(ch)))
+      .replace(/[^\w\s-]+/g, '').trim().replace(/\s+/g, '-').replace(/--+/g, '-');
+  }
+  function users(list) {
+    return (list || []).map(x => x && (x.user || x)).filter(u => u && u.username);
+  }
+  function hashtags(list) {
+    return (list || []).map(x => x && (x.hashtag || x)).filter(h => h && h.name);
+  }
+  function places(list) {
+    return (list || []).map(x => {
+      const p = x && (x.place || x);
+      const loc = p && (p.location || p);
+      const id = loc && (loc.pk || loc.id || loc.location_id);
+      if (!id) return null;
+      const name = loc.name || p.title || '';
+      return { id: String(id), name: p.title || name, sub: p.subtitle || loc.address || loc.city || '', slug: p.slug || slugify(loc.name || name) };
+    }).filter(Boolean);
+  }
+  async function loadTop(q) {
+    let u = [], t = [], pl = [];
+    const blended = await igGet('/web/search/topsearch/?context=blended&include_reel=true&query=' + encodeURIComponent(q));
+    if (blended) { u = users(blended.users); t = hashtags(blended.hashtags); pl = places(blended.places); }
+    // Blended search has lately left out tags and places; ask for those directly.
+    const [tg, pg] = await Promise.all([
+      t.length ? null : igGet('/web/search/topsearch/?context=hashtag&query=' + encodeURIComponent(q.replace(/^#/, ''))),
+      pl.length ? null : igGet('/web/search/topsearch/?context=place&query=' + encodeURIComponent(q)),
+    ]);
+    if (tg) t = hashtags(tg.hashtags);
+    if (pg) pl = places(pg.places);
+    if (!pl.length) {
+      const fp = await igGet('/api/v1/fbsearch/places/?query=' + encodeURIComponent(q));
+      if (fp) pl = places(fp.items);
+    }
+    if (!u.length || !t.length || !pl.length) {
+      const c = await igGraphQL('PolarisSearchBoxRefetchableQuery', {
+        data: { context: 'blended', include_reel: 'true', query: q, rank_token: '', search_session_id: uuid(), search_surface: 'web_top_search' },
+        hasQuery: true,
+      }, 'xdt_api__v1__fbsearch__topsearch_connection');
+      if (c) {
+        if (!u.length) u = users(c.users);
+        if (!t.length) t = hashtags(c.hashtags);
+        if (!pl.length) pl = places(c.places);
+      }
+    }
+    if (!blended && !u.length && !t.length && !pl.length) return null;
+    return { users: u, tags: t, places: pl };
+  }
+  // Keyword grid: posts and Reels, and hashtags, which Instagram now shows the same way.
+  async function loadKeyword(q, cursor) {
+    if (!cursor || cursor.rest) {
+      let path = '/api/v1/fbsearch/web/top_serp/?enable_metadata=true&query=' + encodeURIComponent(q) +
+        '&search_session_id=' + encodeURIComponent((cursor && cursor.session) || '');
+      if (cursor && cursor.max_id) path += '&next_max_id=' + encodeURIComponent(cursor.max_id) + '&rank_token=' + encodeURIComponent(cursor.rank_token || '');
+      const data = await igGet(path);
+      const grid = data && (data.media_grid || data);
+      const media = grid ? collectMedia(grid.sections || grid) : [];
+      if (media.length) {
+        const more = grid.has_more || grid.more_available;
+        return { media: media, more: more ? { rest: true, max_id: grid.next_max_id || '', rank_token: grid.rank_token || data.rank_token || '' } : null };
+      }
+      if (cursor) return null;
+    }
+    const session = (cursor && cursor.session) || uuid();
+    const vars = { query: q, search_session_id: session, serp_session_id: session };
+    const c = cursor && cursor.after
+      ? await igGraphQL('PolarisKeywordSearchExplorePageRelayPaginationQuery', Object.assign(vars, { first: 24, after: cursor.after }), 'xdt_fbsearch__top_serp_graphql')
+      : await igGraphQL('PolarisKeywordSearchExplorePageRelayQuery', vars, 'xdt_fbsearch__top_serp_graphql');
+    if (!c) return null;
+    const units = (c.edges || []).map(e => e && e.node).filter(n => n && Array.isArray(n.items));
+    const pi = c.page_info || {};
+    return { media: collectMedia(units.map(n => n.items)), more: pi.has_next_page && pi.end_cursor ? { after: pi.end_cursor, session: session } : null };
+  }
+  async function loadPosts(q, cursor) {
+    return loadKeyword(q, cursor);
+  }
+  function sectionsForm(tab, cursor) {
+    const form = { tab: tab, surface: 'grid', include_persistent: '0' };
+    if (cursor) {
+      form.max_id = cursor.max_id || '';
+      if (cursor.page != null) form.page = String(cursor.page);
+      if (cursor.media_ids) form.next_media_ids = JSON.stringify(cursor.media_ids.map(String));
+    }
+    return form;
+  }
+  async function loadTag(view, cursor) {
+    const name = view.id.replace(/^#/, '');
+    const path = '/api/v1/tags/' + encodeURIComponent(name) + '/sections/';
+    if (view.sub === 'recent') {
+      // The website dropped Recent for hashtags; the old list still answers
+      // for some tags, but it isn't strictly newest first.
+      const part = await igPost(path, sectionsForm('recent', cursor));
+      const media = part ? collectMedia(part.sections || []) : [];
+      if (cursor) return part ? { media: media, more: moreState(part), unordered: true } : null;
+      return { media: media, more: media.length ? moreState(part) : null, noRecent: !media.length, unordered: true };
+    }
+    if (cursor && cursor.rest) {
+      const part = await igPost(path, sectionsForm('top', cursor));
+      if (!part) return null;
+      const m = moreState(part);
+      if (m) m.rest = true;
+      return { media: collectMedia(part.sections || []), more: m };
+    }
+    if (!cursor) {
+      const data = await igGet('/api/v1/tags/web_info/?tag_name=' + encodeURIComponent(name));
+      const body = data && (data.data || data);
+      const top = body && body.top;
+      if (body && body.media_count != null) view.count = body.media_count;
+      const media = top ? collectMedia(top.sections || []) : [];
+      if (media.length) {
+        const m = moreState(top);
+        if (m) m.rest = true;
+        return { media: media, more: m };
+      }
+    }
+    // What the website itself shows for a hashtag now.
+    return loadKeyword('#' + name, cursor);
+  }
+  async function loadPlace(view, cursor) {
+    const tab = view.sub === 'recent' ? 'recent' : 'ranked';
+    if (cursor) {
+      const part = await igPost('/api/v1/locations/' + encodeURIComponent(view.id) + '/sections/', sectionsForm(tab, cursor));
+      return part ? { media: collectMedia(part.sections || []), more: moreState(part) } : null;
+    }
+    const data = await igGet('/api/v1/locations/web_info/?location_id=' + encodeURIComponent(view.id) + '&show_nearby=false');
+    const body = data && (data.native_location_data || data);
+    if (body && body.location_info) {
+      const li = body.location_info;
+      view.name = li.name || view.name;
+      view.address = [li.location_address, li.location_city].filter(Boolean).join(', ') || view.address || '';
+      if (li.slug) view.slug = li.slug;
+    }
+    const part = body && body[tab];
+    const media = part ? collectMedia(part.sections || []) : [];
+    if (media.length) return { media: media, more: moreState(part) };
+    // The website's current request for a place's grid.
+    const c = await igGraphQL('PolarisLocationPageTabContentQuery', {
+      location_id: String(view.id), first: 24, after: null, tab: tab, page_size_override: null,
+      __relay_internal__pv__PolarisShortDramaEnabledrelayprovider: false,
+    }, 'xdt_location_get_web_info_tab');
+    if (c) {
+      const gm = collectMedia((c.edges || []).map(e => e && e.node));
+      if (gm.length) return { media: gm, more: null };
+    }
+    if (part || c) return { media: [], more: null, noRecent: tab === 'recent' };
+    return null;
+  }
+  async function loadTagOrPlace(view, cursor) {
+    return view.kind === 'tag' ? loadTag(view, cursor) : loadPlace(view, cursor);
+  }
+
+  /* Recent searches */
+  function recents() {
+    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]').slice(0, 15); } catch (e) { return []; }
+  }
+  function remember(item) {
+    try {
+      const list = recents().filter(x => !(x.kind === item.kind && x.id === item.id));
+      list.unshift(item);
+      localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, 15)));
+    } catch (e) { /* ignore */ }
+  }
+
+  /* Screen */
+  const SEARCH_CSS = `
+    :host{all:initial}
+    .wrap{position:fixed;left:0;right:0;top:0;bottom:var(--sg-bottom,0px);z-index:2147483000;display:flex;flex-direction:column;
+      background:#fff;color:#000;font:14px -apple-system,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-tap-highlight-color:transparent}
+    .bar{display:flex;align-items:center;gap:8px;padding:10px 12px 6px}
+    .field{flex:1;display:flex;align-items:center;gap:8px;background:#efefef;border-radius:10px;padding:0 10px;height:38px}
+    .field svg{flex:none;opacity:.55}
+    input{flex:1;border:0;outline:0;background:transparent;font:inherit;font-size:16px;color:inherit;min-width:0}
+    input::-webkit-search-cancel-button{display:none}
+    .clear{border:0;background:#c7c7c7;color:#fff;width:18px;height:18px;border-radius:50%;font-size:11px;line-height:18px;padding:0;display:none}
+    .cancel{border:0;background:none;font:inherit;font-weight:600;color:inherit;padding:6px 2px}
+    .tabs{display:flex;border-bottom:1px solid #dbdbdb}
+    .tab{flex:1;border:0;background:none;font:inherit;font-weight:600;color:#737373;padding:11px 2px;border-bottom:1px solid transparent;margin-bottom:-1px;white-space:nowrap}
+    .tab.on{color:inherit;border-bottom-color:currentColor}
+    .head{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #dbdbdb}
+    .back{border:0;background:none;font:inherit;font-size:22px;line-height:1;color:inherit;padding:2px 8px 2px 0}
+    .htitle{font-weight:700;font-size:16px}.hsub{color:#737373;font-size:12px}
+    .seg{display:flex;margin:10px 12px 6px;background:#efefef;border-radius:9px;padding:2px}
+    .seg button{flex:1;border:0;background:none;font:inherit;font-weight:600;padding:7px;border-radius:8px;color:#737373}
+    .seg button.on{background:#fff;color:#000;box-shadow:0 1px 2px rgba(0,0,0,.15)}
+    .body{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+    .row{display:flex;align-items:center;gap:12px;padding:8px 14px;width:100%;border:0;background:none;font:inherit;color:inherit;text-align:left}
+    .row:active{background:rgba(0,0,0,.05)}
+    .av{width:44px;height:44px;border-radius:50%;object-fit:cover;background:#efefef;flex:none}
+    .ic{width:44px;height:44px;border-radius:50%;border:1px solid #dbdbdb;display:flex;align-items:center;justify-content:center;flex:none;font-size:20px}
+    .t1{font-weight:600;display:flex;align-items:center;gap:4px}.t2{color:#737373;font-size:13px;margin-top:1px}
+    .tx{min-width:0;overflow:hidden}.tx div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px}
+    .cell{position:relative;aspect-ratio:3/4;background:#efefef;border:0;padding:0;overflow:hidden}
+    .cell img{width:100%;height:100%;object-fit:cover;display:block}
+    .badge{position:absolute;top:6px;right:6px;color:#fff;font-size:13px;text-shadow:0 0 3px rgba(0,0,0,.6)}
+    .msg{color:#737373;text-align:center;padding:28px 24px;line-height:1.4}
+    .more,.link{display:block;margin:14px auto 22px;border:0;border-radius:9px;background:#efefef;color:inherit;font:inherit;font-weight:600;padding:9px 18px}
+    .link{background:none;color:#0095f6}
+    .label{font-weight:700;font-size:16px;padding:14px 14px 6px}
+    .spin{width:22px;height:22px;margin:28px auto;border:2px solid #dbdbdb;border-top-color:#737373;border-radius:50%;animation:s .8s linear infinite}
+    @keyframes s{to{transform:rotate(360deg)}}
+    @media (prefers-color-scheme:dark){
+      .wrap{background:#000;color:#f5f5f5}.field,.seg,.more,.cell,.av{background:#262626}
+      .tabs,.head{border-color:#262626}.ic{border-color:#363636}.seg button.on{background:#000;color:#f5f5f5}
+      .row:active{background:rgba(255,255,255,.06)}.clear{background:#555}.spin{border-color:#363636;border-top-color:#a8a8a8}
+    }`;
+  const ICON_SEARCH = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7.5"/><path d="M16.5 16.5 22 22" stroke-linecap="round"/></svg>';
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function navHeight() {
+    const a = document.querySelector('a[href="/direct/inbox/"],a[href="/"]');
+    let n = a;
+    for (let i = 0; n && i < 10; i++, n = n.parentElement) {
+      const cs = getComputedStyle(n);
+      if (cs.position === 'fixed') {
+        const r = n.getBoundingClientRect();
+        return r.top > innerHeight / 2 ? Math.max(0, innerHeight - r.top) : 0;
+      }
+    }
+    return 0;
+  }
+  function buildSearch() {
+    if (search.host) return;
+    const host = document.createElement('div');
+    host.id = 'sg-search';
+    const root = host.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = SEARCH_CSS;
+    root.appendChild(style);
+    const wrap = el('div', 'wrap');
+    root.appendChild(wrap);
+    (document.body || document.documentElement).appendChild(host);
+    search.host = host;
+    search.root = root;
+    search.wrap = wrap;
+  }
+  function saveSearch() {
+    try {
+      sessionStorage.setItem(SEARCH_STATE, JSON.stringify({
+        tab: search.tab, query: search.query, view: search.view, returnUrl: search.returnUrl,
+        top: search.top, posts: search.posts, grid: search.grid,
+        scroll: search.body ? search.body.scrollTop : 0, suspended: search.suspended, at: Date.now(),
+      }));
+    } catch (e) { /* storage full or unavailable */ }
+  }
+  function clearSaved() { try { sessionStorage.removeItem(SEARCH_STATE); } catch (e) { /* ignore */ } }
+
+  function render() {
+    const w = search.wrap;
+    w.style.setProperty('--sg-bottom', navHeight() + 'px');
+    w.textContent = '';
+    if (search.view) return renderView(w);
+    const bar = el('div', 'bar');
+    const field = el('label', 'field');
+    field.innerHTML = ICON_SEARCH;
+    const input = el('input');
+    input.type = 'search';
+    input.placeholder = 'Search';
+    input.enterKeyHint = 'search';
+    input.autocomplete = 'off';
+    input.value = search.query;
+    const clear = el('button', 'clear', '✕');
+    clear.style.display = search.query ? 'block' : 'none';
+    field.append(input, clear);
+    const cancel = el('button', 'cancel', 'Cancel');
+    bar.append(field, cancel);
+    const tabs = el('div', 'tabs');
+    for (const [key, label] of TABS) {
+      const b = el('button', 'tab' + (search.tab === key ? ' on' : ''), label);
+      b.onclick = () => { search.tab = key; render(); if (key === 'posts') runPosts(false); };
+      tabs.appendChild(b);
+    }
+    const body = el('div', 'body');
+    search.body = body;
+    w.append(bar, tabs, body);
+    input.addEventListener('input', () => {
+      search.query = input.value;
+      clear.style.display = input.value ? 'block' : 'none';
+      clearTimeout(search.timer);
+      search.timer = setTimeout(() => runQuery(), 280);
+    });
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { input.blur(); clearTimeout(search.timer); runQuery(); }
+    });
+    clear.onclick = e => { e.preventDefault(); search.query = ''; search.top = null; search.posts = null; render(); focusInput(); };
+    cancel.onclick = () => closeSearch(true);
+    search.input = input;
+    renderBody();
+  }
+  function focusInput() {
+    if (search.input) { search.input.focus(); const n = search.input.value.length; search.input.setSelectionRange(n, n); }
+  }
+  function renderBody() {
+    const body = search.body;
+    if (!body) return;
+    body.textContent = '';
+    const q = search.query.trim();
+    if (!q) {
+      const items = recents();
+      if (!items.length) { body.appendChild(el('div', 'msg', 'Search for people, posts, Reels, tags and places.')); return; }
+      body.appendChild(el('div', 'label', 'Recent'));
+      for (const it of items) body.appendChild(resultRow(it));
+      return;
+    }
+    if (search.tab === 'posts') return renderGrid(body, search.posts, () => runPosts(true), q);
+    const top = search.top;
+    if (!top || top.q !== q) { body.appendChild(el('div', 'spin')); return; }
+    if (top.error) return renderFailure(body, q);
+    let items = [];
+    if (search.tab === 'accounts') items = top.users.map(u => ({ kind: 'user', id: u.username, title: u.username, sub: u.full_name || '', pic: u.profile_pic_url || '', verified: !!u.is_verified }));
+    if (search.tab === 'tags') items = top.tags.map(h => ({ kind: 'tag', id: h.name, title: '#' + h.name, sub: h.media_count != null ? Number(h.media_count).toLocaleString() + ' posts' : '' }));
+    if (search.tab === 'places') items = top.places.map(p => ({ kind: 'place', id: p.id, title: p.name, sub: p.sub, slug: p.slug }));
+    if (!items.length) {
+      body.appendChild(el('div', 'msg', 'No ' + TABS.find(t => t[0] === search.tab)[1].toLowerCase() + ' found for “' + q + '”.'));
+      return;
+    }
+    for (const it of items) body.appendChild(resultRow(it));
+  }
+  function resultRow(it) {
+    const row = el('button', 'row');
+    if (it.kind === 'user') {
+      const img = el('img', 'av');
+      img.alt = '';
+      img.referrerPolicy = 'origin';
+      if (it.pic) img.src = it.pic;
+      row.appendChild(img);
+    } else {
+      row.appendChild(el('div', 'ic', it.kind === 'tag' ? '#' : it.kind === 'place' ? '\u{1F4CD}' : '\u{1F50E}'));
+    }
+    const tx = el('div', 'tx');
+    const t1 = el('div', 't1', it.title);
+    if (it.verified) { const v = el('span', '', '✔︎'); v.style.cssText = 'color:#0095f6;font-size:11px'; t1.appendChild(v); }
+    tx.appendChild(t1);
+    if (it.sub) tx.appendChild(el('div', 't2', it.sub));
+    row.appendChild(tx);
+    row.onclick = () => pick(it);
+    return row;
+  }
+  function pick(it) {
+    remember(it);
+    if (it.kind === 'user') return openPath('/' + encodeURIComponent(it.id) + '/');
+    if (it.kind === 'tag' || it.kind === 'place') {
+      search.view = { kind: it.kind, id: it.id, name: it.title, address: it.sub, slug: it.slug || '', sub: 'top' };
+      search.grid = null;
+      render();
+      runGrid(false);
+      return;
+    }
+    if (it.kind === 'query') { search.query = it.id; render(); runQuery(); }
+  }
+  function renderView(w) {
+    const v = search.view;
+    const head = el('div', 'head');
+    const back = el('button', 'back', '‹');
+    back.onclick = () => { search.view = null; search.grid = null; render(); };
+    const tx = el('div', 'tx');
+    tx.appendChild(el('div', 'htitle', v.kind === 'tag' ? (v.name.startsWith('#') ? v.name : '#' + v.name) : v.name));
+    const sub = v.kind === 'tag' ? (v.count != null ? Number(v.count).toLocaleString() + ' posts' : '') : (v.address || '');
+    if (sub) tx.appendChild(el('div', 'hsub', sub));
+    head.append(back, tx);
+    const seg = el('div', 'seg');
+    for (const [key, label] of [['top', 'Top'], ['recent', 'Most recent']]) {
+      const b = el('button', v.sub === key ? 'on' : '', label);
+      b.onclick = () => { if (v.sub === key) return; v.sub = key; search.grid = null; render(); runGrid(false); };
+      seg.appendChild(b);
+    }
+    const body = el('div', 'body');
+    search.body = body;
+    w.append(head, seg, body);
+    renderGrid(body, search.grid, () => runGrid(true), null);
+  }
+  function renderGrid(body, state, more, q) {
+    body.textContent = '';
+    if (!state || state.loading && !state.media.length) { body.appendChild(el('div', 'spin')); return; }
+    if (state.error) return renderFailure(body, q);
+    if (state.noRecent && !state.media.length) {
+      body.appendChild(el('div', 'msg', search.view && search.view.kind === 'tag'
+        ? 'Instagram no longer shows most recent posts for hashtags. Top is all it offers now.'
+        : 'Instagram isn\u2019t showing most recent posts here right now. Try Top.'));
+      return;
+    }
+    if (state.unordered && state.media.length) {
+      body.appendChild(el('div', 'msg', 'Instagram\u2019s recent list for hashtags isn\u2019t strictly newest first.'));
+    }
+    if (!state.media.length) { body.appendChild(el('div', 'msg', 'No posts found.')); return; }
+    const grid = el('div', 'grid');
+    for (const m of state.media) {
+      const cell = el('button', 'cell');
+      const img = el('img');
+      img.alt = '';
+      img.loading = 'lazy';
+      img.src = m.thumb;
+      cell.appendChild(img);
+      if (m.reel || m.multi) cell.appendChild(el('span', 'badge', m.reel ? '▶︎' : '❐'));
+      cell.onclick = () => openPath(m.path);
+      grid.appendChild(cell);
+    }
+    body.appendChild(grid);
+    if (state.loading) body.appendChild(el('div', 'spin'));
+    else if (state.more && state.pages < MAX_MORE + 1) {
+      const b = el('button', 'more', 'Show more');
+      b.onclick = more;
+      body.appendChild(b);
+    }
+  }
+  function renderFailure(body, q) {
+    body.appendChild(el('div', 'msg', 'Instagram didn’t return results here.'));
+    const fallback = search.view
+      ? (search.view.kind === 'tag'
+        ? '/explore/search/keyword/?q=' + encodeURIComponent('#' + search.view.id.replace(/^#/, ''))
+        : '/explore/locations/' + encodeURIComponent(search.view.id) + '/' + (search.view.slug ? search.view.slug + '/' : '') + (search.view.sub === 'recent' ? 'recent/' : ''))
+      : '/explore/search/keyword/?q=' + encodeURIComponent(q || search.query);
+    const b = el('button', 'link', 'Open Instagram’s own page');
+    b.onclick = () => openPath(fallback);
+    body.appendChild(b);
+  }
+  function addNew(have, more) {
+    const seen = new Set(have.map(m => m.path));
+    return have.concat(more.filter(m => !seen.has(m.path) && seen.add(m.path)));
+  }
+  function slim(list) {
+    return list.map(m => ({
+      path: postPath(m), thumb: thumbOf(m),
+      reel: m.product_type === 'clips' || m.media_type === 2, multi: Array.isArray(m.carousel_media) && m.carousel_media.length > 1,
+    })).filter(m => m.thumb);
+  }
+  async function runQuery() {
+    const q = search.query.trim();
+    if (!q) { renderBody(); return; }
+    if (search.tab === 'posts') { runPosts(false); return; }
+    const seq = ++search.seq;
+    if (!search.top || search.top.q !== q) renderBody();
+    const top = await loadTop(q);
+    if (seq !== search.seq) return;
+    search.top = top ? Object.assign({ q: q }, top) : { q: q, error: true, users: [], tags: [], places: [] };
+    if (!search.view) renderBody();
+  }
+  async function runPosts(more) {
+    const q = search.query.trim();
+    if (!q) return;
+    let st = search.posts;
+    if (!more || !st || st.q !== q) st = search.posts = { q: q, media: [], more: null, pages: 0, loading: true };
+    else { if (!st.more || st.loading) return; st.loading = true; }
+    renderBody();
+    const seq = ++search.seq;
+    const res = await loadPosts(q, more ? st.more : null);
+    if (seq !== search.seq || search.posts !== st) return;
+    st.loading = false;
+    if (!res) { if (!st.media.length) st.error = true; }
+    else { st.media = addNew(st.media, slim(res.media)); st.more = res.more; st.pages++; }
+    if (search.tab === 'posts' && !search.view) renderBody();
+  }
+  async function runGrid(more) {
+    const v = search.view;
+    if (!v) return;
+    let st = search.grid;
+    if (!more || !st) st = search.grid = { media: [], more: null, pages: 0, loading: true };
+    else { if (!st.more || st.loading) return; st.loading = true; }
+    render();
+    const seq = ++search.seq;
+    const res = await loadTagOrPlace(v, more ? st.more : null);
+    if (seq !== search.seq || search.grid !== st || search.view !== v) return;
+    st.loading = false;
+    if (!res) { if (!st.media.length) st.error = true; }
+    else { st.media = addNew(st.media, slim(res.media)); st.more = res.more; st.pages++; st.noRecent = !!res.noRecent; st.unordered = !!res.unordered; }
+    render();
+  }
+
+  // Open a profile/post from search. Try Instagram's in-app navigation;
+  // if the page doesn't change, load it normally. Back brings search back.
+  function openPath(path) {
+    search.suspended = true;
+    saveSearch();
+    hideSearch();
+    const before = document.title, from = location.href;
+    try {
+      history.pushState(null, '', path);
+      window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    } catch (e) { location.assign(path); return; }
+    setTimeout(() => {
+      if (location.href !== from && document.title === before) location.replace(path);
+    }, 1500);
+  }
+  function showSearch() {
+    buildSearch();
+    search.host.style.display = '';
+    search.open = true;
+    post('search', { open: true });
+  }
+  function hideSearch() {
+    if (search.body) search.lastScroll = search.body.scrollTop;
+    if (search.host) search.host.style.display = 'none';
+    search.open = false;
+    post('search', { open: false });
+  }
+  function openSearch(fresh) {
+    if (CFG.role !== 'main') return;
+    search.returnUrl = location.pathname + location.search;
+    search.suspended = false;
+    if (fresh) { search.view = null; search.grid = null; }
+    showSearch();
+    render();
+    // Focus right away, while the tap still counts, so the keyboard opens.
+    if (!search.view) focusInput();
+    stats.searchOpened = (stats.searchOpened || 0) + 1;
+  }
+  function closeSearch(leaveExplore) {
+    hideSearch();
+    search.suspended = false;
+    clearSaved();
+    if (leaveExplore && route() === 'explore') {
+      if (history.length > 1) history.back(); else location.assign('/');
+    }
+  }
+  // Back: inside search first (a tag/place page → results → close).
+  SG.back = () => {
+    if (!search.open) return false;
+    if (search.view) { search.view = null; search.grid = null; render(); return true; }
+    closeSearch(true);
+    return true;
+  };
+  // Returning to the page search was opened from brings it back as you left it.
+  function restoreSearch() {
+    if (CFG.role !== 'main' || search.open) return;
+    let saved = null;
+    if (search.suspended) saved = { returnUrl: search.returnUrl, scroll: search.lastScroll };
+    else {
+      try { saved = JSON.parse(sessionStorage.getItem(SEARCH_STATE) || 'null'); } catch (e) { saved = null; }
+      if (!saved || !saved.suspended || Date.now() - saved.at > 30 * 60 * 1000) return;
+      Object.assign(search, { tab: saved.tab, query: saved.query, view: saved.view, top: saved.top, posts: saved.posts, grid: saved.grid, returnUrl: saved.returnUrl });
+      search.suspended = true;
+    }
+    if (location.pathname + location.search !== search.returnUrl) return;
+    search.suspended = false;
+    showSearch();
+    render();
+    const y = saved && saved.scroll;
+    if (y && search.body) requestAnimationFrame(() => { search.body.scrollTop = y; });
   }
 
   /* ------------------------------------------------------------------ *
@@ -1277,6 +2291,9 @@
         break;
       }
       case 'splitClosed': closeSplit(); break;
+      case 'continueFeed':
+        if (cmd.variant === 'following' || cmd.variant === 'favorites') continueFeed(cmd.variant);
+        break;
       case 'storyHold': storyHold(!!cmd.on); break;
       case 'viewer': if (cmd.id) CFG.viewerId = String(cmd.id); break;
       case 'status': post('status', { stats: stats, route: route(), version: CFG.version }); break;
@@ -1291,6 +2308,10 @@
   function start() {
     addStyle();
     queueTidy();
+    if (CFG.role === 'main') {
+      safe(restoreSearch)();
+      if (route() === 'explore' && !search.open) safe(openSearch)(true);
+    }
     new MutationObserver(queueTidy).observe(document.documentElement, { childList: true, subtree: true });
     post('ready', { url: location.href, route: route() });
   }

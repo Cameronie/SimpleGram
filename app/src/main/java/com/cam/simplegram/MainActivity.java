@@ -86,6 +86,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private CommentsPanel comments;
     private TextView menuButton;
     private TextView zoomChip;
+    private View feedBar;
     private View screenshotShield;
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
@@ -145,6 +146,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         chipLp.topMargin = dp(10);
         root.addView(zoomChip, chipLp);
+
+        feedBar = makeFeedBar();
+        FrameLayout.LayoutParams barLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        barLp.bottomMargin = dp(72);
+        root.addView(feedBar, barLp);
 
         menuButton = makeMenuButton();
         root.addView(menuButton, new FrameLayout.LayoutParams(dp(40), dp(40)));
@@ -456,9 +463,19 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         switch (action) {
             case "ready":
             case "route":
-                if (main) route = m.optString("route", "other");
-                else comments.pageReady();
+                if (main) {
+                    route = m.optString("route", "other");
+                    if (!"home".equals(route)) showFeedBar(false);
+                } else {
+                    comments.pageReady();
+                }
                 if (main && "ready".equals(action)) refreshViewer();
+                break;
+            case "feedEnd":
+                if (main) showFeedBar(m.optBoolean("on"));
+                break;
+            case "search":
+                if (main && m.optBoolean("open")) showFeedBar(false);
                 break;
             case "awake":
                 if (main) setAwake(m.optBoolean("on"));
@@ -540,6 +557,85 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         chip.setVisibility(View.GONE);
         chip.setOnClickListener(v -> zoom.reset(true));
         return chip;
+    }
+
+    /* ------------------------------------------------------------------ *
+     * End of Home: keep going in Following or Favorites
+     * ------------------------------------------------------------------ */
+
+    private View makeFeedBar() {
+        android.widget.LinearLayout bar = new android.widget.LinearLayout(this);
+        bar.setOrientation(android.widget.LinearLayout.VERTICAL);
+        bar.setGravity(Gravity.CENTER_HORIZONTAL);
+        bar.setPadding(dp(16), dp(12), dp(16), dp(14));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(dark ? 0xF2262626 : 0xF2FFFFFF);
+        bg.setCornerRadius(dp(18));
+        bg.setStroke(dp(1), dark ? 0x33FFFFFF : 0x22000000);
+        bar.setBackground(bg);
+        bar.setElevation(dp(8));
+
+        TextView title = new TextView(this);
+        title.setText("You're all caught up on Home");
+        title.setTextColor(dark ? Color.WHITE : Color.BLACK);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setGravity(Gravity.CENTER);
+        bar.addView(title);
+        TextView sub = new TextView(this);
+        sub.setText("Keep going, newest first, without repeats:");
+        sub.setTextColor(dark ? 0xFFA8A8A8 : 0xFF737373);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        sub.setGravity(Gravity.CENTER);
+        sub.setPadding(0, dp(2), 0, dp(10));
+        bar.addView(sub);
+
+        android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+        row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        row.addView(feedButton("Following", "following"));
+        View gap = new View(this);
+        row.addView(gap, new android.widget.LinearLayout.LayoutParams(dp(10), 1));
+        row.addView(feedButton("Favorites", "favorites"));
+        bar.addView(row);
+        bar.setVisibility(View.GONE);
+        return bar;
+    }
+
+    private TextView feedButton(String label, String variant) {
+        TextView b = new TextView(this);
+        b.setText(label);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(22), dp(9), dp(22), dp(9));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFF0095F6);
+        bg.setCornerRadius(dp(10));
+        b.setBackground(bg);
+        b.setOnClickListener(v -> {
+            showFeedBar(false);
+            try {
+                js(new JSONObject().put("type", "continueFeed").put("variant", variant));
+            } catch (JSONException ignored) {
+                // Not reachable with constant keys.
+            }
+        });
+        return b;
+    }
+
+    private void showFeedBar(boolean on) {
+        boolean visible = feedBar.getVisibility() == View.VISIBLE;
+        if (on && !screenshotMode && !comments.isOpen() && !zoom.isZoomed()) {
+            if (visible) return;
+            feedBar.setAlpha(0f);
+            feedBar.setTranslationY(dp(16));
+            feedBar.setVisibility(View.VISIBLE);
+            feedBar.animate().alpha(1f).translationY(0f).setDuration(180).start();
+        } else if (visible) {
+            feedBar.animate().alpha(0f).translationY(dp(16)).setDuration(150)
+                    .withEndAction(() -> feedBar.setVisibility(View.GONE)).start();
+        }
     }
 
     /* ------------------------------------------------------------------ *
@@ -979,6 +1075,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (storyMode()) zoom.hold();
         menuButton.setVisibility(View.GONE);
         zoomChip.setVisibility(View.GONE);
+        showFeedBar(false);
         setSystemBarsHidden(true);
         screenshotShield = new View(this);
         screenshotShield.setOnClickListener(v -> exitScreenshot());
@@ -1053,10 +1150,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             zoom.reset(true);
         } else if (comments.isOpen()) {
             if (!comments.goBack()) closeComments();
-        } else if (!"home".equals(route) && web.canGoBack()) {
-            web.goBack();
         } else {
-            moveTaskToBack(true);
+            // The page may have its own screen to close first (SimpleGram search).
+            web.evaluateJavascript("!!(window.__sg&&window.__sg.back&&window.__sg.back())", handled -> {
+                if ("true".equals(handled)) return;
+                if (!"home".equals(route) && web.canGoBack()) web.goBack();
+                else moveTaskToBack(true);
+            });
         }
     }
 
