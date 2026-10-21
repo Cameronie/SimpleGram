@@ -3,7 +3,8 @@
 Distraction-free Instagram for Android. Your friends' posts, Stories, Reels and
 messages — without ads, suggested posts, reposts, the Reels tab or endless scrolling.
 
-**Download:** [`dist/SimpleGram-1.0.apk`](dist/SimpleGram-1.0.apk) · Android 10 or newer.
+**Download:** [`dist/SimpleGram-1.1.apk`](dist/SimpleGram-1.1.apk) · Android 10 or newer.
+It installs over an earlier version and keeps your login.
 
 ## What it does
 
@@ -12,22 +13,29 @@ messages — without ads, suggested posts, reposts, the Reels tab or endless scr
 | Posts from people you follow (and your own) | Ads and "Sponsored" posts, including Story ads |
 | Stories, DMs, profiles, notifications, comments | "Suggested for you" posts and account carousels |
 | Reels opened from a DM, Story, profile, post or search | Friends' reposts and posts surfaced because a friend liked/commented |
-| Search for accounts, posts and Reels | The Reels tab and the Explore suggestion grid |
+| Search: Accounts · Posts & Reels · Tags · Places | The Reels tab and the Explore suggestion grid |
 | Instagram's own look, buttons and settings | Swiping from one Reel on to the next (go back and pick another) |
-| | Endless search results (a few pages, then it stops) |
+| | Endless search results (3 "Show more" taps, then it stops) |
 | | "Use the app" banners |
 
 Extras:
 
-- **Pinch to zoom** anything (up to 5×) — photos, carousels, videos, Stories, Reels, DMs.
-  One finger pans, double-tap or the chip at the top resets. A zoomed Story stays put
+- **Pinch to zoom** anything (up to 5×, never smaller than the screen) — photos, carousels,
+  videos, Stories, Reels, DMs. One finger pans, double-tap or the chip at the top resets. A zoomed Story stays put
   (videos loop) until you let go of the zoom.
 - **Download** the photo or video on screen from the ⋮ menu (full resolution;
-  carousels offer "this one" or "all"). Saved to `Downloads/SimpleGram`.
+  carousels offer "this one" or "all"). Saved to `Downloads/SimpleGram`. If a Story's
+  file wasn't loaded yet, SimpleGram looks it up from the account's Stories.
 - **Comments in a half-screen panel** under the post, like the app — the video keeps playing.
 - **Sound on** for Stories and opened Reels; your own mute is respected.
+- **Opened videos play by themselves** (a Reel from a DM, an opened post or Reel), once,
+  unless you already played or paused it.
+- **Search with tabs** like the app: Accounts · Posts & Reels · Tags · Places. Places have
+  Top / Most recent. Back from a result returns to your search.
+- **End of Home**: when Home runs out, a card offers **Following** and **Favorites** side by
+  side (newest first). Opened from there, they skip posts you already saw in Home.
 - **Screen stays on** while a video plays.
-- **Following** (newest first) and **Favorites** feeds in the menu.
+- **Following** (newest first) and **Favorites** feeds in the menu too (these show everything).
 - **Clean screenshots**: hide the menu button and system bars, tap to bring them back.
 - **Instagram links** from texts and other apps open in SimpleGram (menu → More → Open Instagram
   links…), or use Share → SimpleGram / "Open copied Instagram link".
@@ -55,20 +63,25 @@ details are stored).
 
 | File | Role |
 | --- | --- |
-| `app/src/main/assets/simplegram.js` | Page script: data filter, media index for downloads, banner/Reels-tab tidy-up, comments hand-off, sound, screen-awake, Reel swipe guard, search position |
-| `app/src/main/java/.../MainActivity.java` | WebViews, menu, downloads, links, Back, screenshot mode |
+| `app/src/main/assets/simplegram.js` | Page script: data filter, media index for downloads, banner/Reels-tab tidy-up, comments hand-off, sound and autoplay, screen-awake, Reel swipe guard, search screen, end of Home |
+| `app/src/main/java/.../MainActivity.java` | WebViews, menu, downloads, links, Back, screenshot mode, end-of-Home card |
 | `app/src/main/java/.../ZoomFrame.java` | Pinch/pan magnifier, Story hold, comments split view |
 | `app/src/main/java/.../CommentsPanel.java` | The half-screen comments sheet |
 | `tests/page.test.cjs` | Browser tests for the page script (Chromium, fixture data) |
 
 ## Limits
 
-- Tested against fixture data shaped like Instagram's (30 browser tests) and on an
-  Android 10 emulator (5 native tests), not against a signed-in Instagram account —
+- Tested against fixture data shaped like Instagram's (51 browser tests) and on an
+  Android 10 emulator (7 native tests), not against a signed-in Instagram account —
   Instagram can't be reached from the build machine. Your phone is the real test.
 - Instagram's website, not the app: calls, music on Stories, and some posting features
   are as limited as they are on instagram.com in a phone browser.
 - Saving to a specific collection works only as far as Instagram's website offers it.
+- Hashtags: Instagram's website no longer offers Most recent. SimpleGram shows Instagram's
+  older recent list when it still answers, and says so; it isn't strictly newest first.
+- Home loads the page size Instagram chooses. Most of each page is ads and suggestions,
+  so SimpleGram loads ahead rather than bigger. Following is the faster feed.
+- Instants and the Map in messages are app-only; Instagram's website doesn't have them.
 - Some videos (protected or audio-separate streams) can't be downloaded; you'll get a message.
 - Android decides which app opens instagram.com links; SimpleGram can't force it.
 
@@ -85,11 +98,11 @@ Tests (Node 18+ and Playwright's Chromium):
 
 ```sh
 npm install playwright && npx playwright install chromium
-node --test tests/
+node --test tests/page.test.cjs
 ```
 
 On-device tests for the native shell (pinch zoom, comments split view, menu,
-screenshot mode, Back, incoming links) run on a phone or emulator:
+screenshot mode, Back, incoming links, end-of-Home card) run on a phone or emulator:
 
 ```sh
 ./gradlew connectedDebugAndroidTest

@@ -175,6 +175,9 @@ public class ShellTest {
             s.onActivity(act::set);
             s.onActivity(x -> {
                 try {
+                    java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+                    route.setAccessible(true);
+                    route.set(x, "home");               // the card belongs to the Home feed
                     call(x, "showFeedBar", new Class<?>[]{boolean.class}, true);
                 } catch (Exception e) {
                     throw new RuntimeException(e);
@@ -200,6 +203,20 @@ public class ShellTest {
                 }
             });
             SystemClock.sleep(500);
+            idle();
+            assertEquals(View.GONE, bar.getVisibility());
+            // Not on other pages, even if asked.
+            s.onActivity(x -> {
+                try {
+                    java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+                    route.setAccessible(true);
+                    route.set(x, "direct");
+                    call(x, "showFeedBar", new Class<?>[]{boolean.class}, true);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(400);
             idle();
             assertEquals(View.GONE, bar.getVisibility());
         }
