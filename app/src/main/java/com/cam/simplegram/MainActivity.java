@@ -151,6 +151,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
         setContentView(root);
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> onRootLayout(r - l, b - t));
+        guardEdgeToEdge();
 
         if (state != null && web.restoreState(state) != null) {
             handleIntent(getIntent(), false);
@@ -592,6 +593,30 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
         zoom.setLayoutParams(lp);
         js("splitClosed");
+    }
+
+    /**
+     * The theme opts out of Android 15's edge-to-edge layout, so the system keeps
+     * the page clear of the status and navigation bars. If a future Android
+     * ignores that, pad for the bars and the keyboard ourselves.
+     */
+    private void guardEdgeToEdge() {
+        if (Build.VERSION.SDK_INT < 30) return;
+        root.post(() -> {
+            WindowInsets wi = root.getRootWindowInsets();
+            if (wi == null) return;
+            int status = wi.getInsets(WindowInsets.Type.statusBars()).top;
+            int[] loc = new int[2];
+            root.getLocationOnScreen(loc);
+            if (status == 0 || loc[1] >= status) return;
+            root.setOnApplyWindowInsetsListener((v, in) -> {
+                android.graphics.Insets bars = in.getInsets(WindowInsets.Type.systemBars());
+                android.graphics.Insets ime = in.getInsets(WindowInsets.Type.ime());
+                v.setPadding(bars.left, bars.top, bars.right, Math.max(bars.bottom, ime.bottom));
+                return in;
+            });
+            root.requestApplyInsets();
+        });
     }
 
     private void onRootLayout(int width, int height) {

@@ -63,8 +63,9 @@ details are stored).
 
 ## Limits
 
-- Tested against fixture data shaped like Instagram's, not against a signed-in account
-  (Instagram can't be reached from the build machine). Your phone is the real test.
+- Tested against fixture data shaped like Instagram's (30 browser tests) and on an
+  Android 10 emulator (5 native tests), not against a signed-in Instagram account —
+  Instagram can't be reached from the build machine. Your phone is the real test.
 - Instagram's website, not the app: calls, music on Stories, and some posting features
   are as limited as they are on instagram.com in a phone browser.
 - Saving to a specific collection works only as far as Instagram's website offers it.
@@ -85,6 +86,13 @@ Tests (Node 18+ and Playwright's Chromium):
 ```sh
 npm install playwright && npx playwright install chromium
 node --test tests/
+```
+
+On-device tests for the native shell (pinch zoom, comments split view, menu,
+screenshot mode, Back, incoming links) run on a phone or emulator:
+
+```sh
+./gradlew connectedDebugAndroidTest
 ```
 
 Signing: release builds use `signing/simplegram.jks` with its passwords in

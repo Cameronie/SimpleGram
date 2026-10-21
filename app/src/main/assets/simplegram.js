@@ -590,6 +590,8 @@
     if (hide(lca, 'explore')) stats.dom.exploreGrid++;
   }
 
+  // A feed post. Instagram uses <article>; some layouts mark posts with a role instead.
+  const POST = 'article,div[role="article"]';
   const AD_LABEL = /^(sponsored|ad|advertisement|promoted)$/i;
   const SUGGEST_LABEL = /^suggested (for you|post|posts|reel|reels)$/i;
   const REPOST_LABEL = /^(.{1,60} )?reposted( this)?$|^reposted by .{1,60}$/i;
@@ -618,7 +620,7 @@
   }
   function tidyFeed() {
     if (route() !== 'home' || CFG.role !== 'main') return;
-    for (const article of document.querySelectorAll('article')) {
+    for (const article of document.querySelectorAll(POST)) {
       const sig = articleSig(article);
       const prev = checked.get(article);
       if (prev && prev.sig === sig) continue;
@@ -971,7 +973,7 @@
     return best;
   }
   function codeForElement(el) {
-    const art = el && el.closest('article');
+    const art = el && el.closest(POST);
     if (art) {
       const time = art.querySelector('a[href] time');
       const ta = time && time.closest('a[href]');
@@ -1150,7 +1152,7 @@
     return best;
   }
   function mediaBoxFor(control) {
-    const art = control.closest('article');
+    const art = control.closest(POST);
     const el = art ? articleMedia(art) : pickMedia(null, null);
     return el ? { el: el, box: el } : null;
   }
