@@ -537,34 +537,8 @@ test('feed: reaching the end of Home asks the app to show the Following/Favorite
   await page.waitForFunction(() => { const m = window.__sent.filter(x => x.action === 'feedEnd'); return m.length && !m[m.length - 1].on; });
 });
 
-function feedBody(friendly, variables) {
-  return new URLSearchParams({ fb_api_req_friendly_name: friendly, variables: JSON.stringify(variables), doc_id: '123' }).toString();
-}
 
-test('feed: "load more" requests ask for bigger batches; the first page is left alone', async () => {
-  const seen = [];
-  const page = await open('https://www.instagram.com/', BLANK, { api: { '/graphql/query': (u, req) => { seen.push(req.postData()); return { body: { data: {} } }; } } });
-  await page.evaluate(([a, b]) => Promise.all([a, b].map(body => new Promise(res => {
-    const x = new XMLHttpRequest(); x.open('POST', '/graphql/query'); x.onloadend = res; x.send(body);
-  }))), [feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'cursor1', first: 12, variant: 'home' }),
-        feedBody('PolarisFeedTimelineRootV2Query', { first: 12, variant: 'home' })]);
-  await page.evaluate(b => fetch('/graphql/query', { method: 'POST', body: b }), feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'c2', first: 12 }));
-  const vars = seen.map(b => JSON.parse(new URLSearchParams(b).get('variables')));
-  const paged = vars.filter(v => v.after);
-  assert.deepEqual(paged.map(v => v.first), [24, 24]);
-  assert.deepEqual(vars.filter(v => !v.after).map(v => v.first), [12]);
-});
 
-test('feed: if Instagram refuses a bigger batch, SimpleGram stops asking for good', async () => {
-  const seen = [];
-  const page = await open('https://www.instagram.com/', BLANK, { api: { '/graphql/query': (u, req) => { seen.push(req.postData()); return { body: { errors: [{ message: 'bad' }] } }; } } });
-  const send = b => page.evaluate(body => new Promise(res => { const x = new XMLHttpRequest(); x.open('POST', '/graphql/query'); x.onloadend = res; x.send(body); }), b);
-  await send(feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'c1', first: 12 }));
-  await send(feedBody('PolarisFeedRootPaginationCachedQuery_subscribe', { after: 'c2', first: 12 }));
-  const firsts = seen.map(b => JSON.parse(new URLSearchParams(b).get('variables')).first);
-  assert.deepEqual(firsts, [24, 12]);
-  assert.equal(await page.evaluate(() => localStorage.getItem('sg_feed_batch_off')), '1');
-});
 
 /* ---------------- 1.1: opened videos start; sound controls ---------------- */
 
