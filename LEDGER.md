@@ -25,6 +25,6 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 
 | # | Request | Notes |
 | --- | --- | --- |
-| R1 | Search: see accounts, photos/Reels, hashtags and places, or pick which. Places (and tags) with Most recent / Top toggle like old Instagram. | Recent depends on Instagram's website still serving it; verify when building. |
+| R1 | Search: see accounts, photos/Reels, hashtags and places, or pick which. Places (and tags) with Most recent / Top toggle like old Instagram. | Decided: **tabs** (Accounts · Posts & Reels · Tags · Places), like Instagram. Recent depends on Instagram's website still serving it; verify when building. |
 | R2 | Instants. | App-only (launched May 2026 in the app's DM inbox, needs the in-app camera); not on Instagram's website. Not possible in SimpleGram unless the website adds it. |
 | R3 | Map (from the messages page). | App-only; not on Instagram's website. Same as R2. |
