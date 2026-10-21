@@ -9,6 +9,24 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 - Sound on automatically for a Reel opened from DMs.
 - Scrolling (feed, messages, profiles) after an app restart — see B2.
 
+## Confirmed working on the phone (1.1)
+
+- Accounts search.
+- Back from an opened search result returns to the results.
+- The start of Home: friends only, no ads.
+
+## Batch 3 — open (reported against 1.1)
+
+| # | Report | Likely cause (tentative, diagnosis in progress) | Planned fix |
+| --- | --- | --- | --- |
+| B8 | Suggested posts in Home (accounts you don't follow, with a Follow button), even one before "You're all caught up", then Instagram's "Suggested Posts" section after it; maybe posts shown because a friend liked them. | Lead: later feed pages arrive in Instagram's "streamed" format, which 1.1 lets through unfiltered (to avoid scrambling them). 1.1's load-ahead reaches those pages sooner. | Filter streamed pages safely; end Home at "You're all caught up" and drop everything after it. |
+| B9 | Home went black: a long blank scroll, a post flashed a few times, the spinner at the bottom, nothing new loaded. One post's video shrank to a thin strip. | Under investigation: the page running out of rendering memory or time as the feed grows, and/or SimpleGram's on-screen checks hiding and re-showing posts. | Depends on diagnosis. |
+| B10 | After the black feed, Stories took a very long time to load. | Likely the same as B9 (page bogged down), or Instagram slowing requests after heavy paging. | Depends on diagnosis. |
+| B11 | The Following / Favorites buttons flashed briefly after the first couple of posts, then vanished; they didn't appear at the real end. | The "4 seconds at the bottom" fallback fires while the next page is still loading. The real end was missed (see B8). | Show the buttons only at a real end of Home (Instagram's "caught up" marker or no more pages). |
+| B12 | Places search: no results on Top or Most recent; only "Open Instagram's own page" works. | Instagram removed the place-page request SimpleGram uses first (now "Page Not Found"), and the newer one isn't being found or accepted. | Use the request Instagram's own place page makes now. |
+| B13 | Tags search: "No tags found for 'Nba'". | Instagram's old search request is gone ("Page Not Found"), and the website's current search may no longer list hashtags. | Always offer "#nba" itself, opening Instagram's hashtag results; add any tags Instagram returns. |
+| B14 | Opening a Posts & Reels result flashes Home before the post or Reel. Back to the results works. | The search screen hides before Instagram has switched to the post. It may also be a full page reload after 1.8 s. | Keep the search screen (or a blank cover) up until the post is on screen; navigate the way Instagram's own links do. |
+
 ## Batch 2 — fixed (unconfirmed) in 1.1 (reported against 1.0)
 
 | # | Report | Cause | Fix in 1.1 |
