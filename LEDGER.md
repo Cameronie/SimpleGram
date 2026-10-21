@@ -19,7 +19,7 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 | B4 | Home feed scroll is slow and clunky: wait for one post to load, then the next. | Each page Instagram sends is mostly ads/suggestions that get removed, leaving 1–2 real posts per load, so you keep hitting the loading spinner. | Load more ahead of time / ask for bigger pages; consider the Following feed (no suggestions) as the start page. |
 | B5 | Search only shows accounts; no photo/Reel results. | Instagram's mobile site shows accounts in the search dropdown; posts/Reels live on a separate results page. | Search with choices: Accounts · Posts & Reels · Tags · Places (see R1). |
 | B6 | One Story video wouldn't download (others did). | That Story's data wasn't in what SimpleGram had seen. | Backup lookup through the account's Stories; clearer error. |
-| B7 | At the end of the feed, show older posts and/or Favorites. | — | "Older posts" (Following feed) and "Favorites" buttons at the end of the feed. |
+| B7 | At the end of the feed, show older posts and/or Favorites. Keep Home (Instagram's picks first) as the start; continue into Following when Home runs out, without repeats. | Merging two feeds into one scrolling page is what broke the old apps' feeds. | Start on Home. At its end: "Keep going" opens Following (newest first) with posts already seen in Home skipped; plus a Favorites button. The skipping applies only when arriving this way, not when Following is opened from the menu. |
 
 ## Requests
 
