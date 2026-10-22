@@ -528,9 +528,10 @@ test('search: Posts & Reels shows a grid; opening one and coming back restores s
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
   await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelector('.cell').click());
   await page.waitForURL(/\/p\/KEYW001\/$/);
-  assert.equal(await searchText(page), null);
+  // Search stays up, dimmed, until the post is drawn (B14).
+  assert.ok(await page.evaluate(() => !!document.getElementById('sg-search').shadowRoot.querySelector('.wrap.leaving')));
   // The test page cannot render posts, so the app falls back to a full load; Back returns to search.
-  await page.waitForTimeout(2600);
+  await page.waitForEvent('load');
   await page.goBack();
   await page.waitForFunction(() => { const h = document.getElementById('sg-search'); return h && h.style.display !== 'none' && h.shadowRoot.querySelectorAll('.cell').length === 2; });
 });

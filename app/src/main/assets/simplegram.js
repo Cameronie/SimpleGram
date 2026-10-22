@@ -912,7 +912,11 @@
       return;
     }
     if (CFG.role === 'main') {
-      if (search.open) { hideSearch(false); search.suspended = false; clearSaved(); }
+      // Opening a result keeps search up until the new page is drawn; coming
+      // back to the marked entry keeps it up too.
+      const backToSearch = !!(history.state && history.state.sgSearch && history.state.sgSearch === search.token);
+      if (leaving) safe(leavingRouteChanged)();
+      else if (search.open && !backToSearch) { hideSearch(false); search.suspended = false; clearSaved(); }
       restoreSearch();
       if (route() === 'explore' && !search.open && !search.suspended) openSearch(true);
       atBottomSince = 0;
@@ -934,15 +938,19 @@
   history.pushState = function pushState() {
     safe(rememberScroll)();
     const out = nativePush.apply(this, arguments);
+    safe(noteHistoryWrite)();
     safe(routeChanged)();
     return out;
   };
   history.replaceState = function replaceState() {
     const out = nativeReplace.apply(this, arguments);
+    safe(noteHistoryWrite)();
     safe(routeChanged)();
     return out;
   };
-  window.addEventListener('popstate', safe(() => { routeChanged(); if (!syntheticPop) restoreScroll(); }));
+  // Back to the same address (after a same-page result) changes no URL, so
+  // routeChanged() doesn't run: bring search back here too.
+  window.addEventListener('popstate', safe(() => { routeChanged(); if (!syntheticPop) { restoreScroll(); safe(restoreSearch)(); } }));
 
   /* ------------------------------------------------------------------ *
    * No endless Reels: vertical swipes cannot move a Reel viewer on to
@@ -998,6 +1006,7 @@
   const unmuteBudget = new WeakMap();
   function wantsSound(v) {
     if (CFG.role !== 'main') return false;
+    if (isOldMedia(v)) return false;
     const r = route();
     if (r === 'story' || r === 'reel') return true;
     if (!(v instanceof HTMLVideoElement)) return false;
@@ -1102,7 +1111,7 @@
     const r = route();
     if (r !== 'direct' && r !== 'reel' && r !== 'post') return;
     for (const v of document.getElementsByTagName('video')) {
-      if (autoStarted.has(v) || v.ended) continue;
+      if (autoStarted.has(v) || v.ended || isOldMedia(v)) continue;
       if (!v.paused) { autoStarted.add(v); continue; }
       // Mostly on screen; a carousel's next slide waiting to the side doesn't count.
       if (onScreenArea(v) < 0.4 * innerWidth * innerHeight) continue;
@@ -1890,12 +1899,14 @@
     .more,.link{display:block;margin:14px auto 22px;border:0;border-radius:9px;background:#efefef;color:inherit;font:inherit;font-weight:600;padding:9px 18px}
     .link{background:none;color:#0095f6}
     .label{font-weight:700;font-size:16px;padding:14px 14px 6px}
+    .wrap.leaving>*{opacity:.35;pointer-events:none;transition:opacity .15s}
+    .wrap.leaving::after{content:"";position:absolute;left:50%;top:40%;width:28px;height:28px;margin:-14px;border:3px solid #dbdbdb;border-top-color:#737373;border-radius:50%;animation:s .8s linear infinite}
     .spin{width:22px;height:22px;margin:28px auto;border:2px solid #dbdbdb;border-top-color:#737373;border-radius:50%;animation:s .8s linear infinite}
     @keyframes s{to{transform:rotate(360deg)}}
     @media (prefers-color-scheme:dark){
       .wrap{background:#000;color:#f5f5f5}.field,.seg,.more,.cell,.av{background:#262626}
       .tabs,.head{border-color:#262626}.ic{border-color:#363636}.seg button.on{background:#000;color:#f5f5f5}
-      .row:active{background:rgba(255,255,255,.06)}.clear{background:#555}.spin{border-color:#363636;border-top-color:#a8a8a8}
+      .row:active{background:rgba(255,255,255,.06)}.clear{background:#555}.spin,.wrap.leaving::after{border-color:#363636;border-top-color:#a8a8a8}
     }`;
   const ICON_SEARCH = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7.5"/><path d="M16.5 16.5 22 22" stroke-linecap="round"/></svg>';
   function el(tag, cls, text) {
@@ -2189,33 +2200,295 @@
   // Open a profile/post from search. Try Instagram's in-app navigation;
   // if Instagram doesn't draw the new page, load it normally. Back to the
   // page search was opened from brings search back as you left it.
-  let openTimer = 0, syntheticPop = false;
+  let openTimer = 0, syntheticPop = false, leaving = null;
   function pageSig() {
     const m = document.querySelector('main') || document.body;
-    return document.title + '|' + (m ? m.textContent.slice(0, 400) : '');
+    let txt = '';
+    if (m) {
+      // A bounded walk: after a long scroll Home's text is huge.
+      const w = document.createTreeWalker(m, NodeFilter.SHOW_TEXT);
+      while (txt.length < 400 && w.nextNode()) txt += w.currentNode.nodeValue;
+    }
+    // Instagram's DocumentTitle.badge() adds "(3) " for unread counts: not a new page.
+    return document.title.replace(/^\(\d+\+?\)\s*/, '') + '|' + txt.slice(0, 400);
   }
-  function openPath(path) {
+  // An Instagram module that is already running (window.require, Meta's
+  // module system). ifRequired never throws or loads anything; a missing or
+  // renamed module just means "not available".
+  function runningModule(name) {
+    try {
+      const req = window.require;
+      if (typeof req !== 'function') return null;
+      const ifRequired = req('ifRequired');
+      if (typeof ifRequired !== 'function') return null;
+      let out = null;
+      ifRequired(name, m => { out = m || null; }, () => {});
+      return out;
+    } catch (e) { return null; }
+  }
+  // NO_ACTIVE_NAVIGATION | GOIMPL_TRIGGERED | FETCHING_ROUTE | REACT_PENDING, or null if unknown.
+  function igRouterStatus() {
+    try {
+      const m = runningModule('currentCometRouterInstance');
+      const r = m && typeof m.get_THIS_IS_NOT_WHAT_YOU_WANT === 'function' && m.get_THIS_IS_NOT_WHAT_YOU_WANT();
+      const s = r && typeof r.getCurrentRouterStatus === 'function' ? r.getCurrentRouterStatus() : null;
+      return typeof s === 'string' ? s : null;
+    } catch (e) { return null; }
+  }
+  // The call Instagram's own openURL() makes for in-app links.
+  function igPush(path) {
+    try {
+      const m = runningModule('browserHistory_DO_NOT_USE');
+      if (!m || !m.browserHistory || typeof m.browserHistory.push !== 'function') return false;
+      if (typeof m.getCometRouterDispatcher === 'function' && !m.getCometRouterDispatcher()) return false;
+      m.browserHistory.push(path);
+      return true;
+    } catch (e) { return false; }
+  }
+  function here() { return location.pathname + location.search; }
+  // Media that was on the page when a result was tapped (usually Home's) and
+  // is still there under the cover: never started or unmuted meanwhile.
+  function isOldMedia(v) { return !!(leaving && leaving.oldMedia.has(v)); }
+  // Instagram (not us) wrote history while a result opens: it picked the open up.
+  function noteHistoryWrite() {
+    if (leaving && !leaving.self && !leaving.ack) leaving.ack = Date.now();
+  }
+  function coverSearch(on) {
+    if (search.wrap) search.wrap.classList.toggle('leaving', !!on);
+  }
+  // The opened post's own picture or video, not one that was already there.
+  function hasNewMedia(l) {
+    for (const m of document.querySelectorAll('main video,main img[srcset],main img[src*="cdninstagram"],article video,article img[srcset]')) {
+      if (!l.oldMedia.has(m)) return true;
+    }
+    return false;
+  }
+  function armWatch(ms) {
+    clearTimeout(openTimer);
+    openTimer = setTimeout(safe(watchLeaving), ms);
+  }
+  // A new mark on the current entry (Instagram's own key kept): Back to it brings search back.
+  function markSearch() {
     search.token = String(Date.now()) + Math.random().toString(16).slice(2, 6);
     search.suspended = true;
     try { nativeReplace.call(history, Object.assign({}, history.state || {}, { sgSearch: search.token }), ''); } catch (e) { /* ignore */ }
+  }
+  function dropMark() {
+    try { const st = Object.assign({}, history.state); delete st.sgSearch; nativeReplace.call(history, st, ''); } catch (e) { /* ignore */ }
+    search.suspended = false;
+  }
+
+  // How results opened, for Filter status. Kept for the tab's session, so a
+  // full load (which starts a new page) is counted too.
+  const OPENS_KEY = 'sg_search_opens';
+  const opens = (stats.searchOpens = { router: 0, popstate: 0, samePage: 0, fullLoad: 0, cancelled: 0, lastMs: 0, lastVia: '' });
+  function saveOpens(extra) {
+    try { sessionStorage.setItem(OPENS_KEY, JSON.stringify(Object.assign({}, opens, extra || {}))); } catch (e) { /* ignore */ }
+  }
+  function countOpen(key) { opens[key]++; saveOpens(); }
+  function loadOpens() {
+    let saved = null;
+    try { saved = JSON.parse(sessionStorage.getItem(OPENS_KEY) || 'null'); } catch (e) { saved = null; }
+    if (!saved || typeof saved !== 'object') return;
+    for (const k in opens) if (typeof saved[k] === typeof opens[k]) opens[k] = saved[k];
+    // A full load we started: time it to when this new page has loaded.
+    const at = Number(saved.pendingAt) || 0;
+    if (!at) return;
+    saveOpens();                              // timed once
+    if (Date.now() - at > 60000) return;
+    const done = safe(() => requestAnimationFrame(safe(() => { opens.lastMs = Date.now() - at; saveOpens(); })));
+    if (document.readyState === 'complete') done();
+    else window.addEventListener('load', done, { once: true });
+  }
+  safe(loadOpens)();
+
+  // Search stays on screen (dimmed, with a spinner) until Instagram has drawn
+  // the new page, so whatever is underneath (usually Home) never shows in between.
+  function openPath(path) {
+    if (leaving) return;                      // one open at a time
+    const target = new URL(path, location.href);
+    if (target.origin !== location.origin) { location.assign(target.href); return; }
+    if (target.pathname + target.search === here()) return openSamePage(path);
+    markSearch();
+    if (search.body) search.lastScroll = search.body.scrollTop;
+    saveSearch();
+    leaving = {
+      path: target.pathname + target.search, from: here(), before: pageSig(), at: Date.now(), via: '',
+      drawnAt: 0, abandoned: false, sawBusy: false, ack: 0, self: false, unloading: false,
+      oldMedia: new WeakSet(document.querySelectorAll('video,audio,img')),
+    };
+    coverSearch(true);
+    // Instagram's router only when its state can be read (so a slow start
+    // isn't mistaken for a dropped push); otherwise the older way. Never both.
+    if (igRouterStatus() && igPush(leaving.path)) {
+      leaving.via = 'router';
+      countOpen('router');
+      const st = igRouterStatus();
+      if (st && st !== 'NO_ACTIVE_NAVIGATION') leaving.sawBusy = true;
+    } else if (!popOpen()) return;
+    armWatch(100);
+  }
+  // The result is the page search was opened over: nothing wrong can show,
+  // so 1.1's way (a new entry, Instagram re-reads the address), and no reload.
+  function openSamePage(path) {
+    markSearch();
     saveSearch();
     hideSearch(false);
-    const target = new URL(path, location.href);
-    const before = pageSig();
-    clearTimeout(openTimer);
+    countOpen('samePage');
     try {
       history.pushState(null, '', path);
       syntheticPop = true;
       window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    } catch (e) { /* ignore */ } finally { syntheticPop = false; }
+  }
+  // The older way in: put the address in place and tell Instagram's router,
+  // which treats a history entry it doesn't know as "go to this address".
+  function popOpen() {
+    const l = leaving;
+    try {
+      l.self = true;
+      history.pushState(null, '', l.path);
+      l.self = false;
+      syntheticPop = true;
+      window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+      l.via = 'popstate';
+      countOpen('popstate');
+      return true;
     } catch (e) {
-      location.assign(path);
-      return;
+      l.self = false;
+      fullLoad();
+      return false;
     } finally {
       syntheticPop = false;
     }
-    openTimer = setTimeout(() => {
-      if (location.pathname + location.search === target.pathname + target.search && pageSig() === before) location.replace(path);
-    }, 1800);
+  }
+  function fullLoad() {
+    const l = leaving;
+    if (!l) return;
+    clearTimeout(openTimer);
+    l.via = 'fullLoad';
+    l.unloading = true;
+    opens.fullLoad++;
+    opens.lastVia = 'fullLoad';
+    saveOpens({ pendingAt: l.at });
+    // Search stays drawn until the new page paints. If our own entry for the
+    // target already exists, replace it so Back still lands on search.
+    if (here() !== l.from) location.replace(l.path);
+    else location.assign(l.path);
+  }
+  // The open is over (or called off): no watcher, no cover.
+  function endOpen() {
+    leaving = null;
+    clearTimeout(openTimer);
+    coverSearch(false);
+  }
+  function settle() {
+    const l = leaving;
+    leaving = null;
+    clearTimeout(openTimer);
+    opens.lastMs = Date.now() - l.at;
+    opens.lastVia = l.via;
+    saveOpens();
+    // Two frames, so the new page has painted before search goes.
+    requestAnimationFrame(() => requestAnimationFrame(safe(() => {
+      if (leaving) return;                    // another open started meanwhile
+      coverSearch(false);
+      if (search.open) hideSearch(false);
+      safe(autoplay)();
+    })));
+  }
+  // Every 100 ms while a result opens: has Instagram drawn the new page?
+  function watchLeaving() {
+    const l = leaving;
+    if (!l || l.unloading) return;
+    const now = Date.now(), age = now - l.at;
+    const st = igRouterStatus();
+    const busy = !!st && st !== 'NO_ACTIVE_NAVIGATION';
+    if (busy) l.sawBusy = true;
+    // Not "at the target": Instagram may rewrite it (/user/p/CODE/, /reel/).
+    const moved = here() !== l.from;
+    const drawn = moved && !busy && pageSig() !== l.before;
+    if (drawn && !l.drawnAt) l.drawnAt = now;
+    if (l.via === 'router' && !l.sawBusy && !l.ack && !moved && !busy && !l.abandoned) {
+      // Instagram's router didn't take the push (nothing started): the older way.
+      if (popOpen()) armWatch(100);
+      return;
+    }
+    if (l.abandoned) {
+      // Back was pressed before Instagram switched: undo the switch unseen.
+      if (moved) { endOpen(); countOpen('cancelled'); history.back(); return; }
+      if ((!busy && age > 3000) || age > 10000) { endOpen(); countOpen('cancelled'); return; }
+    } else if (drawn) {
+      // A post or Reel also waits (a little) for its picture or video.
+      const r = route();
+      if ((r !== 'post' && r !== 'reel') || hasNewMedia(l) || now - l.drawnAt > 2500) return settle();
+    } else if (!busy && !l.sawBusy && !l.ack && age > (st ? 800 : 2500)) {
+      return fullLoad();                      // Instagram never picked it up
+    } else if (!busy && age > 8000) {
+      return fullLoad();                      // picked up, but nothing drawn
+    } else if (age > 10000) {
+      return fullLoad();                      // still busy after 10 s
+    }
+    armWatch(100);
+  }
+  // A full load (ours or Instagram's) leaves this page. If the WebView keeps
+  // it in its back/forward cache and Back restores it, show the results again
+  // instead of resuming the open.
+  window.addEventListener('pagehide', safe(() => { if (leaving) { clearTimeout(openTimer); leaving.unloading = true; } }));
+  window.addEventListener('pageshow', safe(e => {
+    if (!e.persisted) return;
+    safe(loadOpens)();                        // the newer page may have counted since
+    if (!leaving) return;
+    endOpen();
+    if (search.open && history.state && history.state.sgSearch === search.token) dropMark();
+  }));
+  // Our own full load may still be on its way: call it off too.
+  function stopFullLoad(l) {
+    if (l.via === 'fullLoad') { try { window.stop(); } catch (e) { /* ignore */ } }
+  }
+  // The open is called off for the page search was opened over: close search as before.
+  function cancelToOrigin() {
+    stopFullLoad(leaving);
+    endOpen();
+    countOpen('cancelled');
+    hideSearch(false); search.suspended = false; clearSaved();
+  }
+  function leavingRouteChanged() {
+    // Instagram switched the address (or a redirect did); the watcher decides
+    // when the new page is drawn. Search stays up meanwhile.
+    if (here() === leaving.from && !leaving.self) {
+      // Instagram went (back) to the page search was opened from, e.g. its Home tab.
+      cancelToOrigin();
+      return;
+    }
+    armWatch(50);
+  }
+  // Instagram's tabs stay tappable below the cover. Its tab for the page
+  // underneath (usually Home) may not change the address at all, so the tap
+  // itself calls the open off; Instagram then handles the tap as usual.
+  window.addEventListener('click', safe(e => {
+    if (!leaving || !e.isTrusted || !(e.target instanceof Element)) return;
+    const a = e.target.closest('a[href]');
+    if (!a) return;
+    const u = new URL(a.href, location.href);
+    if (u.origin === location.origin && u.pathname + u.search === leaving.from) cancelToOrigin();
+  }), true);
+  // Back (or the Search tab) while a result opens: back to the results.
+  // Returns false when normal search Back should follow.
+  function backFromOpen() {
+    const l = leaving;
+    stopFullLoad(l);
+    if (here() !== l.from) {
+      // Already switched: going back lands on the marked entry, where search is up.
+      endOpen();
+      countOpen('cancelled');
+      history.back();
+      return true;
+    }
+    if (!l.abandoned && !l.unloading) { l.abandoned = true; coverSearch(false); return true; }
+    endOpen();
+    countOpen('cancelled');
+    return l.unloading;
   }
   function showSearch() {
     buildSearch();
@@ -2240,6 +2513,7 @@
   }
   function openSearch(fresh) {
     if (CFG.role !== 'main') return;
+    if (leaving) { backFromOpen(); return; }  // Search tab tapped while a result opens: stay
     search.returnUrl = location.pathname + location.search;
     search.suspended = false;
     if (fresh) { search.view = null; search.grid = null; }
@@ -2260,13 +2534,19 @@
   // Back: inside search first (a tag/place page → results → close).
   SG.back = () => {
     if (!search.open) return false;
+    if (leaving && backFromOpen()) return true;
     if (search.view) { search.view = null; search.grid = null; render(); return true; }
     closeSearch(true);
     return true;
   };
   // Returning to the page search was opened from brings it back as you left it.
   function restoreSearch() {
-    if (CFG.role !== 'main' || search.open || syntheticPop) return;
+    if (CFG.role !== 'main' || syntheticPop) return;
+    if (search.open) {
+      // Back on the marked entry while search is still up (Back during an open).
+      if (!leaving && history.state && history.state.sgSearch === search.token) dropMark();
+      return;
+    }
     const mark = history.state && history.state.sgSearch;
     if (!mark) return;
     let saved = null;
@@ -2279,8 +2559,7 @@
       search.pending = null;
     }
     // Only this one time: later visits to the page don't reopen search.
-    try { const st = Object.assign({}, history.state); delete st.sgSearch; nativeReplace.call(history, st, ''); } catch (e) { /* ignore */ }
-    search.suspended = false;
+    dropMark();
     showSearch();
     render();
     const y = saved && saved.scroll;
