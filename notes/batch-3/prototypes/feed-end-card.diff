@@ -1,0 +1,188 @@
+--- a/simplegram.js
++++ b/simplegram.js
+@@ -288,14 +288,30 @@
+     return v;
+   }
+   SG.feedVerdict = feedVerdict;
++  SG.__feed = () => { const f = feedStates.get(lastVariant); return f ? Object.assign({}, f) : null; };
+ 
+-  let feedState = null;
++  // One state per feed (home / following / favorites). It survives opening a
++  // post, a profile or Stories and coming back, because Instagram keeps the
++  // feed it already loaded; it starts over on a reload or a refresh of the feed.
++  const feedStates = new Map();
++  let lastVariant = 'home';
++  function freshFeed(v) {
++    return { key: v, emptyStreak: 0, seenStreak: 0, ended: false, caughtUp: false, homePages: 0, endText: null, lastPageAt: 0 };
++  }
+   function currentFeed() {
+-    const key = location.pathname + '|' + feedVariant();
+-    if (!feedState || feedState.key !== key) {
+-      feedState = { key: key, emptyStreak: 0, seenStreak: 0, ended: false, caughtUp: false, homePages: 0 };
++    if (route() === 'home') lastVariant = feedVariant();
++    let fs = feedStates.get(lastVariant);
++    if (!fs) feedStates.set(lastVariant, fs = freshFeed(lastVariant));
++    return fs;
++  }
++  // Lists inside Instagram's "caught up" block (its Suggested / Older posts groups).
++  const markerLists = new WeakSet();
++  function markerIndex(list) {
++    for (let i = 0; i < list.length; i++) {
++      const n = list[i] && (list[i].node || list[i]);
++      if (n && typeof n === 'object' && n.end_of_feed_demarcator) return i;
+     }
+-    return feedState;
++    return -1;
+   }
+ 
+   // Which home feed is showing: home (Instagram's picks), following or favorites.
+@@ -343,8 +359,59 @@
+     return !!(o.more_available || o.has_more || o.moreAvailable);
+   }
+   function filterFeedList(owner, list) {
++    if (markerLists.has(list)) {
++      // Inside Instagram's caught-up block: only posts from people you follow, never counted as a page.
++      if (streamed) return;
++      const keep = list.filter(e => { const n = e && e.node ? e.node : e; const v = feedVerdict(n); const m = mediaOf(n); return !v.drop && v.media && m && followState(m) === true; });
++      if (keep.length !== list.length) { stats.feed.inMarker = (stats.feed.inMarker || 0) + list.length - keep.length; list.splice(0, list.length, ...keep); }
++      return;
++    }
+     stats.feed.pages++;
+     if (streamed) { stats.feed.streamed++; return; }
++    let fs = currentFeed();
++    // Nothing can follow the end of a feed: a new page now (a different cursor)
++    // is Instagram refreshing it, so start over. The same page read twice stays the end.
++    const cursor = cursorOf(owner);
++    if (fs.ended && cursor && cursor !== fs.endCursor) {
++      const followed = list.some(e => { const n = e && e.node ? e.node : e; const v = feedVerdict(n); const m = mediaOf(n); return !v.drop && m && followState(m) === true; });
++      if (followed || markerIndex(list) >= 0) {
++        feedStates.set(fs.key, fs = freshFeed(fs.key));
++        if (feedEndShown) { feedEndShown = false; post('feedEnd', { on: false }); }
++      } else {
++        // Something Instagram loads after the end (its end-of-feed suggestions): never shown.
++        stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length;
++        list.length = 0; stopPagination(owner); fs.endCursor = cursor;
++        return;
++      }
++    }
++    if (route() === 'home' || feedVariant() === fs.key) fs.lastPageAt = Date.now();
++    const at = markerIndex(list);
++    for (let i = Math.max(at, 0); at >= 0 && i < list.length; i++) {
++      const d = (list[i].node || list[i]).end_of_feed_demarcator;
++      const groups = d && d.group_set && d.group_set.groups;
++      if (Array.isArray(groups)) for (const g of groups) if (g && Array.isArray(g.feed_items)) markerLists.add(g.feed_items);
++    }
++    const homeFeed = feedVariant() === 'home' && fs.key === 'home';
++    if (homeFeed && (at >= 0 || owner.pagination_source === 'feed_recs')) {
++      // End of Home: Instagram's "You're all caught up". Everything from here on
++      // is its suggestions, so drop it and stop asking for more.
++      let from = at >= 0 ? at : 0;
++      if (at < 0) {
++        const keep = list.filter(e => { const n = e && e.node ? e.node : e; const v = feedVerdict(n); const m = mediaOf(n); return !v.drop && m && followState(m) === true; });
++        stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length - keep.length;
++        list.splice(0, list.length, ...keep); from = list.length;
++      }
++      if (at >= 0) {
++        const d = (list[at].node || list[at]).end_of_feed_demarcator;
++        fs.endText = { title: typeof d.title === 'string' ? d.title : '', subtitle: typeof d.subtitle === 'string' ? d.subtitle : '' };
++      }
++      stats.feed.afterEnd = (stats.feed.afterEnd || 0) + (list.length - from);
++      list.splice(from);
++      stopPagination(owner);
++      fs.caughtUp = true;
++      fs.ended = true;
++    }
++    if (fs.ended) { fs.endCursor = cursor; setTimeout(safe(checkFeedEnd), 300); }
+     const verdicts = list.map(e => feedVerdict(e && e.node ? e.node : e));
+     if (list.length && !verdicts.some(x => x.media)) {
+       // Nothing recognisable: Instagram probably changed its format. Fail open.
+@@ -358,7 +425,6 @@
+     }
+     const seenCodes = skipping();
+     const onHome = route() === 'home' && feedVariant() === 'home';
+-    const fs = currentFeed();
+     const kept = [];
+     let keptMedia = 0, alreadySeen = 0;
+     verdicts.forEach((x, i) => {
+@@ -373,7 +439,6 @@
+           if (onHome && code) { homeSeen.add(code); if (homeSeen.size > 4000) homeSeen.delete(homeSeen.values().next().value); }
+         }
+       }
+-      if (!x.drop && list[i] && (list[i].node || list[i]).end_of_feed_demarcator) fs.caughtUp = true;
+     });
+     if (onHome && keptMedia > 0) fs.homePages++;
+     stats.feed.kept += keptMedia;
+@@ -395,8 +460,14 @@
+       if (keptMedia <= 2 && more) scheduleNudge(false);
+     }
+     if (!more) fs.ended = true;
++    if (fs.ended) fs.endCursor = cursor;
+     setTimeout(safe(checkFeedEnd), 300);
+   }
++  function cursorOf(o) {
++    const pi = o.page_info || o.pageInfo;
++    const c = (pi && (pi.end_cursor || pi.endCursor)) || o.next_max_id || null;
++    return typeof c === 'string' || typeof c === 'number' ? String(c) : null;
++  }
+   function edgeCode(e) {
+     const n = e && e.node ? e.node : e;
+     const m = mediaOf(n) || n;
+@@ -577,22 +648,42 @@
+    * what you already saw. Shown by the app, outside Instagram's page.
+    * ------------------------------------------------------------------ */
+   let feedEndShown = null, atBottomSince = 0;
++  const STALL_MS = 15000; // no Home page for this long while you wait at the bottom
++  const END_ROOM = 170; // CSS px: the app's card plus a margin
++  function endRoom(on) {
++    let el = document.getElementById('sg-end-room');
++    if (on && !el && document.body) {
++      el = document.createElement('div');
++      el.id = 'sg-end-room';
++      el.setAttribute('aria-hidden', 'true');
++      el.style.cssText = 'height:' + END_ROOM + 'px;pointer-events:none';
++      document.body.appendChild(el);
++    } else if (!on && el) {
++      el.remove();
++    }
++  }
+   function checkFeedEnd(force) {
+     if (CFG.role !== 'main') return;
+     let show = false;
+     const fs = currentFeed();
+     const searching = typeof search !== 'undefined' && search.open;
+-    if (route() === 'home' && feedVariant() === 'home' && fs.homePages > 0 && !searching) {
++    // Only a real end: Instagram's "caught up" marker, no more pages, or we stopped
++    // paging. Never on a timer, which fires while Instagram is still loading.
++    const atEnd = route() === 'home' && feedVariant() === 'home' && fs.ended;
++    endRoom(atEnd);
++    let stalled = false;
++    const onHomeFeed = route() === 'home' && feedVariant() === 'home';
++    if (onHomeFeed && !searching) {
+       const se = document.scrollingElement || document.documentElement;
+-      const nearBottom = se.scrollHeight - (se.scrollTop + innerHeight) < Math.max(400, innerHeight * 0.6);
+-      if (nearBottom) { if (!atBottomSince) atBottomSince = Date.now(); } else atBottomSince = 0;
+-      show = nearBottom && (fs.ended || (atBottomSince && Date.now() - atBottomSince > 4000));
+-    } else {
+-      atBottomSince = 0;
+-    }
++      const gap = se.scrollHeight - (se.scrollTop + innerHeight);
++      const near = gap < (feedEndShown ? innerHeight : Math.max(400, innerHeight * 0.6));
++      if (near) { if (!atBottomSince) atBottomSince = Date.now(); } else atBottomSince = 0;
++      if (atEnd) show = near;
++      else if (near && fs.homePages > 0 && Date.now() - atBottomSince > STALL_MS && Date.now() - fs.lastPageAt > STALL_MS) show = stalled = true;
++    } else atBottomSince = 0;
+     if (show !== feedEndShown || force) {
+       feedEndShown = show;
+-      post('feedEnd', { on: show, caughtUp: fs.caughtUp || fs.ended });
++      post('feedEnd', { on: show, caughtUp: fs.caughtUp, stalled: stalled, title: fs.endText && fs.endText.title, subtitle: fs.endText && fs.endText.subtitle });
+     }
+   }
+   let feedEndTimer = 0;
+@@ -915,7 +1006,6 @@
+       if (search.open) { hideSearch(false); search.suspended = false; clearSaved(); }
+       restoreSearch();
+       if (route() === 'explore' && !search.open && !search.suspended) openSearch(true);
+-      atBottomSince = 0;
+       safe(checkFeedEnd)(true);
+     }
+     if (CFG.role === 'main' && route() === 'comments' && previous !== 'comments' && !split) {
