@@ -522,7 +522,8 @@
     } else {
       return null;
     }
-    if (safe(contArm)(fs, owner)) return cut;   // R7: paging stays on, Following comes next
+    if (safe(contArm)(fs, owner) === true) return cut;   // R7: paging stays on, Following comes next
+    if (fs.cont) { fs.cont = false; safe(contFail)('error'); }   // a start that broke: the card, as before
     endHomePaging(owner, fs);
     endFeed(fs, true);
     return cut;
@@ -653,7 +654,9 @@
    * (navigate, reload, back_forward, bfcache; spa after an in-page address
    * change), va feed by address, vp feed by page, ps pagination_source, in/out
    * edges, k posts kept, sk skipped as seen, ad, sg suggestions, mk marker
-   * index, nx0/nx1 has_next in/out, an anchor kind, first, ae after the end. */
+   * index, nx0/nx1 has_next in/out, an anchor kind, first, ae after the end;
+   * R7: hw why a page after the marker was taken for Home's first page again,
+   * ik Instagram's own followed posts kept and cf Following posts handed. */
   const TRAIL_MAX = 30;
   const docN = (readSession('sg_doc_n') | 0) + 1;
   writeSession('sg_doc_n', docN);
@@ -783,17 +786,28 @@
     const jump = home && cont.on && contJump();
     const tap = home && cont.on && contTap();
     if (home && fs.cont) {
-      const why = contHead(owner, list, jump, tap);
+      // A rule that fails takes the page for a reload: it is then filtered as usual.
+      let why = safe(contHead)(owner, list, jump, tap);
+      if (why === undefined) why = 'error';
       if (why) {
         cont.heads++;
-        contReset();
+        safe(contReset)();
         feedStates.set(fs.key, fs = freshFeed(fs.key));
         fs.lastPageAt = fs.resetAt = Date.now();
         stats.feed.refreshes = (stats.feed.refreshes || 0) + 1;
         tr.hw = why;
       } else {
         fs.lastCursor = cursor;
-        contHandover(owner, list, fs, ctx, tr);
+        try {
+          contHandover(owner, list, fs, ctx, tr);
+        } catch (e) {
+          // Never Instagram's suggestions: its new followed posts at most, then Home ends with the card.
+          stats.errors++;
+          safe(contFail)('error');
+          list.splice(0, list.length, ...list.filter(x => safe(followedPost)(x) && !homeSeen.has(edgeCode(x))));
+          stopPagination(owner);
+          endFeed(fs, true);
+        }
         return;
       }
     }
@@ -1529,6 +1543,10 @@
     run.fetching = false;
     contAnsweredAt = Date.now();
     if (run !== cs || gen !== contGen) { if (cs) contFill(); return; }   // Home started over meanwhile: stale
+    try { contTake(c, q, after); } catch (e) { stats.errors++; contFail('error'); }
+  }
+  // An answer from Following: its new posts go to the buffer (what Home showed is skipped).
+  function contTake(c, q, after) {
     if (!c || !Array.isArray(c.edges) || !(c.page_info || c.pageInfo)) { cont.ownFail++; contFail('request'); return; }
     cont.pages++;
     let recognised = c.edges.length === 0, fresh = 0;
