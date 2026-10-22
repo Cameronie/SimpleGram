@@ -14,6 +14,7 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 - No suggested posts: none slipped through (Suggested removed 48, 0 unrecognised pages, 0 posts with a Follow button). Posts shown because a friend liked them are removed too.
 - Home ends at "You're all caught up" with the Following / Favorites card and Instagram's "You've seen all new posts from the past 3 days."
 - Copy details works.
+- Places search: a place's Most recent grid loads, with Show more.
 
 ## Batch 4 — open (reported against 1.2)
 
@@ -65,3 +66,4 @@ New in 1.2 for reporting: Menu → More → **Filter status** shows the new coun
 | R1 | Search: see accounts, photos/Reels, hashtags and places, or pick which. Places (and tags) with Most recent / Top toggle like old Instagram. | **Fixed (unconfirmed) in 1.1.** Tabs: Accounts · Posts & Reels · Tags · Places. Places have Top / Most recent. Hashtags: Instagram's website removed Most recent for tags. SimpleGram shows the older recent list when Instagram still sends one, and says it isn't strictly newest first. Each grid stops after 3 "Show more" taps. |
 | R2 | Instants. | App-only (launched May 2026 in the app's DM inbox, needs the in-app camera); not on Instagram's website. Not possible in SimpleGram unless the website adds it. |
 | R3 | Map (from the messages page). | App-only; not on Instagram's website. Same as R2. |
+| R4 | Search grids (e.g. a place's Most recent) stop after 3 "Show more" taps; keep going longer. | Open. The limit of 3 was the original guard against endless scrolling. Each tap loads about 12 posts, so a grid ends at about 48. Options: a higher limit, or no limit on taps (every page still needs a deliberate tap, nothing loads by itself). Waiting for Cam's choice. |
