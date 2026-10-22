@@ -1251,12 +1251,34 @@
     }
     return merged;
   }
-  async function igGet(path) {
+  // Requests that answered 404 (or a search source that proved dead) are not
+  // asked again in this session; full page loads keep the list.
+  const DEAD_KEY = 'sg_dead_requests';
+  const dead = new Set();
+  try { for (const k of JSON.parse(sessionStorage.getItem(DEAD_KEY) || '[]')) dead.add(k); } catch (e) { /* ignore */ }
+  function markDead(key) {
+    dead.add(key);
+    cap(dead, 60);
+    searchStats.deadRequests = dead.size;
+    try { sessionStorage.setItem(DEAD_KEY, JSON.stringify(Array.from(dead))); } catch (e) { /* ignore */ }
+  }
+  // Search diagnostics for Filter status: counts and shapes only, never names or queries.
+  const gqlLog = [];
+  const searchStats = (stats.searchData = {
+    gqlLog: gqlLog, deadRequests: dead.size, hashtags: { blended: null, topsearch: null },
+    tagWebInfo: null, tagGrid: { webInfo: 0, keyword: 0 }, tagRecent: { asked: 0, failed: 0 },
+  });
+  SG.gqlLog = gqlLog;
+  // `meta`, when given, receives the HTTP status.
+  async function igGet(path, meta) {
     try {
+      if (dead.has(path)) return null;
       const res = await fetch(path, {
         credentials: 'include',
         headers: { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest', 'X-IG-WWW-Claim': '0' },
       });
+      if (meta) meta.status = res.status;
+      if (res.status === 404) markDead(path);
       if (!res.ok) return null;
       const data = parseIg(await res.text());
       if (data && typeof data === 'object') ownCleanse(data);
@@ -1269,41 +1291,110 @@
   function igModule(name) {
     try { return typeof window.require === 'function' ? window.require(name) : null; } catch (e) { return null; }
   }
-  const docIds = {};
-  // Last ids seen in public captures (Sept–Oct 2026), used only when the
-  // page's own code doesn't reveal the current one.
+  const docIds = {}, idSource = {};
+  // Ids in Instagram's website code (bundles fetched 2026-10-21), used only
+  // when the page's own code doesn't reveal the current one.
   const KNOWN_DOC_IDS = {
     PolarisSearchBoxRefetchableQuery: '27706427925724183',
     PolarisKeywordSearchExplorePageRelayQuery: '37324993597144881',
     PolarisKeywordSearchExplorePageRelayPaginationQuery: '28656899673911396',
-    PolarisLocationPageTabContentQuery: '28211016731901625',
+    PolarisLocationPageTabContentQuery: '28586113187724473',
+    PolarisLocationPageTabContentQuery_connection: '29002281179411948',
+    PolarisExploreLocationsContainerQuery: '28572807415659320',
+    PolarisAPITopsearchQuery: '29386906664232128',
   };
-  let scannedBundles = null;
+  // Settings ("provided variables") a query declares; Instagram refuses the
+  // query when one is missing. Same date; false is always a valid value.
+  const KNOWN_PV = {
+    PolarisLocationPageTabContentQuery: ['PolarisShortDramaEnabled', 'PolarisSEOIsCrawler'],
+    PolarisLocationPageTabContentQuery_connection: ['PolarisShortDramaEnabled', 'PolarisSEOIsCrawler'],
+  };
+  function pvKey(provider) { return '__relay_internal__pv__' + provider + 'relayprovider'; }
+  // The query's compiled module, when the page has loaded it.
+  function gqlParams(name) {
+    const m = igModule(name + '.graphql');
+    const p = m && (m.params || (m.default && m.default.params));
+    return p && typeof p === 'object' ? p : null;
+  }
+  // Instagram's script files the page already downloaded, read from cache:
+  // ids and declared settings. Each file is read once, and only after a miss.
+  const scanned = { ops: {}, pv: {}, urls: new Set() };
+  let scanning = Promise.resolve();
+  function readBundle(text) {
+    const ops = /__d\("([A-Za-z0-9_]+)_instagramRelayOperation",\[\],\(function\([^)]*\)\{[^}]*?exports="(\d+)"/g;
+    const mods = /__d\("([A-Za-z0-9_]+)\.graphql",\[([^\]]*)\]/g;
+    let m;
+    while ((m = ops.exec(text))) scanned.ops[m[1]] = m[2];
+    while ((m = mods.exec(text))) {
+      const pv = [];
+      const deps = /"([A-Za-z0-9_]+)\.relayprovider"/g;
+      let d;
+      while ((d = deps.exec(m[2]))) pv.push(d[1]);
+      scanned.pv[m[1]] = pv;
+    }
+  }
+  function scanBundles(name) {
+    const run = async () => {
+      const urls = [];
+      for (const sc of document.scripts) if (sc.src) urls.push(sc.src);
+      try { for (const e of performance.getEntriesByType('resource')) if (/\.js(\?|$)/.test(e.name)) urls.push(e.name); } catch (e) { /* ignore */ }
+      let n = 0;
+      for (const u of urls) {
+        if (scanned.ops[name] || n >= 40) break;
+        if (scanned.urls.has(u) || !/cdninstagram\.com|instagram\.com/.test(u)) continue;
+        scanned.urls.add(u);
+        n++;
+        try { readBundle(await (await fetch(u, { cache: 'force-cache' })).text()); } catch (e) { /* skip this file */ }
+      }
+    };
+    scanning = scanning.then(run, run);
+    return scanning;
+  }
+  function keepId(name, id, source) {
+    idSource[name] = source;
+    return (docIds[name] = id);
+  }
+  // Order: this page's memo, the page's own modules, its script files, then KNOWN.
   async function docIdFor(name) {
     if (docIds[name]) return docIds[name];
     const op = igModule(name + '_instagramRelayOperation');
-    if (typeof op === 'string' && /^\d+$/.test(op)) return (docIds[name] = op);
-    const gql = igModule(name + '.graphql');
-    if (gql && gql.params && /^\d+$/.test(String(gql.params.id))) return (docIds[name] = String(gql.params.id));
-    // Last resort: find it in the script files the page already downloaded (from cache).
-    if (!scannedBundles) {
-      scannedBundles = {};
-      const urls = new Set();
-      for (const sc of document.scripts) if (sc.src) urls.add(sc.src);
-      try { for (const e of performance.getEntriesByType('resource')) if (/\.js(\?|$)/.test(e.name)) urls.add(e.name); } catch (e) { /* ignore */ }
-      const re = /__d\("([A-Za-z0-9_]+)_instagramRelayOperation",\[\],\(function\([^)]*\)\{[^}]*?exports="(\d+)"/g;
-      let n = 0;
-      for (const u of urls) {
-        if (!/cdninstagram\.com|instagram\.com/.test(u) || n++ > 25) continue;
-        try {
-          const text = await (await fetch(u, { cache: 'force-cache' })).text();
-          let m;
-          while ((m = re.exec(text))) scannedBundles[m[1]] = m[2];
-        } catch (e) { /* skip this file */ }
-      }
-    }
-    if (scannedBundles[name]) return (docIds[name] = scannedBundles[name]);
+    if (typeof op === 'string' && /^\d+$/.test(op)) return keepId(name, op, 'module');
+    const p = gqlParams(name);
+    if (p && /^\d+$/.test(String(p.id))) return keepId(name, String(p.id), 'graphql');
+    if (!scanned.ops[name]) await scanBundles(name);
+    if (scanned.ops[name]) return keepId(name, scanned.ops[name], 'scan');
+    idSource[name] = 'known';
     return KNOWN_DOC_IDS[name] || null;
+  }
+  // Settings named in an error answer, remembered per query for this page.
+  const addedPv = {};
+  function providerValue(m) {
+    try {
+      const o = m && typeof m.get === 'function' ? m : m && m.default;
+      const v = o && typeof o.get === 'function' ? o.get() : false;
+      return typeof v === 'boolean' || typeof v === 'number' || typeof v === 'string' ? v : !!v;
+    } catch (e) { return false; }
+  }
+  // The query's declared settings with the values Instagram's page uses:
+  // from its compiled module, else its script file, else KNOWN_PV (false).
+  function providedVars(name) {
+    const out = {};
+    let source = 'none';
+    const p = gqlParams(name);
+    if (p) {
+      source = 'graphql';
+      const pvs = p.providedVariables;
+      if (pvs && typeof pvs === 'object') for (const k of Object.keys(pvs)) out[k] = providerValue(pvs[k]);
+    } else if (scanned.pv[name]) {
+      source = 'scan';
+      for (const x of scanned.pv[name]) out[pvKey(x)] = false;
+    } else if (KNOWN_PV[name]) {
+      source = 'known';
+      for (const x of KNOWN_PV[name]) out[pvKey(x)] = false;
+    }
+    const added = addedPv[name];
+    if (added) for (const k in added) if (!(k in out)) out[k] = added[k];
+    return { vars: out, source: source };
   }
   let homeHtml = null;
   async function pageToken(module, re) {
@@ -1320,35 +1411,81 @@
     } catch (e) { homeHtml = ''; }
     return '';
   }
-  // Returns data[root] (the answer's main object), or null.
+  function gqlNote(entry) {
+    gqlLog.push(entry);
+    while (gqlLog.length > 20) gqlLog.shift();
+  }
+  // Sizes of an answer, for diagnostics.
+  function answerShape(out) {
+    const shape = {};
+    if (Array.isArray(out.edges)) shape.edges = out.edges.length;
+    for (const k of ['users', 'hashtags', 'places']) if (Array.isArray(out[k])) shape[k] = out[k].length;
+    return shape;
+  }
+  // Returns data[root] (the answer's main object), or null. At most 2 POSTs.
   async function igGraphQL(name, variables, root) {
-    const id = await docIdFor(name);
-    if (!id) return null;
-    const lsd = await pageToken('LSD', /"LSD",\[\],\{"token":"([^"]+)"/);
-    const body = new URLSearchParams({
-      doc_id: id, variables: JSON.stringify(variables),
-      fb_dtsg: await pageToken('DTSGInitialData', /"DTSGInitialData",\[\],\{"token":"([^"]+)"/),
-      lsd: lsd, fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: name, server_timestamps: 'true',
-    }).toString();
-    // The website uses /api/graphql; some requests only answer on /graphql/query.
-    for (const path of ['/api/graphql', '/graphql/query']) {
-      try {
-        const res = await fetch(path, {
-          method: 'POST', credentials: 'include',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': csrf(), 'X-IG-App-ID': '936619743392459',
-            'X-FB-LSD': lsd, 'X-FB-Friendly-Name': name,
-          },
-          body: body,
-        });
-        if (!res.ok) continue;
-        const data = parseIg(await res.text());
-        if (data && typeof data === 'object') ownCleanse(data);
-        const out = data && data.data && data.data[root];
-        if (out) return out;
-      } catch (e) { /* try the other path */ }
-    }
-    return null;
+    try {
+      const id = await docIdFor(name);
+      if (!id) return null;
+      const params = gqlParams(name);
+      const pv = providedVars(name);
+      // The caller's variables in its order, then the settings, as the website sends them.
+      const vars = Object.assign({}, variables);
+      for (const k in pv.vars) if (!(k in vars)) vars[k] = pv.vars[k];
+      const lsd = await pageToken('LSD', /"LSD",\[\],\{"token":"([^"]+)"/);
+      const dtsg = await pageToken('DTSGInitialData', /"DTSGInitialData",\[\],\{"token":"([^"]+)"/);
+      // The website uses /api/graphql (/graphql/query for "distillery" queries).
+      // The other path is tried only when the first gives no readable answer.
+      const paths = params && params.metadata && params.metadata.is_distillery === true
+        ? ['/graphql/query', '/api/graphql'] : ['/api/graphql', '/graphql/query'];
+      let p = 0;
+      for (let posts = 0; posts < 2 && p < paths.length; posts++) {
+        const path = paths[p];
+        const note = { query: name, id: id, idSource: idSource[name] || '', providerSource: pv.source, providers: {}, path: path, status: 0 };
+        for (const k in vars) {
+          if (/^__relay_internal__pv__/.test(k)) note.providers[k.replace(/^__relay_internal__pv__|relayprovider$/g, '')] = vars[k];
+        }
+        const t0 = Date.now();
+        let res = null, text = '', data = null;
+        try {
+          res = await fetch(path, {
+            method: 'POST', credentials: 'include',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': csrf(), 'X-IG-App-ID': '936619743392459',
+              'X-FB-LSD': lsd, 'X-FB-Friendly-Name': name,
+            },
+            body: new URLSearchParams({
+              doc_id: id, variables: JSON.stringify(vars), fb_dtsg: dtsg,
+              lsd: lsd, fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: name, server_timestamps: 'true',
+            }).toString(),
+          });
+          note.status = res.status;
+          if (res.ok) { text = await res.text(); data = parseIg(text); }
+        } catch (e) { note.message = 'network error'; }
+        note.ms = Date.now() - t0;
+        if (!data || typeof data !== 'object') {
+          if (res && res.ok) note.message = 'unreadable answer';
+          gqlNote(note);
+          p++;
+          continue;
+        }
+        ownCleanse(data);
+        const out = data.data && data.data[root];
+        if (out) { Object.assign(note, answerShape(out)); gqlNote(note); return out; }
+        // Instagram read the request and refused it: never resend it elsewhere.
+        const err = Array.isArray(data.errors) ? data.errors[0] : null;
+        if (err && (err.code != null || err.api_error_code != null)) note.code = err.code != null ? err.code : err.api_error_code;
+        note.message = String(err ? err.message || err.summary || err.description || 'error' : data.message || 'no ' + root).slice(0, 200);
+        gqlNote(note);
+        // Retry once only when the answer names a setting that wasn't sent.
+        const missing = (text.match(/__relay_internal__pv__\w+?relayprovider/g) || []).filter(k => !(k in vars));
+        if (!missing.length) break;
+        const added = addedPv[name] || (addedPv[name] = {});
+        for (const k of missing) { added[k] = false; vars[k] = false; }
+      }
+      delete docIds[name];                  // look the id up again next time
+      return null;
+    } catch (e) { return null; }
   }
   function uuid() {
     try { return crypto.randomUUID(); } catch (e) { return String(Date.now()) + Math.random().toString(16).slice(2); }
@@ -1671,8 +1808,8 @@
     };
   }
 
-  /* Data: Instagram's long-standing web endpoints first, then the
-     website's current GraphQL requests, then Instagram's own page. */
+  /* Data: the website's current requests (GraphQL), plus the older web
+     endpoints that still answer; Instagram's own page as the fallback. */
   const LATIN = 'àáâäæãåāăąçćčđďèéêëēėęěğǵḧîïíīįìłḿñńǹňôöòóœøōõőṕŕřßśšşșťțûüùúūǘůűųẃẍÿýžźż·/_,:;';
   const PLAIN = 'aaaaaaaaaacccddeeeeeeeegghiiiiiilmnnnnoooooooooprrsssssttuuuuuuuuuwxyyzzz------';
   // Instagram's own slug rule for place links.
@@ -1710,59 +1847,77 @@
     if (v == null) delete c[key];          // failures are not remembered
     return v;
   }
+  // The website's search box request (accounts, and tags or places when it has any),
+  // shared by the tabs.
+  function blendedSearch(c, q) {
+    return cached(c, 'gql', () => igGraphQL('PolarisSearchBoxRefetchableQuery', {
+      data: { context: 'blended', include_reel: 'true', query: q, rank_token: '', search_session_id: uuid(), search_surface: 'web_top_search' },
+      hasQuery: true,
+    }, 'xdt_api__v1__fbsearch__topsearch_connection'));
+  }
+  // A typed tag as Instagram writes it: no '#' or spaces, lower case,
+  // letters with their marks (Hindi vowel signs, accents), digits, '_'.
+  let tagChars = null;
+  function tagOf(q) {
+    if (!tagChars) {
+      try { tagChars = new RegExp('[^\\p{L}\\p{M}\\p{N}_\\u200c]', 'gu'); } catch (e) { tagChars = /[^\w\u00c0-\uffff]/g; }
+    }
+    return String(q || '').replace(/^#+/, '').replace(/\s+/g, '').toLowerCase().replace(tagChars, '');
+  }
+  // The typed tag first, then the others found, each once; counts filled in when known.
+  function tagRows(typed, lists) {
+    const out = typed ? [{ name: typed, media_count: null }] : [];
+    const seen = new Map(out.map(h => [h.name, h]));
+    for (const list of lists) {
+      for (const h of list) {
+        const key = String(h.name).toLowerCase();
+        const have = seen.get(key);
+        const count = h.media_count != null ? h.media_count : null;
+        if (!have) { const row = { name: String(h.name), media_count: count }; seen.set(key, row); out.push(row); }
+        else if (have.media_count == null) have.media_count = count;
+      }
+    }
+    return out;
+  }
+  async function loadTags(c, q, stale) {
+    const typed = tagOf(q);
+    if (!typed) return { list: [] };                 // just '#': nothing to look up
+    const g = await blendedSearch(c, q);
+    const found = g ? hashtags(g.hashtags) : [];
+    if (g) searchStats.hashtags.blended = found.length;
+    let own = [];
+    // The lookup Instagram's '#' suggestions use, only when the search box had no tags.
+    if (!found.length && !stale()) {
+      const r = await cached(c, 'tagsGql', () => igGraphQL('PolarisAPITopsearchQuery', {
+        data: { context: 'hashtag', include_reel: 'true', query: typed, rank_token: '', search_session_id: uuid(), search_surface: 'web_top_search' },
+      }, 'xdt_api__v1__fbsearch__topsearch_connection'));
+      own = r ? hashtags(r.hashtags) : [];
+      if (r) searchStats.hashtags.topsearch = own.length;
+    }
+    if (stale()) return null;
+    return { list: tagRows(typed, [found, own]) };   // never empty, never an error
+  }
   // Results for one tab. `stale()` says the user has typed something else:
   // then stop before asking Instagram for anything more.
   async function loadTab(tab, q, stale) {
     const c = cacheFor(q);
-    const enc = encodeURIComponent;
-    const blended = await cached(c, 'blended', () => igGet('/web/search/topsearch/?context=blended&include_reel=true&query=' + enc(q)));
-    let list = [];
-    if (tab === 'accounts') list = blended ? users(blended.users) : [];
-    if (tab === 'tags') {
-      list = blended ? hashtags(blended.hashtags) : [];
-      if (!list.length && !stale()) {
-        const r = await cached(c, 'tags', () => igGet('/web/search/topsearch/?context=hashtag&query=' + enc(q.replace(/^#/, ''))));
-        if (r) list = hashtags(r.hashtags);
-      }
-    }
+    if (tab === 'tags') return loadTags(c, q, stale);
     if (tab === 'places') {
-      list = blended ? places(blended.places) : [];
-      if (!list.length && !stale()) {
-        const r = await cached(c, 'places', () => igGet('/web/search/topsearch/?context=place&query=' + enc(q)));
-        if (r) list = places(r.places);
-      }
-      if (!list.length && !stale()) {
-        const r = await cached(c, 'fbplaces', () => igGet('/api/v1/fbsearch/places/?query=' + enc(q)));
-        if (r) list = places(r.items);
-      }
+      const r = await cached(c, 'fbplaces', () => igGet('/api/v1/fbsearch/places/?query=' + encodeURIComponent(q)));
+      const list = r ? places(r.items) : [];
+      if (stale()) return null;
+      if (list.length) return { list: list };
+      const g = await blendedSearch(c, q);
+      if (stale()) return null;
+      const more = g ? places(g.places) : [];
+      return !more.length && !r && !g ? { error: true, list: [] } : { list: more };
     }
+    const g = await blendedSearch(c, q);
     if (stale()) return null;
-    if (!list.length) {
-      // The website's own search request, only when the older ones gave nothing.
-      const g = await cached(c, 'gql', () => igGraphQL('PolarisSearchBoxRefetchableQuery', {
-        data: { context: 'blended', include_reel: 'true', query: q, rank_token: '', search_session_id: uuid(), search_surface: 'web_top_search' },
-        hasQuery: true,
-      }, 'xdt_api__v1__fbsearch__topsearch_connection'));
-      if (g) list = tab === 'accounts' ? users(g.users) : tab === 'tags' ? hashtags(g.hashtags) : places(g.places);
-      if (!list.length && !blended && !g) return { error: true, list: [] };
-    }
-    return { list: list };
+    return g ? { list: users(g.users) } : { error: true, list: [] };
   }
   // Keyword grid: posts and Reels, and hashtags, which Instagram now shows the same way.
   async function loadKeyword(q, cursor) {
-    if (!cursor || cursor.rest) {
-      let path = '/api/v1/fbsearch/web/top_serp/?enable_metadata=true&query=' + encodeURIComponent(q) +
-        '&search_session_id=' + encodeURIComponent((cursor && cursor.session) || '');
-      if (cursor && cursor.max_id) path += '&next_max_id=' + encodeURIComponent(cursor.max_id) + '&rank_token=' + encodeURIComponent(cursor.rank_token || '');
-      const data = await igGet(path);
-      const grid = data && (data.media_grid || data);
-      const media = grid ? collectMedia(grid.sections || grid) : [];
-      if (media.length) {
-        const more = grid.has_more || grid.more_available;
-        return { media: media, more: more ? { rest: true, max_id: grid.next_max_id || '', rank_token: grid.rank_token || data.rank_token || '' } : null };
-      }
-      if (cursor) return null;
-    }
     const session = (cursor && cursor.session) || uuid();
     const vars = { query: q, search_session_id: session, serp_session_id: session };
     const c = cursor && cursor.after
@@ -1770,8 +1925,13 @@
       : await igGraphQL('PolarisKeywordSearchExplorePageRelayQuery', vars, 'xdt_fbsearch__top_serp_graphql');
     if (!c) return null;
     const units = (c.edges || []).map(e => e && e.node).filter(n => n && Array.isArray(n.items));
+    const next = nextCursor(c, cursor);
+    return { media: collectMedia(units.map(n => n.items)), more: next ? { after: next, session: session } : null };
+  }
+  // The next page's cursor, unless Instagram has no more or sent back the one we gave it.
+  function nextCursor(c, cursor) {
     const pi = c.page_info || {};
-    return { media: collectMedia(units.map(n => n.items)), more: pi.has_next_page && pi.end_cursor ? { after: pi.end_cursor, session: session } : null };
+    return pi.has_next_page && pi.end_cursor && pi.end_cursor !== (cursor && cursor.after) ? pi.end_cursor : null;
   }
   async function loadPosts(q, cursor) {
     return loadKeyword(q, cursor);
@@ -1790,8 +1950,12 @@
     const path = '/api/v1/tags/' + encodeURIComponent(name) + '/sections/';
     if (view.sub === 'recent') {
       // The website dropped Recent for hashtags; the old list still answers
-      // for some tags, but it isn't strictly newest first.
+      // for some tags, but it isn't strictly newest first. One try per
+      // session: once it fails, say so without asking again.
+      if (!cursor && dead.has('tags/sections recent')) return { media: [], more: null, noRecent: true, unordered: true };
+      if (!cursor) searchStats.tagRecent.asked++;
       const part = await igPost(path, sectionsForm('recent', cursor));
+      if (!part && !cursor) { searchStats.tagRecent.failed++; markDead('tags/sections recent'); }
       const media = part ? collectMedia(part.sections || []) : [];
       if (cursor) return part ? { media: media, more: moreState(part), unordered: true } : null;
       return { media: media, more: media.length ? moreState(part) : null, noRecent: !media.length, unordered: true };
@@ -1803,49 +1967,56 @@
       if (m) m.rest = true;
       return { media: collectMedia(part.sections || []), more: m };
     }
-    if (!cursor) {
-      const data = await igGet('/api/v1/tags/web_info/?tag_name=' + encodeURIComponent(name));
+    // The old tag page, while it still answers with posts in this session.
+    if (!cursor && !dead.has('tags/web_info')) {
+      const meta = {};
+      const data = await igGet('/api/v1/tags/web_info/?tag_name=' + encodeURIComponent(name), meta);
+      searchStats.tagWebInfo = meta.status || 0;
       const body = data && (data.data || data);
       const top = body && body.top;
       if (body && body.media_count != null) view.count = body.media_count;
       const media = top ? collectMedia(top.sections || []) : [];
       if (media.length) {
+        searchStats.tagGrid.webInfo++;
         const m = moreState(top);
         if (m) m.rest = true;
         return { media: media, more: m };
       }
+      markDead('tags/web_info');            // gone or empty: keyword results from now on
     }
     // What the website itself shows for a hashtag now.
+    if (!cursor) searchStats.tagGrid.keyword++;
     return loadKeyword('#' + name, cursor);
   }
-  async function loadPlace(view, cursor) {
-    const tab = view.sub === 'recent' ? 'recent' : 'ranked';
-    if (cursor) {
-      const part = await igPost('/api/v1/locations/' + encodeURIComponent(view.id) + '/sections/', sectionsForm(tab, cursor));
-      return part ? { media: collectMedia(part.sections || []), more: moreState(part) } : null;
-    }
-    const data = await igGet('/api/v1/locations/web_info/?location_id=' + encodeURIComponent(view.id) + '&show_nearby=false');
-    const body = data && (data.native_location_data || data);
-    if (body && body.location_info) {
-      const li = body.location_info;
+  // A place's name and address, when the row it was opened from had none.
+  function placeHeader(view) {
+    igGraphQL('PolarisExploreLocationsContainerQuery', { location_id_str: String(view.id), show_nearby: false }, 'xdt_location_get_web_info').then(safe(h => {
+      const li = h && h.native_location_data && h.native_location_data.location_info;
+      if (!li) return;
       view.name = li.name || view.name;
       view.address = [li.location_address, li.location_city].filter(Boolean).join(', ') || view.address || '';
       if (li.slug) view.slug = li.slug;
-    }
-    const part = body && body[tab];
-    const media = part ? collectMedia(part.sections || []) : [];
-    if (media.length) return { media: media, more: moreState(part) };
-    // The website's current request for a place's grid.
-    const c = await igGraphQL('PolarisLocationPageTabContentQuery', {
-      location_id: String(view.id), first: 24, after: null, tab: tab, page_size_override: null,
-      __relay_internal__pv__PolarisShortDramaEnabledrelayprovider: false,
-    }, 'xdt_location_get_web_info_tab');
-    if (c) {
-      const gm = collectMedia((c.edges || []).map(e => e && e.node));
-      if (gm.length) return { media: gm, more: null };
-    }
-    if (part || c) return { media: [], more: null, noRecent: tab === 'recent' };
-    return null;
+      const tx = search.view === view && search.wrap && search.wrap.querySelector('.head .tx');
+      if (!tx) return;
+      tx.textContent = '';
+      tx.appendChild(el('div', 'htitle', view.name || ''));
+      if (view.address) tx.appendChild(el('div', 'hsub', view.address));
+    }));
+  }
+  // The requests Instagram's own place page makes (Top is "ranked").
+  async function loadPlace(view, cursor) {
+    const tab = view.sub === 'recent' ? 'recent' : 'ranked';
+    const id = String(view.id);
+    if (!cursor && (!view.name || !view.address) && !view.headerAsked) { view.headerAsked = true; placeHeader(view); }
+    const c = cursor
+      ? await igGraphQL('PolarisLocationPageTabContentQuery_connection',
+        { after: cursor.after, first: 12, location_id: id, page_size_override: null, tab: tab }, 'xdt_location_get_web_info_tab')
+      : await igGraphQL('PolarisLocationPageTabContentQuery',
+        { location_id: id, first: 12, after: null, tab: tab, page_size_override: null }, 'xdt_location_get_web_info_tab');
+    if (!c) return null;
+    const media = collectMedia((c.edges || []).map(e => e && e.node));
+    const next = nextCursor(c, cursor);
+    return { media: media, more: next ? { after: next } : null, noRecent: tab === 'recent' && !media.length && !cursor };
   }
   async function loadTagOrPlace(view, cursor) {
     return view.kind === 'tag' ? loadTag(view, cursor) : loadPlace(view, cursor);
@@ -2025,7 +2196,7 @@
     top[search.tab === 'accounts' ? 'users' : search.tab] = res.list;
     let items = [];
     if (search.tab === 'accounts') items = top.users.map(u => ({ kind: 'user', id: u.username, title: u.username, sub: u.full_name || '', pic: u.profile_pic_url || '', verified: !!u.is_verified }));
-    if (search.tab === 'tags') items = top.tags.map(h => ({ kind: 'tag', id: h.name, title: '#' + h.name, sub: h.media_count != null ? Number(h.media_count).toLocaleString() + ' posts' : '' }));
+    if (search.tab === 'tags') items = top.tags.map(h => ({ kind: 'tag', id: h.name, title: '#' + h.name, sub: h.media_count != null ? Number(h.media_count).toLocaleString() + ' posts' : 'Hashtag' }));
     if (search.tab === 'places') items = top.places.map(p => ({ kind: 'place', id: p.id, title: p.name, sub: p.sub, slug: p.slug }));
     if (!items.length) {
       body.appendChild(el('div', 'msg', 'No ' + TABS.find(t => t[0] === search.tab)[1].toLowerCase() + ' found for “' + q + '”.'));
@@ -2122,6 +2293,15 @@
   }
   function renderFailure(body, q) {
     body.appendChild(el('div', 'msg', 'Instagram didn’t return results here.'));
+    // Asks once more, from scratch (the request id is looked up again too).
+    const again = el('button', 'more', 'Try again');
+    again.onclick = safe(() => {
+      if (search.view) { search.grid = null; runGrid(false); return; }
+      if (search.tab === 'posts') { search.posts = null; runPosts(false); return; }
+      delete search.results[topKey()];
+      runTop();
+    });
+    body.appendChild(again);
     const fallback = search.view
       ? (search.view.kind === 'tag'
         ? '/explore/search/keyword/?q=' + encodeURIComponent('#' + search.view.id.replace(/^#/, ''))
@@ -2178,7 +2358,12 @@
     if (seq !== search.seqPosts || search.posts !== st) return;
     st.loading = false;
     if (!res) { if (!st.media.length) st.error = true; }
-    else { st.media = addNew(st.media, slim(res.media)); st.more = res.more; st.pages++; }
+    else {
+      const had = st.media.length;
+      st.media = addNew(st.media, slim(res.media));
+      st.more = st.media.length > had ? res.more : null;     // a page that adds nothing ends the list
+      st.pages++;
+    }
     if (search.tab === 'posts' && !search.view) renderBody();
   }
   async function runGrid(more) {
@@ -2193,7 +2378,12 @@
     if (seq !== search.seqGrid || search.grid !== st || search.view !== v) return;
     st.loading = false;
     if (!res) { if (!st.media.length) st.error = true; }
-    else { st.media = addNew(st.media, slim(res.media)); st.more = res.more; st.pages++; st.noRecent = !!res.noRecent; st.unordered = !!res.unordered; }
+    else {
+      const had = st.media.length;
+      st.media = addNew(st.media, slim(res.media));
+      st.more = st.media.length > had ? res.more : null;     // a page that adds nothing ends the list
+      st.pages++; st.noRecent = !!res.noRecent; st.unordered = !!res.unordered;
+    }
     render();
   }
 
