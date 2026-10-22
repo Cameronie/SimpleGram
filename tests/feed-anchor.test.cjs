@@ -317,6 +317,9 @@ for (const mode of ['H1', 'H2']) {
     assert.equal(s.empty, false, 'Instagram never sees an empty first page');
     assert.ok(s.items.filter(c => seen.has(c)).length <= 1, 'one repeat at most: ' + s.items.slice(0, 5));
     assert.ok(s.items.some(c => !seen.has(c)), 'new posts loaded: ' + JSON.stringify({ req: s.req, nudges: s.feed.nudges }));
+    // Diagnostics: how the next page was asked for, and when the first new post came.
+    assert.ok(s.feed.skipFirstNewMs > 0, JSON.stringify(s.feed));
+    assert.ok(Object.values(s.feed.tries).some(t => t.n > 0 && t.hit > 0), JSON.stringify(s.feed.tries));
   });
 }
 
@@ -340,6 +343,8 @@ test('B17: with only the anchor, a swipe into the scroll room pages', async () =
   await pg.waitForFunction(() => window.__ig.mountedAt > 0 && window.__ig.items.length === 1, null, { timeout: 5000 });
   await pg.mouse.wheel(0, 400);
   await pg.waitForFunction(() => window.__ig.items.some(i => i.code[0] === 'U'), null, { timeout: 10000 });
+  const tries = await pg.evaluate(() => window.__sg.stats.feed.tries);
+  assert.ok(tries.swipe && tries.swipe.n >= 1, JSON.stringify(tries));
 });
 
 test('B17: releasing the scroll room never moves the page (Instagram draws a moment after the data)', async () => {

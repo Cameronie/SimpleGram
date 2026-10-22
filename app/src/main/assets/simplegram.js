@@ -722,6 +722,7 @@
     const tr = { ev: 'page', va: addressVariant(), vp: variant, ps: shapeToken(owner.pagination_source),
       in: list.length, mk: markerAt(list), nx0: sentMore };
     if (home) safe(noteHomePage)(owner, list);
+    safe(triedHit)();
     fs.lastPageAt = Date.now();
     if (streamed) {
       stats.feed.streamed++;
@@ -829,6 +830,8 @@
     stats.feed.lastPageKept = keptMedia;
     if (keptMedia > 0 || anchor) fs.shownAny = true;
     fs.shownCount += keptMedia;
+    // Diagnostics: ms from the page load to the first new post past the skip.
+    if (seenCodes && !stats.feed.skipFirstNewMs && keptMedia > (anchor ? 1 : 0)) stats.feed.skipFirstNewMs = Math.round(performance.now());
     fs.handed += kept.length;
     if (kept.length !== list.length || kept.some((e, i) => e !== list[i])) list.splice(0, list.length, ...kept);
     if (first && !list.length) emptyFirstAt = Date.now();
@@ -1024,6 +1027,20 @@
   window.addEventListener('touchend', () => { touching = false; lastUserScroll = lastTouchEnd = Date.now(); }, { capture: true, passive: true });
   window.addEventListener('touchcancel', () => { touching = false; }, { capture: true, passive: true });
   const nudgedAt = [];
+  // Diagnostics: which ways of asking for the next page work on the device
+  // (scroll events only, a 2 px jiggle, the pad, your own swipe into the
+  // scroll room): each try, and whether a feed page came within 3 s.
+  let lastTry = null;
+  function noteTry(kind) {
+    const k = stats.feed.tries || (stats.feed.tries = {});
+    const t = k[kind] || (k[kind] = { n: 0, hit: 0 });
+    t.n++;
+    lastTry = { t: t, at: Date.now() };
+  }
+  function triedHit() {
+    if (lastTry && Date.now() - lastTry.at < 3000) lastTry.t.hit++;
+    lastTry = null;
+  }
   // Nudges that keep trying (about 1, 2, 4 and 8 s apart, 8 at most) until a
   // page comes: on the page opened from the end card, and on Home's first
   // page while only its hidden anchor is there. Elsewhere one nudge, as before.
@@ -1088,8 +1105,9 @@
       window.dispatchEvent(new Event('scroll'));
       document.dispatchEvent(new Event('scroll'));
       // Never move the page under your finger or during a fling.
-      if (touching || Date.now() - lastUserScroll < 400) return;
+      if (touching || Date.now() - lastUserScroll < 400) { noteTry('synthetic'); return; }
       const y = se.scrollTop;
+      noteTry(se.scrollHeight - innerHeight > 4 ? 'jiggle' : (hard || trying) && document.body ? 'pad' : 'synthetic');
       if (se.scrollHeight - innerHeight > 4) {
         const d = y >= 2 ? -2 : 2;
         se.scrollTop += d;
@@ -1242,9 +1260,11 @@
     }
     lastTop = top;
   });
+  let roomSwipeAt = 0;
   window.addEventListener('scroll', e => {
     if (e.isTrusted) lastUserScroll = Date.now();
     noteJump();
+    if (e.isTrusted && Date.now() - roomSwipeAt > 1000 && document.getElementById(ROOM_ID)) { roomSwipeAt = Date.now(); safe(noteTry)('swipe'); }
     if (feedEndTimer) return;
     feedEndTimer = setTimeout(() => { feedEndTimer = 0; safe(checkFeedEnd)(); }, 250);
   }, { passive: true, capture: true });
