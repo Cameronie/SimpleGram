@@ -19,6 +19,8 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 
 Full diagnosis and build plan: [`notes/batch-3/plan.md`](notes/batch-3/plan.md).
 
+New in 1.2 for reporting: Menu → More → **Filter status** shows the new counts, and **Copy details** copies them (counts and data shapes only, no names) to paste into a message.
+
 | # | Report | Cause | Fix in 1.2 |
 | --- | --- | --- | --- |
 | B8 | Suggested posts in Home (accounts you don't follow, with a Follow button), even one before "You're all caught up", then Instagram's "Suggested Posts" section after it; maybe posts shown because a friend liked them. Second try: new posts kept loading without end, and nearly all of them were random suggestions. | **Confirmed** (your Filter status: Posts shown 2, Suggested removed 0, Pages read 8 with 7 unrecognised; reproduced exactly). Once you're caught up, Instagram switches Home to an all-suggestions feed. Those pages contain only "suggestion" units, no plain posts. SimpleGram took such a page for an unknown format and left it alone; that safety net is meant to stop an Instagram change from blanking the feed. Leaving those pages alone also skipped the "stop loading" logic, so it never ended. | Recognise suggestion units, so those pages get filtered. End Home at "You're all caught up" and stop loading there. Keep only posts from people you follow on any suggestions page. After the end, never let a page through unfiltered. Also apply Instagram's own "Suggested for you" rule, and block the suggested-accounts list Instagram shows when Home has nothing new. Add a "Copy details" diagnostic (data shapes only, no names). |
