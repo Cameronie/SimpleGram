@@ -306,8 +306,9 @@ test('search data: at most 2 POSTs per request; never /graphql/query after Insta
   await openPlace(page);
   await waitText(page, 'Try again');
   assert.ok((await searchText(page)).includes('Open Instagram’s own page'));
+  // No setting added and no other path; only the place's one ask at the website's 12 (R4).
   const grid = s.log.filter(r => r.name === 'PolarisLocationPageTabContentQuery');
-  assert.deepEqual(grid.map(r => r.path), ['/api/graphql']);
+  assert.deepEqual(grid.map(r => [r.path, r.vars.first, BRAND in r.vars]), [['/api/graphql', 24, false], ['/api/graphql', 12, false]]);
   assert.equal(s.log.filter(r => r.path === '/graphql/query').length, 0);
 });
 
@@ -623,24 +624,85 @@ test('R4: a failed chained page keeps the first page\'s posts and offers Try aga
   assert.ok(!(await searchText(page)).includes('Try again'));
 });
 
-test('R4: Places ask for 24 a page; if Instagram refuses that, Try again asks for the website\'s 12', async () => {
-  const s = placeSite(after => (after == null ? null : placePage(codes('G1X', 12), null)));
+// Instagram's place query answering only requests for 12 a page.
+function only12(s, at) {
   const handler = s.api['/api/graphql'];
   s.api['/api/graphql'] = (u, req) => {
     const r = handler(u, req);
     const e = s.log[s.log.length - 1];
-    if (e.name === 'PolarisLocationPageTabContentQuery' && e.vars.first === 12) {
+    if (/^PolarisLocationPageTabContentQuery/.test(e.name) && e.vars.first === 12) {
       e.result = 'data';
-      return { body: { data: { xdt_location_get_web_info_tab: placePage(codes('G0X', 12), null) } } };
+      return { body: { data: { xdt_location_get_web_info_tab: at(e.vars.after) } } };
     }
     return r;
   };
+}
+test('R4: Places ask for 24 a page; if Instagram refuses that, the same tap asks for the website\'s 12 and keeps it', async () => {
+  const s = placeSite(() => null);                         // 24 is refused ("execution error")
+  only12(s, after => placePage(codes('G' + (after ? after.slice(1) : '0') + 'X', 12), 'c' + (after ? Number(after.slice(1)) + 1 : 1)));
   const page = await openPlaceWith(s);
-  await waitText(page, 'Try again');
-  assert.equal((await gridStats(page)).placeFirst, 12);
-  await shadowClick(page, 'Try again');
   await waitCells(page, 12);
+  await waitIdle(page);
+  assert.ok(!(await searchText(page)).includes('Try again'));
   assert.deepEqual(firsts(s).map(r => r.vars.first), [24, 12]);
+  assert.equal(conn(s).length, 0, 'the retry was this tap\'s second request: no chained page');
+  const g = await gridStats(page);
+  assert.deepEqual({ placeFirst: g.placeFirst, failed: g.failed, chained: g.chained }, { placeFirst: 12, failed: 0, chained: 0 });
+  // Later taps ask for 12 straight away and chain: two requests a tap.
+  await shadowClick(page, 'Show more');
+  await waitCells(page, 36);
+  await waitIdle(page);
+  assert.deepEqual(conn(s).map(r => [r.vars.after, r.vars.first]), [['c1', 12], ['c2', 12]]);
+});
+
+test('R4: a throttle or a stale request id is not taken for a refused page size', async () => {
+  const refusals = {
+    throttle: { errors: [{ code: 1675004, summary: 'Rate limit exceeded', severity: 'CRITICAL' }], data: null },
+    'stale id': { errors: [{ message: 'PersistedQueryNotFound', severity: 'CRITICAL', code: 1675002 }], data: null },
+  };
+  for (const [what, body] of Object.entries(refusals)) {
+    const state = { refuse: true };
+    const s = placeSite(after => {
+      if (after == null && state.refuse) return { status: 200, body: body };
+      return placePage(codes('T' + (after || '0') + 'X', 24), after == null ? 'c1' : 'c' + (Number(after.slice(1)) + 1));
+    });
+    const page = await openPlaceWith(s);
+    await waitText(page, 'Try again');
+    assert.deepEqual(firsts(s).map(r => r.vars.first), [24], what + ': no second request');
+    assert.equal((await gridStats(page)).placeFirst, 24, what);
+    state.refuse = false;
+    await shadowClick(page, 'Try again');
+    await waitCells(page, 24);
+    await shadowClick(page, 'Show more');
+    await waitCells(page, 48);
+    await waitIdle(page);
+    assert.deepEqual(firsts(s).map(r => r.vars.first), [24, 24], what);
+    assert.deepEqual(conn(s).map(r => r.vars.first), [24], what + ': 24 posts, no chained page');
+    const g = await gridStats(page);
+    assert.deepEqual({ placeFirst: g.placeFirst, chained: g.chained }, { placeFirst: 24, chained: 0 }, what);
+  }
+  const log = await (await openPlaceWith(placeSite(() => ({ status: 200, body: refusals.throttle })))).evaluate(async () => {
+    await new Promise(r => setTimeout(r, 300));
+    return window.__sg.gqlLog.filter(e => e.query === 'PolarisLocationPageTabContentQuery');
+  });
+  assert.equal(log.length, 1);
+  assert.equal(log[0].wait, true, 'the diagnostics mark it as a "please wait"');
+});
+
+test('R4: a refused chained page is not asked again at 12 in the same tap (2 requests a tap)', async () => {
+  const s = placeSite(after => (after == null ? placePage(codes('H0X', 12), 'c1') : null));
+  only12(s, () => placePage(codes('H1X', 12), null));
+  const page = await openPlaceWith(s);
+  await waitCells(page, 12);
+  await waitText(page, 'Try again');
+  assert.deepEqual(conn(s).map(r => r.vars.first), [24]);
+  assert.equal((await gridStats(page)).placeFirst, 24);
+  // Try again is a new tap: 24, then 12.
+  await shadowClick(page, 'Try again');
+  await waitCells(page, 24);
+  await waitIdle(page);
+  assert.deepEqual(conn(s).map(r => r.vars.first), [24, 24, 12]);
+  assert.equal((await gridStats(page)).placeFirst, 12);
 });
 
 test('R4: the keyword grid and a tag\'s pages chain the same way', async () => {
@@ -714,4 +776,80 @@ test('R4: leaving the grid before its first page arrives asks for no second page
   await page.waitForTimeout(400);
   assert.equal(firsts(s).length, 1);
   assert.equal(conn(s).length, 0);
+});
+
+// Holds the first answer to GraphQL query `name` until the returned function is called.
+async function hold(page, name) {
+  let release;
+  const held = new Promise(r => { release = r; });
+  await page.route('**/api/graphql', async route => {
+    if ((route.request().postData() || '').includes('=' + name + '&')) await held;
+    await route.fallback();
+  });
+  return release;
+}
+test('R4: closing search (Cancel, or an Instagram tab) before the first page arrives asks for no second page', async () => {
+  // Posts & Reels, then Cancel.
+  let s = site({ users: [NBA], keyword: codes('V0X', 10), keywordMore: 'k1', keywordNext: codes('V1X', 10) });
+  let { page } = await start(s.api);
+  let release = await hold(page, 'PolarisKeywordSearchExplorePageRelayQuery');
+  await shadowClick(page, 'Posts & Reels');
+  await query(page, 'nba');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelector('.spin'));
+  await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelector('.cancel').click());
+  release();
+  await page.waitForFunction(() => window.__sg.gqlLog.some(e => e.query === 'PolarisKeywordSearchExplorePageRelayQuery'));
+  await page.waitForTimeout(400);
+  assert.equal(s.log.filter(r => r.name === 'PolarisKeywordSearchExplorePageRelayPaginationQuery').length, 0);
+  // Reopened, the first page is there and Show more carries on from it.
+  await openSearchTab(page);
+  await waitCells(page, 10);
+  await shadowClick(page, 'Show more');
+  await waitCells(page, 20);
+  assert.equal(s.log.filter(r => r.name === 'PolarisKeywordSearchExplorePageRelayPaginationQuery').length, 1);
+  // A place, then Instagram's own navigation to another tab.
+  s = placeSite(after => placePage(codes('Z' + (after || '0') + 'X', 6), after == null ? 'c1' : 'c2'));
+  ({ page } = await start(Object.assign(s.api, placesApi(HYATT))));
+  release = await hold(page, 'PolarisLocationPageTabContentQuery');
+  await query(page, 'hyatt');
+  await openPlace(page);
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelector('.spin'));
+  await page.evaluate(() => { history.pushState({}, '', '/direct/inbox/'); window.dispatchEvent(new PopStateEvent('popstate')); });
+  await page.waitForFunction(() => document.getElementById('sg-search').style.display === 'none');
+  release();
+  await page.waitForFunction(() => window.__sg.gqlLog.some(e => e.query === 'PolarisLocationPageTabContentQuery'));
+  await page.waitForTimeout(400);
+  assert.equal(firsts(s).length, 1);
+  assert.equal(conn(s).length, 0);
+});
+
+test('R4: a tag whose old page fails (429 or 5xx) costs 2 requests a tap: no chained page after the probe', async () => {
+  for (const status of [429, 503]) {
+    const s = site({ users: [NBA], tags: [{ name: 'nbafinals', media_count: 9 }], keyword: codes('J0X', 12), keywordMore: 'k1', keywordNext: codes('J1X', 12) });
+    let probes = 0;
+    const api = Object.assign(s.api, { '/api/v1/tags/web_info/': () => { probes++; return { status: status, body: { message: 'Please wait a few minutes before you try again.', status: 'fail' } }; } });
+    const { page, urls } = await start(api);
+    await shadowClick(page, 'Tags');
+    await query(page, 'nba');
+    await waitText(page, '#nbafinals');
+    for (const tag of ['#nba', '#nbafinals']) {
+      const mark = urls.length;
+      await shadowClick(page, tag);
+      await waitCells(page, 12);
+      await waitIdle(page);
+      const tap = urls.slice(mark).filter(u => /tags\/web_info|graphql/.test(u));
+      assert.equal(tap.length, 2, status + ' ' + tag + ': ' + tap.length);
+      assert.ok((await searchText(page)).includes('Show more'), 'the next page is still offered');
+      await shadowClick(page, '‹');
+      await waitText(page, '#nbafinals');
+    }
+    assert.equal(probes, 2, 'a ' + status + ' is not remembered');
+    assert.equal(s.log.filter(r => r.name === 'PolarisKeywordSearchExplorePageRelayPaginationQuery').length, 0);
+    // Show more on a tag after the probe: the keyword page, chained as usual.
+    await shadowClick(page, '#nba');
+    await waitCells(page, 12);
+    await shadowClick(page, 'Show more');
+    await waitCells(page, 24);
+    assert.equal(s.log.filter(r => r.name === 'PolarisKeywordSearchExplorePageRelayPaginationQuery').length, 1);
+  }
 });

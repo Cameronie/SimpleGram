@@ -1876,6 +1876,9 @@
         // Instagram read the request and refused it: never resend it elsewhere.
         const err = Array.isArray(data.errors) ? data.errors[0] : null;
         if (err && (err.code != null || err.api_error_code != null)) note.code = err.code != null ? err.code : err.api_error_code;
+        // "Please wait" inside an ordinary answer (as noteThrottle counts it).
+        if (err && (/rate limit|please wait/i.test(String(err.message || '') + ' ' + String(err.summary || '')) ||
+            (note.code === 1675004 && /rate/i.test(String(err.summary || ''))))) note.wait = true;
         note.message = String(err ? err.message || err.summary || err.description || 'error' : data.message || 'no ' + root).slice(0, 200);
         gqlNote(note);
         // Retry once only when the answer names a setting that wasn't sent.
@@ -2372,7 +2375,9 @@
       return { media: collectMedia(part.sections || []), more: m };
     }
     // The old tag page, while it still answers with posts in this session.
+    let probed = false;
     if (!cursor && !dead.has('tags/web_info')) {
+      probed = true;
       const meta = {};
       const data = await igGet('/api/v1/tags/web_info/?tag_name=' + encodeURIComponent(name), meta);
       searchStats.tagWebInfo = meta.status || 0;
@@ -2393,7 +2398,10 @@
     }
     // What the website itself shows for a hashtag now.
     if (!cursor) searchStats.tagGrid.keyword++;
-    return loadKeyword('#' + name, cursor);
+    const r = await loadKeyword('#' + name, cursor);
+    // The probe was this tap's first request: no chained page after this one.
+    if (r && probed) r.spent = 2;
+    return r;
   }
   // A place's name and address, when the row it was opened from had none.
   function placeHeader(view) {
@@ -2412,30 +2420,38 @@
   }
   // The requests Instagram's own place page makes (Top is "ranked").
   // `first` is the page size (Relay's count; the website sends 12). Ask for
-  // PLACE_PAGE; if Instagram refuses that request, go back to the website's
-  // 12 for this page (the tap chains a second page instead).
+  // PLACE_PAGE; if Instagram refuses that request, ask again at the website's
+  // 12 in the same tap, and keep 12 only when that answers (the tap then
+  // chains a second page instead). A throttle or a stale id says nothing
+  // about the page size: no second request then.
   let placeFirst = PLACE_PAGE;
-  async function loadPlace(view, cursor) {
+  function sizeMayBeRefused(name) {
+    const last = gqlLog[gqlLog.length - 1];
+    if (!last || last.query !== name || last.code == null || last.wait) return false;
+    return last.code !== 1675002 && !/PersistedQueryNotFound|missing_required_variable/i.test(last.message || '');
+  }
+  async function loadPlace(view, cursor, left) {
     const tab = view.sub === 'recent' ? 'recent' : 'ranked';
     const id = String(view.id);
     if (!cursor && (!view.name || !view.address) && !view.headerAsked) { view.headerAsked = true; placeHeader(view); }
-    const first = placeFirst;
     const name = cursor ? 'PolarisLocationPageTabContentQuery_connection' : 'PolarisLocationPageTabContentQuery';
-    const c = cursor
-      ? await igGraphQL(name, { after: cursor.after, first: first, location_id: id, page_size_override: null, tab: tab }, 'xdt_location_get_web_info_tab')
-      : await igGraphQL(name, { location_id: id, first: first, after: null, tab: tab, page_size_override: null }, 'xdt_location_get_web_info_tab');
-    if (!c) {
-      // Instagram read the request and refused it (not a network error or a 429).
-      const last = gqlLog[gqlLog.length - 1];
-      if (first > 12 && last && last.query === name && last.code != null) searchStats.grid.placeFirst = placeFirst = 12;
-      return null;
+    const ask = first => (cursor
+      ? igGraphQL(name, { after: cursor.after, first: first, location_id: id, page_size_override: null, tab: tab }, 'xdt_location_get_web_info_tab')
+      : igGraphQL(name, { location_id: id, first: first, after: null, tab: tab, page_size_override: null }, 'xdt_location_get_web_info_tab'));
+    const first = placeFirst;
+    let c = await ask(first), spent = 1;
+    if (!c && first > 12 && (left == null || left >= 2) && sizeMayBeRefused(name)) {
+      spent = 2;
+      c = await ask(12);
+      if (c) searchStats.grid.placeFirst = placeFirst = 12;
     }
+    if (!c) return null;
     const media = collectMedia((c.edges || []).map(e => e && e.node));
     const next = nextCursor(c, cursor);
-    return { media: media, more: next ? { after: next } : null, noRecent: tab === 'recent' && !media.length && !cursor };
+    return { media: media, more: next ? { after: next } : null, noRecent: tab === 'recent' && !media.length && !cursor, spent: spent };
   }
-  async function loadTagOrPlace(view, cursor) {
-    return view.kind === 'tag' ? loadTag(view, cursor) : loadPlace(view, cursor);
+  async function loadTagOrPlace(view, cursor, left) {
+    return view.kind === 'tag' ? loadTag(view, cursor) : loadPlace(view, cursor, left);
   }
 
   /* Recent searches */
@@ -2823,17 +2839,21 @@
   }
   // One tap's worth of a grid (opening it, Show more or Try again): a page,
   // and when it brought fewer than CHAIN_BELOW new posts and Instagram has
-  // more, the next page right after it. Never more than 2 pages a tap; nothing
-  // loads without a tap. `alive()` is false once you have left this grid.
+  // more, the next page right after it. Never more than 2 requests a tap:
+  // `load(cursor, left)` is told how many it may send and reports `spent`
+  // when a page took more than one (a tag's old-page probe, a place's 12
+  // retry). Nothing loads without a tap. `alive()` is false once you have
+  // left this grid; closing search (Cancel, an Instagram tab) stops the chain.
   // A failed page keeps every post already shown, and its cursor for Try again.
   async function fillGrid(st, load, alive, draw) {
     const gs = searchStats.grid;
     gs.taps++;
     st.failed = false;
     let fresh = !st.pages;                                 // opening the grid: its first draw is a full one
+    let spent = 0;
     for (let n = 0; n < 2; n++) {
       if (n) gs.chained++;
-      const res = await load(st.pages ? st.more : null);
+      const res = await load(st.pages ? st.more : null, 2 - spent);
       if (!alive()) return;
       if (!res) {
         if (n) gs.chainFailed++; else gs.failed++;
@@ -2848,7 +2868,8 @@
       gs.pages++;
       gs.sizes.push(added);
       if (gs.sizes.length > 10) gs.sizes.shift();
-      if (!st.more || added >= CHAIN_BELOW) break;
+      spent += res.spent || 1;
+      if (!st.more || added >= CHAIN_BELOW || spent >= 2 || !search.open) break;
       draw(fresh);                                         // show this page while the next one loads
       fresh = false;
     }
@@ -2879,7 +2900,7 @@
     const draw = full => { if (!full && search.body) renderGrid(search.body, st, () => runGrid(true), null); else render(); };
     draw(!more);
     const seq = ++search.seqGrid;
-    await fillGrid(st, cursor => loadTagOrPlace(v, cursor), () => seq === search.seqGrid && search.grid === st && search.view === v, draw);
+    await fillGrid(st, (cursor, left) => loadTagOrPlace(v, cursor, left), () => seq === search.seqGrid && search.grid === st && search.view === v, draw);
   }
 
   // Open a profile/post from search. Try Instagram's in-app navigation;
