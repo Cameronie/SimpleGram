@@ -1,6 +1,6 @@
 # B16 / B17 diagnosis
 
-Investigators' diagnoses and the B16 review (the B17 review is pending). Scratchpad paths refer to experiments from the diagnosis session; they are not kept.
+Investigators' diagnoses and both reviews. Scratchpad paths refer to experiments from the diagnosis session; they are not kept.
 
 
 ######## B16
@@ -431,3 +431,131 @@ Record only. Build on "Apk it". All changes go against 1.2 simplegram.js.
 8. **On the phone with the new build:**
    - reach the end card, tap Home (it should stay, at the top), tap Home again at the top (it may reload to a short list, which is Instagram's own caught-up), then send Copy details;
    - separately, if the jump happens again without a tap, send Copy details right away.
+
+
+######## B17 REVIEW (verdict: confirmed)
+
+--- corrections
+The root cause holds. I tried to refute it and could not. The 1.2 skip removed all 3 items of Following's first page. Instagram then has no list, or a list that cannot scroll, so it never asks for page 2. 1.2's only way out is one 600 ms nudge (simplegram.js:565, 740-776), which is lost, and a capped nudge is never re-armed (line 750). Instagram never pages from an empty first page.
+
+I re-checked these claims and they are correct:
+- first:3 from getPolarisFeedInitialPageSize (b205: `var e=3;function s(){return r("gkx")("8953")?e:null}`).
+- The showEmptyFeed branch in PolarisFeedComponent.react (b344).
+- PolarisFeed.react renders the deferred PolarisFeedPage.react (b344).
+- IGVirtualList (b32) attaches a window scroll listener with capture, and onScroll runs only from $7 (scroll, or a containerSize change). An itemCount change only measures.
+- GenericVirtualFeed (1d0d19b3.js) pages from its throttled onScroll and shows the spinner while hasNext or fetching.
+- The cited simplegram.js line numbers.
+- Experiment reproductions: the proposed tests fail 0/5 on 1.2 and pass 5/5 on ARSXC. The repo suite gives 124/124 on 1.2 and 123/124 on ARSXC.
+
+Corrections to the evidence:
+1. suggestionsBlanked 2 is not evidence that loadSULV2 ran.
+   - PolarisFeedRoot.entrypoint (b404) preloads PolarisSuggestedUserListQuery on every feed page load when `gkx("25302") || routeProps.enable_mobile_suggested_user_cta`. Its root is the same `xdt_api__v1__ayml__strict` (alias "ayml"; b344 PolarisSuggestedUserListQuery.graphql).
+   - b385 skips loadSULV2 when JK 6493 and gkx 25302 are both on.
+   - The mock's "suggestionsBlanked 2" matches the phone only because igmock.js serves 2 fake users. It reproduces nothing.
+   - Only an ayml payload count with timing relative to the first feed page would tell these apart.
+2. "1.2 with H1 reproduces the phone exactly" leaves out `blank 4`.
+   - In checkBlank (simplegram.js:1098-1108), `blank` goes up once per run of blank checks. A touch, or a scroll within 800 ms, resets the run (touchend sets lastUserScroll, line 737).
+   - So blank 4 means the user touched or swiped the black page at least 3 times.
+   - My run with swipes (scratch b17-skeptic/exp3.cjs, USER_MODE=swipe, 1.2, H1 and H2 with a 1500 ms mount) gave blank 2-3 in 16 s, 0 trusted scroll events and 1 request. With no swipes, blank stays at 1.
+   - This is new evidence: the page had no scroll room, under either hypothesis, and the user's own gestures could not reach Instagram's loader. It also makes the scroll-room part of the fix mandatory (see fixPlanProblems).
+3. The phone cannot tell H1 from H2.
+   - "No spinner" fits H1, or a logged-in PolarisVirtualFeed whose spinner shows only while fetching. That module is not in the bundles.
+   - H2 with the list mounting before 600 ms is ruled out: in the mock it pages fine.
+4. The C1 claim stands. The 10-a-minute cap drops nudges and never re-arms. The page cap of ceil(seen/10) with 8-post pages ends before any new post.
+   - But the proposed "seen-count bound" (seenPassed > seenCodes.size + 30) never fires in normal paging, because each seen post appears only once in Following.
+   - It only stops a server loop, and only after about 17 requests in about 10 s (LOOP/ECHO runs: 18 requests, 17 within 10 s).
+   - The cursor-echo check named in the plan is not in the prototype.
+   - In normal paging the only real limit is the 80-page cap.
+5. Extra bundle fact: Instagram's client dedupe (b385 polarisFeedDedupeIdsResolver) works only within one connection, by media id plus unfollowed_users. So an anchor post is not removed for having been seen in Home.
+
+Still unverifiable without the phone:
+- Which of H1 or H2 happens.
+- When the list mounts.
+- Whether synthetic scroll events page the logged-in list.
+- Following's page size after page 1.
+
+--- missedCauses
+* blank 4 means the user touched or swiped the blank page at least 3 times (simplegram.js:737 and 1100-1108 reset blankChecks), and none of it produced a page. The page had no scroll room under either hypothesis. This is Instagram's own trigger, and SimpleGram has to restore it (scroll room); retrying synthetic nudges alone is not enough.
+* suggestionsBlanked 2 can come from the route's own preload of PolarisSuggestedUserListQuery (b404 entrypoint: gkx 25302 or enable_mobile_suggested_user_cta; root xdt_api__v1__ayml__strict). It is not evidence of loadSULV2 or of the empty-first-page path.
+* Short-page variant, outside the anchor case: a first page of 2 seen + 1 new keeps 1 post. 1.2 and ARSXC then send only a soft nudge (hard=false), which never adds the pad, and the anchor-only spacer does not appear. If the real list reacts only to real scroll events, the user is stuck with 1 post and a spinner even when swiping. Experiment S4, TRUSTED=1: ARSXC 1 request, 4-5 nudges, stuck; review variant Zg pages.
+
+--- fixPlanProblems
+* The scroll room (option S) is presented as optional, but it is the only part that works through Instagram's own trigger. With a list that ignores synthetic scroll events (igmock3 trustedOnly), ARX, which has no room, stays at the anchor plus a spinner with 1 request and 5 nudges even while the user swipes. ARSXC reaches new posts at 1.75-2.25 s. Make it mandatory.
+* The room appears only while the anchor is alone. A first page that keeps 1-2 new posts (S4) gets no room and only soft nudges with no pad, so it is stuck under a list that needs real scroll events (review test 1 fails on ARSXC and passes on Zf/Zg).
+* The room is removed while the JSON is parsed, before React draws the new posts. The document shrinks, the browser clamps scrollTop, and the page jumps back to the top of the anchor. Trace with RENDER=120: scrollY 400 to 0 at 1.75 s for ARSXC and for Zf; Zg, which waits until removal cannot move the page, stays at 400. This is a B16-type jump. Review test 3 fails on ARSXC and passes on Zg.
+* The room is left behind after the feed ends on the seen cap (LOOP/ECHO runs: ended:true, room:true). It also stays after an in-page switch to Home (review test 6 fails on ARSXC). On Home it adds about 0.6×innerHeight below the last post, so checkFeedEnd's `near` (gap < max(400, 0.6×innerHeight), line 806) is not reached at the real end. That delays Home's end card. The plan says to remove the room on end and on route change, but the prototype does neither.
+* The bound: seenPassed > size+30 never fires in normal paging, the cursor echo is missing from the prototype, and a server loop costs about 17 requests in about 10 s at the 200 ms uncapped pace. Zf/Zg instead treat 'every seen post on this page was already passed' as a reload or loop, and add a cursor-echo stop: 2 requests.
+* Pull to refresh or a Home-tab refetch on the page opened from the end card: in ARSXC the refetched first page is emptied again (shownAny is already true), giving about 0.5 s of blank under H2 and an unknown result under H1, where Instagram may show its empty view (review test 5 fails on ARSXC). This needs a rule (Zf: forget the skip; Z: re-anchor), not just a listed risk.
+* X still pushes skip nudges into nudgedAt (ARSXC lines 779-782), so paging past seen posts uses up the 10-a-minute budget of whichever feed comes next in the same document. Its 200 ms uncapped pace gave 20 requests per 10 s at 300 ms latency. A 400 ms pace with its own 40-a-minute cap gave 15 per 10 s, at a cost of about 4 s to the first new post (18 s versus 14 s; 29 s versus 24.5 s at 800 ms). The plan's 'pause on pleaseWait/s429' is not in the prototype.
+* 'Retry, plus ideally the first page of any feed' would change Home and Following/Favorites opened from the menu. That breaks the rule that menu-opened feeds stay unchanged. Keep every new behaviour behind skipping(). (With MENU=1, 1.2 and Zf behave identically, which is the current state.)
+* The anchor rule has to match B18's fix 1. B18 says the newest already-seen post; B17 says the oldest. Pick one and implement it once.
+* The optional '::before Seen in Home' label changes the article's height inside IGVirtualList's measured items. If a label is wanted, use a non-layout cue, or put the text in the native message.
+* Repo test 62, 'pages of only already-seen posts keep loading', serves the same SEEN001 8 times. A loop guard in Z style breaks it (it fails on Z). With Zf/Zg's 'forget the skip' it passes. If Z is chosen, rewrite the test with distinct seen codes.
+
+--- revisedFixPlan
+Revised B17 fix. Everything is in app/src/main/assets/simplegram.js unless noted. Every new behaviour is gated by skipping(), so it applies only to the page opened from the end-of-Home card. Home and Following/Favorites opened from the menu keep 1.2 behaviour. Prototype: scratch wf4/b17-skeptic/variants3.cjs, variant Zg (built file sg-Zg.js). Results: repo suite 123/124, the only failure being the expected 15-pages test; the investigator's b17-proposed tests 5/5; my b17-review tests 6/6 (1.2: 0/6, ARSXC: 1/6).
+
+1. Anchor (unchanged from option A).
+   - Placement: in filterFeedList after the verdict loop (after line 549).
+   - Trigger: seenCodes, keptMedia===0, alreadySeen>0, and !fs.shownAny.
+   - Action: put back exactly one post that was dropped as alreadySeen, in list order. Count stats.feed.anchor. Set fs.shownAny whenever keptMedia>0.
+   - Line 537 only marks posts with !x.drop, so an anchor is always a followed post that passed every other filter. Ads, suggestions and strangers never come back.
+   - Pick the same post rule as B18 fix 1 (the page's oldest seen post is closest to what follows) and implement it once.
+   - No layout-changing label.
+
+2. Scroll room (mandatory, generalised from option S).
+   - While skipping(), the feed has not ended, has_next is true and fewer than 3 posts have been kept (fs.shownCount), keep `#sg-skip-room` at the end of body: about 0.6×innerHeight, aria-hidden, pointer-events:none.
+   - Release it only when removing it cannot move the page: scrollHeight − room ≥ scrollTop + innerHeight, polled every 100 ms after the page, or after 3 s at most.
+   - Also release it from endFeed (line 325), when the skip is forgotten, and in routeChanged (line 1255) when !skipping().
+   - Never on Home or on a menu-opened feed.
+   - Why: a user's swipe then produces a real scroll event, which is Instagram's own paging trigger. This works even if synthetic nudges do nothing on the device.
+
+3. Nudges while skipping (option R, scoped).
+   - In scheduleNudge (740-776), remember fs.lastPageAt.
+   - While skipping(), no newer page has arrived and the feed has not ended, retry after about 1, 2, 4 and 8 s, up to 8 tries.
+   - While skipping(), every nudge is hard: the pad when the page cannot scroll, the ±2 px jiggle when it can. Either way a real scroll event happens.
+   - Home and menu-opened feeds keep the 1.2 nudge: no retry, and the existing 10-a-minute cap with its test unchanged.
+
+4. Pace while paging past seen posts (option X, softened).
+   - After a page of only seen posts, nudge after 400 ms.
+   - These nudges do not go into nudgedAt (Home's 10-a-minute list). They have their own cap of 40 a minute; a capped one re-arms when the minute frees up.
+   - Stop nudging, and end with the note in point 6, if stats.diag.s429 or pleaseWait rises after the skip started.
+   - Measured, 190 seen and 8-post pages: first new post at 18 s with 300 ms latency and 29 s with 800 ms; at most 15 requests per 10 s.
+
+5. Bounds (replacing lines 559-561).
+   - (a) Cursor echo: a page of only seen posts whose end_cursor equals the previous one → stopPagination + endFeed.
+   - (b) Reload or loop: Following never repeats a post. If every seen post on a page was already passed in this skip run (skip.passed Set), Instagram reloaded the first page (pull to refresh, Home-tab refetch) or is looping. Forget the one-time skip (skip=null), leave the page as Instagram sent it, release the room, and count stats.feed.skipForgotten.
+     - Alternative if repeats after a refresh are unwanted: re-arm the anchor at most twice, then stop.
+     - Measured: loop and echo cost 2 requests (ARSXC 18, 1.2 15). A refetch is never blank.
+   - (c) Page cap: seenStreak ≥ min(80, seenCodes.size + 3).
+   - The natural end (has_next false) is unchanged.
+
+6. Messages (native and JS).
+   - Use a separate 'skipStatus' message, never 'feedEnd', so Home's card logic (checkFeedEnd at line 801, and the card itself) is untouched.
+   - Show "Skipping N posts you saw in Home…" when the anchor has stood alone for more than 3 s while paging past seen posts.
+   - Show "Nothing new since Home" when a skipped feed ends showing only the anchor.
+   - MainActivity shows it only on Following/Favorites.
+
+7. One-time skip (coordinate with B18): also forget the skip when the route leaves the skip page inside the page, so an in-page return is an ordinary open.
+
+8. Tests.
+   - Update 'paging past posts already seen stops after 15 pages, not 40' to the min(80, seen+3) cap, using enough distinct seen codes.
+   - Keep 'pages of only already-seen posts keep loading'. It passes with rule 5b.
+   - Port the investigator's 5 tests (b17/b17-proposed.test.cjs).
+   - Port my 6 tests (b17-skeptic/b17-review.test.cjs):
+     - list that reacts only to real scrolls, first page 2 seen + 1 new;
+     - a swipe into the room pages;
+     - releasing the room never moves the page when React draws later;
+     - a loop costs at most 5 requests;
+     - a pull to refresh is never blank;
+     - the room is gone after an in-page switch to Home.
+   - Add to the VLIST port options for a mount delay, trusted-only paging and a render delay.
+
+9. Fallback, if phone diagnostics show the anchor or the room failing: skip from page 2 onward (option F). That gives 3 repeats, but the page can scroll from the start. Measured with a swiping user: first new post at about 6.25 s under H1 and H2, with real or synthetic scroll events.
+
+Phone diagnostics (shape-only), in addition to the investigator's (a)-(f):
+- Nudge results by kind (synthetic only / jiggle / pad / swipe into the room), each with "a feed page arrived within 3 s". This settles whether synthetic events alone ever page the logged-in list.
+- Touches while blank, and the scroll room (px) at that moment.
+- Count and timing of ayml payloads relative to the first feed page. Do not rely on suggestionsBlanked for this.
+- anchor, skipForgotten, cursorEcho, skipThrottled, skipRoom, and time to the first new post.
+- A per-page trail: edges in/out and has_next in/out, as B18 proposes.
