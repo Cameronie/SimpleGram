@@ -1261,17 +1261,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         } else if (searchOpen) {
             // SimpleGram's search screen closes first (a tag/place page, then search).
             final boolean[] done = {false};
-            Runnable fallback = () -> {
-                if (done[0]) return;
-                done[0] = true;
-                pageBack();
-            };
             web.evaluateJavascript("!!(window.__sg&&window.__sg.back&&window.__sg.back())", handled -> {
                 if (done[0]) return;
                 done[0] = true;
                 if (!"true".equals(handled)) pageBack();
             });
-            ui.postDelayed(fallback, 600);
+            // A page too busy to answer in time (e.g. drawing a result it is
+            // opening, while the route still says Home) gets nothing on this
+            // press: a late answer must never leave the app.
+            ui.postDelayed(() -> done[0] = true, 600);
         } else {
             pageBack();
         }
