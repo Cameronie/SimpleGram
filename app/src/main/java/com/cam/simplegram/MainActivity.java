@@ -230,10 +230,24 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             c.put("version", BuildConfig.VERSION_NAME);
             c.put("searchPages", 3);
             c.put("viewerId", viewerId == null ? JSONObject.NULL : viewerId);
+            c.put("continueHome", continueHome());
             return c.toString();
         } catch (JSONException e) {
             return "{}";
         }
+    }
+
+    /** R7: Home goes on into posts from people you follow past "caught up" (⋮ → More…). */
+    private boolean continueHome() {
+        return prefs.getBoolean("continueHome", true);
+    }
+
+    /** The menu switch: takes effect on the next load of Home (the page script reads it at start). */
+    private void toggleContinueHome() {
+        boolean on = !continueHome();
+        prefs.edit().putBoolean("continueHome", on).apply();
+        for (Script s : scripts) registerScript(s);
+        toast("Continue Home into Following: " + (on ? "on" : "off") + ". Takes effect when Home next loads.");
     }
 
     private void install(WebView w, String role) {
@@ -541,11 +555,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "feedEnd":
                 if (main) {
-                    // The end-of-Home card belongs to Home only, whatever the page asks.
-                    feedWanted = m.optBoolean("on") && !onOtherFeed();
+                    // The end-of-Home card belongs to Home only, whatever the page asks;
+                    // never while Home is going on into Following (unless it stalled).
+                    String cont = m.optString("cont", "off");
+                    boolean stalled = m.optBoolean("stalled");
+                    feedWanted = m.optBoolean("on") && !onOtherFeed() && !("running".equals(cont) && !stalled);
                     if (feedWanted) {
                         String subtitle = m.optBoolean("caughtUp") && !m.isNull("subtitle") ? m.optString("subtitle", "").trim() : "";
-                        setFeedText(m.optBoolean("stalled"), subtitle.length() > 200 ? subtitle.substring(0, 200) : subtitle);
+                        setFeedText(stalled, subtitle.length() > 200 ? subtitle.substring(0, 200) : subtitle, cont);
                     }
                     updateFeedBar();
                 }
@@ -559,7 +576,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             case "skipStatus":
                 if (main) {
                     String kind = m.optString("kind", "");
-                    skipKind = m.optBoolean("on") && ("skipping".equals(kind) || "nothingNew".equals(kind)) ? kind : "";
+                    skipKind = m.optBoolean("on") && ("skipping".equals(kind) || "nothingNew".equals(kind) || "homeSkipping".equals(kind)) ? kind : "";
                     skipCount = Math.max(0, Math.min(99999, m.optInt("n")));
                     updateFeedBar();
                 }
@@ -712,8 +729,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private void updateSkipChip() {
-        boolean show = !skipKind.isEmpty() && "home".equals(route) && onFollowingOrFavorites() && !screenshotMode
-                && !comments.isOpen() && !searchOpen && customView == null;
+        // Following or Favorites opened from the card; or Home itself while it goes on
+        // into Following and is still passing posts you saw (R7, homeSkipping).
+        boolean home = "homeSkipping".equals(skipKind);
+        boolean show = !skipKind.isEmpty() && "home".equals(route) && (home ? !onOtherFeed() : onFollowingOrFavorites())
+                && !screenshotMode && !comments.isOpen() && !searchOpen && customView == null;
         if (show) {
             skipChip.setText("nothingNew".equals(skipKind) ? "Nothing new since Home"
                     : skipCount > 0 ? "Skipping " + skipCount + " posts you saw in Home…" : "Skipping posts you saw in Home…");
@@ -750,7 +770,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bar.addView(sub);
         feedTitle = title;
         feedSub = sub;
-        setFeedText(false, "");
+        setFeedText(false, "", "off");
 
         // Following only: Favorites stays in the ⋮ menu.
         bar.addView(feedButton("Following", "following"));
@@ -785,12 +805,21 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     /**
      * At the end of Home, Instagram's own line ("You've seen all new posts from
      * the past 3 days.") when it sent one; when nothing has loaded for a while, says so.
+     * With Home going on into Following (R7, cont): nothing while it runs; this
+     * card if it failed or stalled; its own words when Following has nothing
+     * new (done) or at the required stop after about 200 posts (limit).
      */
-    private void setFeedText(boolean stalled, String subtitle) {
+    private void setFeedText(boolean stalled, String subtitle, String cont) {
         String keepGoing = "Keep going, newest first, without repeats:";
         if (stalled) {
             feedTitle.setText("Home isn't loading more");
             feedSub.setText(keepGoing);
+        } else if ("done".equals(cont)) {
+            feedTitle.setText("That's everything new from people you follow");
+            feedSub.setText("Older posts, newest first, without repeats:");
+        } else if ("limit".equals(cont)) {
+            feedTitle.setText("Keep going in Following");
+            feedSub.setText("Home stops here after about 200 posts from people you follow.\nNewest first, without repeats:");
         } else {
             feedTitle.setText("You're all caught up on Home");
             feedSub.setText(subtitle.isEmpty() ? keepGoing : subtitle + "\n" + keepGoing);
@@ -1094,6 +1123,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private void showMore() {
         String[] items = {
                 "Filter status",
+                "Continue Home into Following: " + (continueHome() ? "On" : "Off"),
                 "Open Instagram links with SimpleGram…",
                 "Open copied Instagram link",
                 "About SimpleGram",
@@ -1104,9 +1134,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     js("status");
                     break;
                 case 1:
-                    linkSettings();
+                    toggleContinueHome();
                     break;
                 case 2:
+                    linkSettings();
+                    break;
+                case 3:
                     openCopiedLink();
                     break;
                 default:
@@ -1228,6 +1261,31 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     .append(" (held ").append(feed.optInt("recoverHeld")).append(")\n")
                     .append("  Feed trail: ").append(trail().length()).append(" entries, kept across restarts (Copy details)\n");
         }
+        JSONObject cont = stats.optJSONObject("cont");
+        if (cont != null) {
+            JSONObject why = cont.optJSONObject("headWhy");
+            String reason = cont.optString("reason", "");
+            b.append("\nHome into Following\n")
+                    .append("  Switch: ").append(cont.optBoolean("on") ? "on" : "off")
+                    .append(" · state: ").append(cont.optString("state", "off"))
+                    .append(reason.isEmpty() ? "" : " (" + reason + ")").append('\n')
+                    .append("  Posts added: ").append(cont.optInt("handed"))
+                    .append(" · Instagram's own kept: ").append(cont.optInt("igKept"))
+                    .append(" · seen skipped: ").append(cont.optInt("skippedSeen")).append('\n')
+                    .append("  Own requests: ").append(cont.optInt("own"))
+                    .append(" (failed ").append(cont.optInt("ownFail"))
+                    .append(", most in a minute ").append(cont.optInt("peakMin")).append(")\n")
+                    .append("  Pages handed: ").append(cont.optInt("swaps"))
+                    .append(" (empty ").append(cont.optInt("empty")).append(")")
+                    .append(" · repeats: ").append(cont.optInt("repeats")).append('\n')
+                    .append("  Home reloads: ").append(cont.optInt("heads"));
+            if (why != null) {
+                b.append(" (marker ").append(why.optInt("marker")).append(", seen ").append(why.optInt("seen"))
+                        .append(", jump ").append(why.optInt("jump")).append(", tap ").append(why.optInt("tap"))
+                        .append(", ended ").append(why.optInt("ended")).append(')');
+            }
+            b.append('\n');
+        }
         JSONObject sd = stats.optJSONObject("searchData");
         JSONObject opens = stats.optJSONObject("searchOpens");
         if (sd != null || opens != null) {
@@ -1342,6 +1400,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("fullScreens", fullScreens);
             n.put("fullScreenLast", fullScreenLast);
             n.put("fullScreenNested", fullScreenNested);
+            n.put("continueHome", continueHome());
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
             n.put("pageStarts", new JSONObject().put("all", startsAll).put("loadUrl", startsLoadUrl)

@@ -303,6 +303,94 @@ public class ShellTest {
     }
 
     @Test
+    public void endOfHomeCardFollowsHomeGoingOnIntoFollowing() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            // Running: Home goes on, so no card even if asked.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "running").toString());
+            SystemClock.sleep(400);
+            idle();
+            assertNull(visibleChild(act.get(), "End of Home"));
+            // Running but stalled: the Following card.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("stalled", true).put("cont", "running").toString());
+            SystemClock.sleep(400);
+            idle();
+            String text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("Home isn't loading more") && text.contains("Following"));
+            // Failed: the card as without the continuation.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "failed")
+                    .put("subtitle", "You've seen all new posts from the past 3 days.").toString());
+            idle();
+            text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("You're all caught up on Home") && text.contains("Following"));
+            // Done: everything new from people you follow was shown.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "done")
+                    .put("subtitle", "You've seen all new posts from the past 3 days.").toString());
+            idle();
+            text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("That's everything new from people you follow") && !text.contains("past 3 days")
+                    && text.contains("Following"));
+            // The required stop after about 200 posts.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "limit").toString());
+            idle();
+            text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("Keep going in Following"));
+        }
+    }
+
+    @Test
+    public void continueHomeSwitchReachesThePageConfig() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            AtomicReference<String> before = new AtomicReference<>();
+            AtomicReference<String> after = new AtomicReference<>();
+            s.onActivity(x -> {
+                try {
+                    before.set((String) call(x, "config", new Class<?>[]{String.class}, "main"));
+                    call(x, "toggleContinueHome", new Class<?>[]{});
+                    after.set((String) call(x, "config", new Class<?>[]{String.class}, "main"));
+                    call(x, "toggleContinueHome", new Class<?>[]{});   // back as it was
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            boolean was = new JSONObject(before.get()).getBoolean("continueHome");
+            assertEquals(!was, new JSONObject(after.get()).getBoolean("continueHome"));
+        }
+    }
+
+    @Test
+    public void homeSkipNoteShowsOnHomeOnly() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", true).put("kind", "homeSkipping").toString());
+            idle();
+            View chip = visibleChild(act.get(), "Skip status");
+            assertNotNull("skip note on Home", chip);
+            assertTrue(String.valueOf(((android.widget.TextView) chip).getText()).contains("Skipping posts you saw in Home"));
+            assertNull(visibleChild(act.get(), "End of Home"));
+            // Not on Following (that page has its own note).
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString());
+            idle();
+            assertNull(visibleChild(act.get(), "Skip status"));
+            // Off again on Home.
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", false).toString());
+            idle();
+            assertNull(visibleChild(act.get(), "Skip status"));
+        }
+    }
+
+    @Test
     public void skipStatusShowsOnFollowingOnlyNeverAsTheCard() throws Exception {
         try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
             AtomicReference<MainActivity> act = new AtomicReference<>();
