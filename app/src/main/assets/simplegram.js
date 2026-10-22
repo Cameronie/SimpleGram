@@ -830,7 +830,7 @@
     if (keptMedia > 0 || anchor) fs.shownAny = true;
     fs.shownCount += keptMedia;
     fs.handed += kept.length;
-    if (kept.length !== list.length) list.splice(0, list.length, ...kept);
+    if (kept.length !== list.length || kept.some((e, i) => e !== list[i])) list.splice(0, list.length, ...kept);
     if (first && !list.length) emptyFirstAt = Date.now();
     const more = hasMore(owner);
     if (keptMedia === 0 && more) {
@@ -1131,7 +1131,9 @@
     const el = document.createElement('div');
     el.id = ROOM_ID;
     el.setAttribute('aria-hidden', 'true');
-    el.style.cssText = 'height:' + Math.round(innerHeight * 0.6) + 'px;pointer-events:none';
+    // Enough to scroll by a good half screen, however short the page is yet.
+    const h = innerHeight * 0.6 + Math.max(0, innerHeight - document.body.getBoundingClientRect().height);
+    el.style.cssText = 'height:' + Math.round(h) + 'px;pointer-events:none';
     document.body.appendChild(el);
     bump(stats.feed, 'skipRoom');
   }
