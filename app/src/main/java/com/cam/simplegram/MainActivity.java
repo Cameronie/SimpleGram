@@ -25,6 +25,7 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -102,7 +103,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
     private int fullScreens;
+    private int fullScreenNested;
     private String fullScreenLast = "";
+    // A Reel the page plays over a Story (R9): Back closes it, not the Story.
+    private boolean pageVideo;
     private Downloads downloads;
 
     private String route = "other";
@@ -321,6 +325,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             }
             // A page outside Instagram (Meta login, Accounts Center) sends no
             // 'ready': forget the last Instagram page's state so Back goes back.
+            if ("main".equals(role)) setPageVideo(false);   // the old page's Reel layer is gone
             if ("main".equals(role) && url != null && !Links.isInstagram(Uri.parse(url))) {
                 route = "other";
                 searchOpen = false;
@@ -440,7 +445,18 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         @Override
         public void onShowCustomView(View view, CustomViewCallback callback) {
             if (customView != null) {
-                callback.onCustomViewHidden();
+                // A nested request (a video asking for full screen inside a
+                // full-screen Story). Chromium normally settles it inside the
+                // page without asking again; if it does ask, show the new view
+                // in place of the old one and cancel nothing: a cancel ends full
+                // screen altogether, and Instagram then closes the Story.
+                fullScreenNested++;
+                customViewCallback = callback;
+                if (view == customView) return;
+                root.removeView(customView);
+                customView = view;
+                view.setBackgroundColor(Color.BLACK);
+                root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
                 return;
             }
             customView = view;
@@ -510,6 +526,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         searchOpen = false;
                         feedWanted = false;
                         skipKind = "";
+                        setPageVideo(false);
                         setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
                         if (!prefs.getBoolean("tabTip", false)) {
@@ -560,6 +577,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "awake":
                 if (main) setAwake(m.optBoolean("on"));
+                break;
+            case "fullVideo":
+                if (main) setPageVideo(m.optBoolean("on"));
                 break;
             case "comments":
                 if (main) openComments(m);
@@ -614,6 +634,21 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         } else if (!zoomed && zoomedStory) {
             zoomedStory = false;
             storyHold(false);
+        }
+    }
+
+    /** R9's Reel layer covers the page: no menu tab or system bars over it. */
+    private void setPageVideo(boolean on) {
+        if (pageVideo == on) return;
+        pageVideo = on;
+        if (on) {
+            menuButton.setVisibility(View.GONE);
+            zoomChip.setVisibility(View.GONE);
+            setSystemBarsHidden(true);
+        } else {
+            if (!screenshotMode) menuButton.setVisibility(View.VISIBLE);
+            if (customView == null && !screenshotMode) setSystemBarsHidden(false);
+            onZoomChanged(zoom.scale());
         }
     }
 
@@ -1229,7 +1264,21 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     .append("  Instagram slow-downs: ").append(dg.optInt("s429") + dg.optInt("pleaseWait"))
                     .append(" · server errors: ").append(dg.optInt("s5xx")).append('\n')
                     .append("  Page stalls: ").append(dg.optInt("longTasks"))
-                    .append(" (longest ").append(dg.optInt("longestTask")).append(" ms)\n");
+                    .append(" (longest ").append(dg.optInt("longestTask")).append(" ms)\n")
+                    .append("  Story swipes took: ").append(storySwitches(dg.optJSONArray("storySwitch")))
+                    .append(" · over 4 s: ").append(dg.optInt("storySwitchSlow")).append('\n')
+                    .append("  Story touches let go: ").append(dg.optInt("storyCancels")).append('\n');
+            JSONObject fv = dg.optJSONObject("fullVideo");
+            if (fv != null) {
+                b.append("\nFull-screen video\n")
+                        .append("  Posts and Reels (swipe down): ").append(fv.optInt("r8"))
+                        .append(" · didn't open: ").append(fv.optInt("r8Failed")).append('\n')
+                        .append("  Reels in Stories (swipe up): ").append(fv.optInt("r9"))
+                        .append(" · not found: ").append(fv.optInt("r9Missing"))
+                        .append(" · Story moved on: ").append(fv.optInt("r9Moved"))
+                        .append(" · from the card: ").append(fv.optInt("r9Pressed")).append('\n')
+                        .append("  Back to the post or Story: ").append(fv.optInt("exits")).append('\n');
+            }
         }
         b.append("\nElsewhere\n")
                 .append("  Ads removed (Stories etc.): ").append(stats.optInt("ads")).append('\n')
@@ -1248,8 +1297,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         b.append("\nApp\n")
                 .append("  WebView: ").append(device.optString("webView")).append('\n')
                 .append("  Android memory callbacks: ").append(trimLog.isEmpty() ? "none" : String.join(", ", trimLog)).append('\n')
-                .append("  Full-screen video: ").append(fullScreens)
-                .append(fullScreens > 0 ? " (last: " + fullScreenLast + ")" : "").append('\n')
+                .append("  Full-screen views: ").append(fullScreens)
+                .append(fullScreens > 0 ? " (last: " + fullScreenLast + ")" : "")
+                .append(" · nested: ").append(fullScreenNested);
+        String pageFull = dg == null ? "" : dg.optString("fullscreenLast");
+        if (!pageFull.isEmpty()) b.append(" · page: ").append(pageFull);
+        b.append('\n')
                 .append("  Page restarts: ").append(device.optInt("rendererGone"));
         String last = device.optString("rendererGoneLast");
         if (!last.isEmpty()) b.append(" (last: ").append(last).append(')');
@@ -1264,6 +1317,20 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 .setPositiveButton("OK", null).show();
     }
 
+    /** "back 900 ms (address 120), next 400 ms": timings only. */
+    private static String storySwitches(JSONArray list) {
+        if (list == null || list.length() == 0) return "none yet";
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject e = list.optJSONObject(i);
+            if (e == null) continue;
+            if (b.length() > 0) b.append(", ");
+            b.append("back".equals(e.optString("dir")) ? "back " : "next ").append(e.optInt("ms")).append(" ms");
+            if (e.optInt("urlMs", -1) >= 0) b.append(" (address ").append(e.optInt("urlMs")).append(')');
+        }
+        return b.length() == 0 ? "none yet" : b.toString();
+    }
+
     private JSONObject deviceDiagnostics() {
         JSONObject n = new JSONObject();
         try {
@@ -1274,6 +1341,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("memoryWarnings", new JSONArray(trimLog));
             n.put("fullScreens", fullScreens);
             n.put("fullScreenLast", fullScreenLast);
+            n.put("fullScreenNested", fullScreenNested);
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
             n.put("pageStarts", new JSONObject().put("all", startsAll).put("loadUrl", startsLoadUrl)
@@ -1458,11 +1526,31 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         handleIntent(intent, false);
     }
 
+    /**
+     * WebView's own full-screen view takes focus when the WebView had it (after
+     * any typing) and ends full screen on Back itself, before onBackPressed: a
+     * Story Reel's Back would close the whole Story. While a full-screen view,
+     * R9's Reel or screenshot mode is up, Back is taken here first and goes
+     * through onBackPressed, in its usual order.
+     */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        if (e.getKeyCode() == KeyEvent.KEYCODE_BACK && (pageVideo || customView != null || screenshotMode)) {
+            if (e.getAction() == KeyEvent.ACTION_UP && !e.isCanceled()) onBackPressed();
+            return true;
+        }
+        return super.dispatchKeyEvent(e);
+    }
+
     @SuppressWarnings("deprecation")
     @Override
     public void onBackPressed() {
         if (screenshotMode) {
             exitScreenshot();
+        } else if (pageVideo) {
+            // Back to the Story under the Reel; its full screen stays.
+            setPageVideo(false);
+            js("fullVideoExit");
         } else if (customView != null) {
             new Chrome().onHideCustomView();
         } else if (zoom.isZoomed()) {

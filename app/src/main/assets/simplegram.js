@@ -178,11 +178,27 @@
     rec.children.forEach((c, i) => register(c, i));
     if (rec.code) index.byCode.set(rec.code, rec);
     if (rec.pk) index.byPk.set(rec.pk, rec);
+    if (rec.pk && Array.isArray(o.story_feed_media)) noteSharedReel(rec.pk, o.story_feed_media);
     for (const c of rec.children) if (c.pk) index.byPk.set(c.pk, { pk: c.pk, image: c.image, video: c.video, username: rec.username, code: rec.code, children: [], parent: rec });
     cap(index.byCode, 1500); cap(index.byPk, 3000); cap(index.byFile, 8000);
     stats.indexed++;
   }
   SG.index = index;
+  // R9: a Story item that shares a Reel carries only the Reel's code (its
+  // "Watch Reel" sticker, story_feed_media); the Reel's own video is looked
+  // up when you swipe up. Story item pk -> { code, pk }.
+  const sharedReels = new Map();
+  function noteSharedReel(pk, list) {
+    for (const s of list) {
+      if (!s || typeof s.media_code !== 'string' || !/^[A-Za-z0-9_-]{5,}$/.test(s.media_code)) continue;
+      // A shared photo post isn't a Reel; an unknown type is tried (no video: a toast).
+      if (s.product_type && s.product_type !== 'clips' && s.product_type !== 'igtv') continue;
+      const id = s.media_id != null ? mediaPk({ pk: s.media_id }) : null;
+      sharedReels.set(pk, { code: s.media_code, pk: id });
+      cap(sharedReels, 500);
+      return;
+    }
+  }
 
   /* ------------------------------------------------------------------ *
    * Data-layer filtering
@@ -1417,6 +1433,12 @@
       '*{-webkit-tap-highlight-color:transparent}',
       // Links to the endless Reels tab (never a specific Reel).
       'a[href="/reels/"],a[href="/reels"]{display:none!important}',
+      // R8: the video SimpleGram put full screen is shown whole, on black,
+      // with no controls over it (one rule each: an unknown one drops only itself).
+      'video[data-sg-full]:fullscreen{object-fit:contain!important;background:#000!important;border-radius:0!important}',
+      'video[data-sg-full]:fullscreen::-webkit-media-controls{display:none!important}',
+      'video[data-sg-full]:fullscreen::-webkit-media-controls-enclosure{display:none!important}',
+      'video[data-sg-full]:fullscreen::-webkit-media-controls-overlay-play-button{display:none!important}',
     ].join('\n');
     (document.head || document.documentElement).appendChild(s);
   }
@@ -1640,10 +1662,22 @@
    * ------------------------------------------------------------------ */
   let storyDirection = 'next';
   let storyAdSkipped = '';
+  // B19: a Story's label arrives with the item, so each item is checked often
+  // only at first, then once a second: mutations keep coming while it plays.
+  let storyChecks = { path: '', n: 0, at: 0, last: 0 };
   function tidyStory() {
     if (route() !== 'story') return;
     const here = location.pathname;
     if (storyAdSkipped === here) return;
+    const now = Date.now();
+    if (storyChecks.path !== here) storyChecks = { path: here, n: 0, at: now, last: 0 };
+    if (storyChecks.n >= 6 && now - storyChecks.at > 3000 && now - storyChecks.last < 1000) {
+      // A change in between is still looked at, once, a moment later.
+      if (!storyChecks.later) storyChecks.later = setTimeout(() => { storyChecks.later = 0; queueTidy(); }, 1000 - (now - storyChecks.last));
+      return;
+    }
+    storyChecks.n++;
+    storyChecks.last = now;
     let isAd = false;
     // Short leaf texts in the viewer (a section, or a dialog's spans); Home's feed underneath is skipped.
     const walker = walkOutsidePosts(NodeFilter.SHOW_ELEMENT, n => !n.firstElementChild && (n.tagName === 'SPAN' || n.tagName === 'DIV'));
@@ -1696,7 +1730,9 @@
     if (!document.body) return;
     addStyle();
     safe(tidyReelsTab)();
-    if (Date.now() - lastBannerScan > 1000) { lastBannerScan = Date.now(); safe(tidyBanners)(); }
+    // B19: not in Stories: the scan walks every text on the page (Home's feed
+    // stays mounted underneath), and Instagram shows no app banner there.
+    if (route() !== 'story' && Date.now() - lastBannerScan > 1000) { lastBannerScan = Date.now(); safe(tidyBanners)(); }
     safe(tidyFeed)();
     safe(tidyExplore)();
     safe(tidyStory)();
@@ -1887,6 +1923,7 @@
     lastUrl = location.href;
     post('route', { url: location.href, route: route() });
     safe(syncSwipeGuard)();
+    safe(noteStoryUrl)();
     if (CFG.role === 'main' && route() === 'reels-tab') {
       // The endless Reels tab is not part of SimpleGram.
       location.replace('/');
@@ -1963,6 +2000,7 @@
   }
   let swipe = null;
   const guardMove = safe(e => {
+    fullVideoMove(e);
     if (!swipe || e.touches.length !== 1) return;
     const t = e.touches[0];
     const dx = t.clientX - swipe.x, dy = t.clientY - swipe.y;
@@ -1974,6 +2012,7 @@
   });
   // A blocking touch listener makes every scroll wait for the page, so it is
   // registered only where a Reel viewer can be: never on Home, DMs or Stories.
+  // R8's swipe uses the same one (posts and Reels are guarded pages).
   let guardOn = false;
   function syncSwipeGuard() {
     const r = route();
@@ -2003,6 +2042,360 @@
     }
     swipe = null;
   }), { capture: true, passive: true });
+
+  /* ------------------------------------------------------------------ *
+   * Full-screen video.
+   * R8: in an opened post or Reel, a swipe down that starts on the video
+   * while the page is at the top asks the browser to show that video full
+   * screen (the app's full-screen view: just the video, no bars). A swipe up
+   * never does, so reading a long description is safe. In full screen a
+   * swipe up or down (or Back) returns; a tap pauses or plays.
+   * R9: in Stories, a swipe up on a Story that shares a Reel plays the Reel
+   * over the whole screen. Instagram's Story stays pressed (its own pause)
+   * underneath and continues where it was. A swipe up or down (or Back)
+   * returns. No second full-screen request is made: Instagram ends the Story
+   * when its own full screen ends.
+   * ------------------------------------------------------------------ */
+  const FV_SWIPE = 60;                 // px of mostly vertical travel
+  const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0, r9Pressed: 0 };
+  let gesture = null;                  // the current one-finger touch
+  let storyPress = null;               // a touch Instagram's Story saw start
+  let r8El = null, r8On = false;
+  let reelBox = null;                  // R9's Reel layer
+  function searchOpen() { return typeof search !== 'undefined' && !!search.open; }
+  function isField(el) {
+    return !!(el && el.closest && el.closest('input,textarea,[contenteditable="true"],[contenteditable=""]'));
+  }
+  // The video under a point (a carousel's visible slide: the others are off to the side).
+  function videoAt(x, y) {
+    let best = null, area = 0;
+    for (const v of document.getElementsByTagName('video')) {
+      if (v.dataset.sgOwn) continue;
+      const r = v.getBoundingClientRect();
+      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+      const a = onScreenArea(v);
+      if (a > area && a > 90 * 90 && !v.closest('[data-sg-hidden]')) { best = v; area = a; }
+    }
+    return best;
+  }
+  // The page and every list holding the video are scrolled to the top. A Reel
+  // viewer's snapping list doesn't count: the swipe guard pins it in place.
+  function atTop(v) {
+    const se = document.scrollingElement || document.documentElement;
+    if (se.scrollTop > 2) return false;
+    for (let el = v.parentElement, i = 0; el && el !== document.body && i < 40; el = el.parentElement, i++) {
+      if (el.scrollTop <= 2) continue;
+      const cs = getComputedStyle(el);
+      if (/auto|scroll/.test(cs.overflowY) && !/(^|\s)(y|both|block)(\s|$)/.test(cs.scrollSnapType)) return false;
+    }
+    return true;
+  }
+  // The touch is on the video's own media box (the video or Instagram's tap
+  // layer beside it), not on a sheet, dialog or other list drawn over it.
+  // The box is the video's ancestors no taller than the video (give or take
+  // its margins) or the screen (a letterboxed Reel), so how deep Instagram
+  // nests it doesn't matter; a sheet drawn elsewhere in the page is outside.
+  function ownTouch(v, target) {
+    if (!target || !target.closest) return false;
+    const dlg = target.closest('[role="dialog"],[aria-modal="true"]');
+    if (dlg && !dlg.contains(v)) return false;
+    const vh = v.getBoundingClientRect().height;
+    const tallest = Math.max(vh + Math.max(96, vh * 0.3), innerHeight + 2);
+    let box = null;
+    for (let el = v.parentElement, i = 0; el && el !== document.body && i < 12; el = el.parentElement, i++) {
+      if (el.getBoundingClientRect().height > tallest) break;
+      if (el.contains(target)) { box = el; break; }
+    }
+    if (!box) return false;
+    // A list inside the box that is scrolled scrolls back first.
+    for (let el = target; el && el !== box; el = el.parentElement) {
+      if (el.scrollTop > 2 && /auto|scroll/.test(getComputedStyle(el).overflowY)) return false;
+    }
+    return true;
+  }
+  function togglePlay(v) {
+    if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } else v.pause();
+  }
+
+  window.addEventListener('touchstart', safe(e => {
+    gesture = null;
+    if (CFG.role !== 'main' || !e.isTrusted) return;
+    if (e.touches.length !== 1) return;
+    if (reelBox && reelBox.box.contains(e.target)) return;    // the Reel layer has its own
+    const t = e.touches[0];
+    const g = { x: t.clientX, y: t.clientY, at: Date.now(), target: e.target };
+    const r = route();
+    const fs = document.fullscreenElement;
+    if (r8On && fs && fs === r8El) g.exit = true;
+    else if ((r === 'post' || r === 'reel') && !fs && !searchOpen()) {
+      const v = videoAt(g.x, g.y);
+      if (v && ownTouch(v, e.target) && atTop(v)) { g.video = v; g.r8 = 'pending'; }
+    } else if (r === 'story' && !reelBox) {
+      g.story = true;
+      storyPress = { target: e.target, x: g.x, y: g.y };
+    }
+    gesture = g;
+  }), { capture: true, passive: true });
+
+  // From the swipe guard's blocking listener (posts and Reels only). The page
+  // is held still only while an R8 swipe is armed: a downward swipe at the top
+  // (nothing to scroll anyway), or any swipe on the full-screen video.
+  function fullVideoMove(e) {
+    const g = gesture;
+    if (!g || (!g.r8 && !g.exit)) return;
+    if (e.touches.length !== 1) { g.r8 = null; g.exit = false; return; }
+    if (g.exit) { if (e.cancelable) e.preventDefault(); return; }
+    const t = e.touches[0], dx = t.clientX - g.x, dy = t.clientY - g.y;
+    if (g.r8 === 'pending') {
+      if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+      // Sideways (a carousel) or up (reading on) is left alone for the whole touch.
+      g.r8 = dy > 0 && dy >= Math.abs(dx) ? 'armed' : null;
+    }
+    if (g.r8 === 'armed' && e.cancelable) e.preventDefault();
+  }
+
+  window.addEventListener('touchend', safe(e => {
+    const g = gesture;
+    gesture = null;
+    if (!g || !e.isTrusted || e.touches.length || !e.changedTouches.length) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - g.x, dy = t.clientY - g.y, ms = Date.now() - g.at;
+    const vertical = Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6;
+    if (g.exit) { if (vertical) exitFullVideo('swipe'); return; }
+    if (g.r8 === 'armed') { if (vertical && dy > 0 && ms < 1500) enterR8(g.video); return; }
+    if (!g.story || route() !== 'story') return;
+    storyPress = null;                                         // Instagram sees this end
+    if (vertical && dy < 0 && ms < 1000 && !isField(g.target)) {
+      const reel = sharedReelHere();
+      // Instagram's own swipe up opens the reply box; it never sees this one,
+      // so its Story stays pressed (paused) under the Reel.
+      if (reel && openStoryReel(reel, g)) { e.stopImmediatePropagation(); return; }
+    }
+    // Instagram's own thresholds for a swipe to the next or previous person.
+    if (Math.abs(dx) > 50 && Math.abs(dy) < 100 && ms <= 500) storySwitchStart(dx > 0 ? 'back' : 'next');
+  }), { capture: true, passive: true });
+
+  // Instagram's Story listens for touchend only. A cancelled touch (the app's
+  // hold while its menu is open, a pinch that didn't zoom, a system gesture)
+  // left the Story paused and its next swipe measured from the old touch, so
+  // it was ignored. Let go of it the way a lifted finger would.
+  window.addEventListener('touchcancel', safe(e => {
+    gesture = null;
+    const p = storyPress;
+    storyPress = null;
+    if (!e.isTrusted || !p || reelBox || route() !== 'story') return;
+    if (releaseStoryPress(p)) stats.diag.storyCancels++;
+  }), { capture: true, passive: true });
+  function releaseStoryPress(p) {
+    const el = p && p.target;
+    if (!el || !el.isConnected || typeof Touch !== 'function' || typeof TouchEvent !== 'function') return false;
+    try {
+      const t = new Touch({ identifier: 9001, target: el, clientX: p.x, clientY: p.y });
+      el.dispatchEvent(new TouchEvent('touchend', { touches: [], targetTouches: [], changedTouches: [t], bubbles: true, cancelable: true, composed: true }));
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // R8 in full screen: Instagram's tap layer isn't shown, so a tap pauses or plays.
+  window.addEventListener('click', safe(e => {
+    const fs = document.fullscreenElement;
+    if (!r8On || !fs || fs !== r8El || !e.isTrusted) return;
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    togglePlay(fs);
+  }), true);
+
+  function enterR8(v) {
+    if (!v || !v.isConnected || document.fullscreenElement) return;
+    const req = v.requestFullscreen || v.webkitRequestFullscreen;
+    if (typeof req !== 'function') { fvStats.r8Failed++; return; }
+    const fail = () => { fvStats.r8Failed++; if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; } };
+    r8El = v;
+    v.dataset.sgFull = '1';
+    let p;
+    try { p = req.call(v, { navigationUI: 'hide' }); } catch (err) { fail(); return; }
+    if (p && typeof p.then === 'function') p.then(null, () => { if (document.fullscreenElement !== v) fail(); });
+  }
+  function exitFullVideo(why) {
+    if (reelBox) { closeStoryReel(why); return; }
+    if (!r8On || document.fullscreenElement !== r8El) return;
+    try {
+      const p = document.exitFullscreen();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) { /* already out */ }
+  }
+  document.addEventListener('fullscreenchange', safe(() => {
+    const el = document.fullscreenElement;
+    if (r8El && el === r8El) {
+      if (!r8On) {
+        r8On = true;
+        fvStats.r8++;
+        // A landscape video small in the post played muted; full screen is
+        // the sound rule's "opened video". Checked once the layout settles.
+        const v = r8El;
+        setTimeout(safe(() => {
+          if (document.fullscreenElement === v && v.muted && !userMuted && !v.paused && wantsSound(v)) unmute(v);
+        }), 150);
+      }
+    } else if (r8On || r8El) {
+      if (r8On) fvStats.exits++;
+      r8On = false;
+      if (r8El) delete r8El.dataset.sgFull;
+      r8El = null;
+    }
+    // The full screen R9's layer lived in ended: Instagram is closing the Story.
+    if (reelBox && reelBox.inFull && (!el || !el.contains(reelBox.box))) closeStoryReel('ended');
+  }));
+
+  function sharedReelHere() {
+    const pk = storyPk();
+    return pk ? sharedReels.get(pk) || null : null;
+  }
+  // Returns false (and changes nothing) when the layer can't be shown.
+  function openStoryReel(reel, g) {
+    if (reelBox) return false;
+    const fs = document.fullscreenElement;
+    // Instagram's Story is full screen on the phone (its own request, on
+    // <body>): the layer goes inside that, on top of the Story.
+    const host = fs ? (/^(VIDEO|IMG|IFRAME|CANVAS|svg)$/i.test(fs.tagName) ? null : fs) : document.body;
+    if (!host) return false;
+    const box = document.createElement('div');
+    box.id = 'sg-reel';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Reel');
+    box.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;margin:0;padding:0;z-index:2147483647;' +
+      'background:#000;display:flex;align-items:center;justify-content:center;touch-action:none';
+    const v = document.createElement('video');
+    v.dataset.sgOwn = '1';
+    v.setAttribute('playsinline', '');
+    v.loop = true;
+    v.preload = 'auto';
+    v.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000';
+    const note = document.createElement('div');
+    note.textContent = 'Loading the Reel…';
+    note.style.cssText = 'position:absolute;color:#fff;font:15px system-ui,sans-serif;opacity:.75;pointer-events:none';
+    box.appendChild(v);
+    box.appendChild(note);
+    const rb = { box: box, video: v, note: note, inFull: !!fs, held: [],
+      story: { target: g.target, x: g.x, y: g.y, path: location.pathname } };
+    const zone = pressUnderSticker(g);
+    if (zone) rb.story.target = zone;               // its touchend lets go on close
+    // The layer's own touches: a swipe up or down returns, a tap pauses or plays.
+    // Nothing reaches Instagram's page underneath.
+    let start = null;
+    box.addEventListener('touchstart', e => {
+      e.stopPropagation();
+      start = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+    }, { passive: true });
+    box.addEventListener('touchmove', e => { e.stopPropagation(); }, { passive: true });
+    box.addEventListener('touchend', safe(e => {
+      e.stopPropagation();
+      const s = start;
+      start = null;
+      if (!s || e.touches.length || !e.changedTouches.length) return;
+      const dx = e.changedTouches[0].clientX - s.x, dy = e.changedTouches[0].clientY - s.y;
+      if (Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6) closeStoryReel('swipe');
+    }), { passive: true });
+    box.addEventListener('click', safe(e => {
+      e.stopPropagation();
+      e.preventDefault();
+      if (reelBox === rb && rb.video.getAttribute('src')) togglePlay(rb.video);
+    }));
+    host.appendChild(box);
+    reelBox = rb;
+    fvStats.r9++;
+    post('fullVideo', { on: true });
+    holdStoryUnder();
+    setTimeout(safe(holdStoryUnder), 300);           // a video Instagram started late
+    loadStoryReel(reel, rb);
+    return true;
+  }
+  // Instagram's tappable stickers (a shared Reel's card among them) are a
+  // layer over the Story's press zone: pointer-events none, each sticker auto.
+  // A touch that starts on one never presses the Story, so a photo's timer
+  // would run on under the Reel. Press the zone under the finger instead;
+  // returns it (null when the touch did press the Story, or no zone is found).
+  function pressUnderSticker(g) {
+    let layer = null;
+    for (let el = g.target && g.target.parentElement, i = 0; el && el !== document.body && i < 16; el = el.parentElement, i++) {
+      if (getComputedStyle(el).pointerEvents === 'none') layer = el;
+      else if (layer) break;
+    }
+    if (!layer || typeof Touch !== 'function' || typeof TouchEvent !== 'function') return null;
+    for (const el of document.elementsFromPoint(g.x, g.y)) {
+      if (layer.contains(el) || el.contains(layer) || el.closest('#sg-reel')) continue;
+      try {
+        const t = new Touch({ identifier: 9001, target: el, clientX: g.x, clientY: g.y });
+        el.dispatchEvent(new TouchEvent('touchstart', { touches: [t], targetTouches: [t], changedTouches: [t], bubbles: true, cancelable: true, composed: true }));
+        fvStats.r9Pressed++;
+        return el;
+      } catch (e) { return null; }
+    }
+    return null;
+  }
+  async function loadStoryReel(reel, rb) {
+    let rec = index.byCode.get(reel.code) || (reel.pk && index.byPk.get(reel.pk)) || null;
+    let fetched = false;
+    const lookup = async () => {
+      // Instagram's media info, as downloads use it (the Story data has only the code).
+      fetched = true;
+      try { return await fetchInfo(reel.pk || pkFromCode(reel.code)); } catch (e) { return null; }
+    };
+    const missing = () => {
+      fvStats.r9Missing++;
+      closeStoryReel('missing');
+      post('toast', { message: 'This Reel couldn’t be loaded.' });
+    };
+    if (!rec || !rec.video) rec = await lookup();
+    if (reelBox !== rb) return;
+    if (!rec || !rec.video) { missing(); return; }
+    rb.video.addEventListener('playing', () => { rb.note.remove(); }, { once: true });
+    // An address that fails (an older page's signed link that expired): ask
+    // Instagram once for a fresh one, then say so. Closing empties the video,
+    // which can fire this too; by then the layer is gone.
+    rb.video.addEventListener('error', safe(async () => {
+      if (reelBox !== rb) return;
+      const again = fetched ? null : await lookup();
+      if (reelBox !== rb) return;
+      if (!again || !again.video || again.video === rb.video.getAttribute('src')) { missing(); return; }
+      rb.video.src = again.video;
+      rb.video.play().catch(() => {});
+    }));
+    rb.video.src = rec.video;
+    rb.video.muted = userMuted;                      // your own mute choice wins here too
+    const p = rb.video.play();
+    // Sound needs the app's setting; muted beats not playing at all.
+    if (p && p.catch) p.catch(() => { if (reelBox === rb) { rb.video.muted = true; rb.video.play().catch(() => {}); } });
+  }
+  // Instagram pauses a pressed Story. If a Story video still plays under the
+  // Reel, that pause didn't take: pause it here and play it again afterwards.
+  function holdStoryUnder() {
+    const rb = reelBox;
+    if (!rb) return;
+    for (const v of document.getElementsByTagName('video')) {
+      if (v === rb.video || v.paused || v.dataset.sgOwn) continue;
+      v.pause();
+      rb.held.push(v);
+    }
+  }
+  function closeStoryReel(why) {
+    const rb = reelBox;
+    if (!rb) return;
+    reelBox = null;
+    if (why !== 'missing') fvStats.exits++;
+    try { rb.video.pause(); rb.video.removeAttribute('src'); rb.video.load(); } catch (e) { /* gone */ }
+    rb.box.remove();
+    post('fullVideo', { on: false });
+    if (why === 'ended' || route() !== 'story') return;
+    if (location.pathname !== rb.story.path) fvStats.r9Moved++;
+    // Lift the finger Instagram still thinks is down: the Story continues.
+    releaseStoryPress(rb.story);
+    if (rb.held.length) {
+      setTimeout(safe(() => {
+        for (const v of rb.held) if (v.isConnected && v.paused && !v.ended && route() === 'story') v.play().catch(() => {});
+      }), 350);
+    }
+  }
 
   /* ------------------------------------------------------------------ *
    * Sound on for Stories, opened Reels and full-screen DM videos.
@@ -2105,14 +2498,14 @@
   }
   document.addEventListener('play', safe(e => {
     const m = e.target;
-    if (!(m instanceof HTMLMediaElement)) return;
+    if (!(m instanceof HTMLMediaElement) || m.dataset.sgOwn) return;   // R9's Reel sets its own sound
     if (CFG.role !== 'main') { m.pause(); m.muted = true; return; }
     queueAwake();
     if (m.muted && !userMuted && wantsSound(m)) unmute(m);
   }), true);
   document.addEventListener('volumechange', safe(e => {
     const m = e.target;
-    if (!(m instanceof HTMLMediaElement) || CFG.role !== 'main') return;
+    if (!(m instanceof HTMLMediaElement) || CFG.role !== 'main' || m.dataset.sgOwn) return;
     if (Date.now() - lastUserAudioTap < 800) { userMuted = m.muted; return; }
     if (m.muted && !userMuted && !m.paused && wantsSound(m)) setTimeout(() => { if (m.muted && !userMuted) unmute(m); }, 150);
   }), true);
@@ -3973,14 +4366,56 @@
    * Counts and timings only; everything is passive (no requests, no shims).
    * ------------------------------------------------------------------ */
   const diag = (stats.diag = { storyMs: [], storyVideos: 0, s429: 0, s5xx: 0, pleaseWait: 0, longTasks: 0, longestTask: 0,
-    fullscreen: 0, fullscreenLast: '' });
+    fullscreen: 0, fullscreenLast: '', fullVideo: fvStats, storySwitch: [], storySwitchSlow: 0, storyCancels: 0 });
   let storyStart = 0;
+  // B19: switching people felt slow. Timed from a sideways swipe in Stories
+  // to the address changing and to the next person's picture or video showing,
+  // so Copy details shows whether the wait is Instagram's.
+  let switchRun = null;
+  // The Story picture or video in the middle of the screen, once it can be seen.
+  function storyMediaKey() {
+    for (const el of document.elementsFromPoint(innerWidth / 2, innerHeight / 2)) {
+      if (el.tagName !== 'VIDEO' && el.tagName !== 'IMG') continue;
+      if (el.dataset.sgOwn) return '';
+      const r = el.getBoundingClientRect();
+      if (r.width * r.height < innerWidth * innerHeight * 0.3) continue;
+      const ready = el.tagName === 'VIDEO' ? el.readyState >= 2 : el.complete && el.naturalWidth > 0;
+      return ready ? el.currentSrc || el.src || el.poster || '' : '';
+    }
+    return '';
+  }
+  function storySwitchStart(dir) {
+    const run = { t0: performance.now(), dir: dir, from: storyMediaKey(), path: location.pathname, urlMs: -1 };
+    switchRun = run;
+    const done = ms => {
+      if (switchRun === run) switchRun = null;
+      if (ms < 0) { diag.storySwitchSlow++; return; }
+      diag.storySwitch.push({ dir: run.dir, ms: ms, urlMs: run.urlMs });
+      if (diag.storySwitch.length > 6) diag.storySwitch.shift();
+    };
+    // A light check every 50 ms (one hit test), for at most 4 s.
+    const tick = safe(() => {
+      if (switchRun !== run) return;
+      const ms = Math.round(performance.now() - run.t0);
+      noteStoryUrl();
+      const key = route() === 'story' ? storyMediaKey() : '';
+      if (key && key !== run.from) return done(ms);
+      // No new address and nothing new: there was no one to go to.
+      if (ms > 4000 || route() !== 'story') { if (switchRun === run) switchRun = null; if (run.urlMs >= 0 && route() === 'story') done(-1); return; }
+      setTimeout(tick, 50);
+    });
+    setTimeout(tick, 50);
+  }
+  function noteStoryUrl() {
+    const run = switchRun;
+    if (run && run.urlMs < 0 && location.pathname !== run.path) run.urlMs = Math.round(performance.now() - run.t0);
+  }
   function storyOpened() {
     storyStart = performance.now();
     diag.storyVideos = document.getElementsByTagName('video').length;
   }
-  function storyShown() {
-    if (!storyStart || route() !== 'story') return;
+  function storyShown(e) {
+    if (!storyStart || route() !== 'story' || (e && e.target && e.target.dataset && e.target.dataset.sgOwn)) return;
     diag.storyMs.push(Math.round(performance.now() - storyStart));
     if (diag.storyMs.length > 5) diag.storyMs.shift();
     storyStart = 0;
@@ -4075,6 +4510,7 @@
         if (cmd.variant === 'following') continueFeed(cmd.variant);
         break;
       case 'storyHold': storyHold(!!cmd.on); break;
+      case 'fullVideoExit': exitFullVideo('back'); break;
       case 'viewer': if (cmd.id) CFG.viewerId = String(cmd.id); break;
       case 'status':
         stats.storage = safe(storageShape)() || null;
