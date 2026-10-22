@@ -101,8 +101,11 @@ test('anchor: Home\'s first page of suggestions with no marker ([rec, rec, ad]) 
   assert.deepEqual(r, ['none', 'block']);
   // The scroll room lets a swipe reach Instagram's loader; page 2 brings the marker.
   assert.equal(await pg.evaluate(() => !!document.getElementById('sg-skip-room')), true);
+  // Cut to nothing at the marker, the page keeps the marker without its groups
+  // (it may be a head load that replaces the list: never []).
   const second = await parse(pg, page([recs('REC0003'), marker()]));
-  assert.deepEqual(keys(second), []);
+  assert.deepEqual(keys(second), ['end_of_feed_demarcator']);
+  assert.deepEqual(conn(second).edges[0].node.end_of_feed_demarcator.group_set.groups, []);
   assert.equal(conn(second).page_info.has_next_page, false);
   assert.equal((await feedState(pg)).ended, true);
   await pg.waitForFunction(() => !document.getElementById('sg-skip-room'), null, { timeout: 4000 });
@@ -140,7 +143,7 @@ test('anchor: the first page after a refresh reset is anchored too', async () =>
   assert.deepEqual((await feedStats(pg)).anchorKind, { seen: 0, marker: 1, recs: 0 });
 });
 
-test('anchor: a Home page after the end (a reload that replaces the list) is anchored, not emptied, once', async () => {
+test('anchor: a Home page after the end (a reload that replaces the list) is anchored, not emptied, every time', async () => {
   const pg = await open('https://www.instagram.com/', FEED);
   await parse(pg, page([friend('HOME001'), friend('HOME002'), marker()], { cursor: 'end1' }));
   // The reload's head is [rec, rec, ad] (the marker would come on its page 2).
@@ -148,11 +151,14 @@ test('anchor: a Home page after the end (a reload that replaces the list) is anc
   assert.deepEqual(keys(out), ['explore:REC0001']);
   assert.equal(conn(out).page_info.has_next_page, false, 'Home stays ended');
   assert.equal((await feedState(pg)).ended, true);
-  // Anything else after the end is still emptied.
+  // Every such page: a second reload (or an appended page) also keeps one, hidden.
   const more = await parse(pg, page([recs('REC0003')], { cursor: 'h2' }));
-  assert.deepEqual(keys(more), []);
+  assert.deepEqual(keys(more), ['explore:REC0003']);
+  // Nothing that can be hidden: emptied, as before.
+  const ads = await parse(pg, page([adUnit('AD00009')], { cursor: 'h3' }));
+  assert.deepEqual(keys(ads), []);
   const f = await feedStats(pg);
-  assert.equal(f.anchorAfterEnd, 1);
+  assert.equal(f.anchorAfterEnd, 2);
 });
 
 test('anchor: a Following page that keeps Instagram\'s marker needs no anchor (it is not empty)', async () => {
@@ -409,4 +415,172 @@ test('B18: Home\'s first page [rec, rec, ad] with the marker on page 2 is never 
     assert.ok(s.items.includes('HOMENEW'), mode + ': ' + JSON.stringify(s.screen));
     assert.equal((await feedState(pg)).ended, true);
   }
+});
+
+/* ---------------- 5. Review fixes ---------------- */
+
+const neutral = o => {
+  const d = conn(o).edges[0].node.end_of_feed_demarcator;
+  return { groups: d.group_set.groups, active: d.group_set.active_group_id, next: conn(o).page_info.has_next_page };
+};
+
+test('anchor: a refresh\'s second head load holding only [ad, marker] keeps the neutralised marker, never []', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  await parse(pg, page([friend('HOME001'), friend('HOME002'), friend('HOME003'), marker()], { cursor: 'end1' }));
+  // Instagram's Home tab: two head loads; the one that lands last replaces the list.
+  const a = await parse(pg, page([friend('HOME001'), adUnit('AD00001'), friend('HOME002'), friend('HOME003')], { cursor: 'hA' }));
+  assert.deepEqual(keys(a), ['HOME001', 'HOME002', 'HOME003']);
+  const b = await parse(pg, page([adUnit('AD00002'), marker()], { cursor: 'hB', source: 'feed_recs' }));
+  assert.deepEqual(keys(b), ['end_of_feed_demarcator'], 'never an empty list');
+  assert.deepEqual(neutral(b), { groups: [], active: null, next: false });
+  const st = await feedState(pg);
+  assert.equal(st.ended, true);
+  assert.equal(st.endText.subtitle, '', 'Instagram draws its line: the card does not repeat it');
+  // The marker alone, too.
+  const c = await parse(pg, page([marker()], { cursor: 'hC', source: 'feed_recs' }));
+  assert.deepEqual(keys(c), ['end_of_feed_demarcator']);
+  assert.deepEqual(neutral(c), { groups: [], active: null, next: false });
+});
+
+test('anchor: a refresh before Home ended ([old posts] then [ad, marker]) never leaves Home empty', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  await parse(pg, page([friend('HOME001'), friend('HOME002')], { cursor: 'p1' }));
+  await parse(pg, page([friend('HOME001'), adUnit('AD00001'), friend('HOME002')], { cursor: 'hA' }));
+  const b = await parse(pg, page([adUnit('AD00002'), marker()], { cursor: 'hB', source: 'feed_recs' }));
+  assert.deepEqual(keys(b), ['end_of_feed_demarcator']);
+  assert.deepEqual(neutral(b), { groups: [], active: null, next: false });
+  assert.equal((await feedStats(pg)).markerKept, 1);
+});
+
+test('anchor: a second head load with no marker right after a refresh reset ([ad, rec]) keeps a hidden suggestion', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  await parse(pg, page([friend('HOME001'), marker()], { cursor: 'end1' }));
+  await parse(pg, page([friend('HOME001'), friend('HOME002')], { cursor: 'hA' }));
+  const b = await parse(pg, page([adUnit('AD00002'), recs('REC0009')], { cursor: 'hB' }));
+  assert.deepEqual(keys(b), ['explore:REC0009']);
+  assert.equal((await feedStats(pg)).refreshes, 1);
+});
+
+test('anchor: two refreshes after the end, each with a [rec, rec, ad] head, both keep one hidden suggestion', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  await parse(pg, page([friend('HOME001'), friend('HOME002'), marker()], { cursor: 'end1' }));
+  const a = await parse(pg, page([recs('REC0001'), recs('REC0002'), adUnit('AD00001')], { cursor: 'r1' }));
+  const b = await parse(pg, page([recs('REC0005'), recs('REC0006'), adUnit('AD00002')], { cursor: 'r2' }));
+  assert.deepEqual([keys(a), keys(b)], [['explore:REC0001'], ['explore:REC0005']]);
+  // Both are hidden before they are drawn.
+  const shown = await pg.evaluate(() => new Promise(done => {
+    document.getElementById('feed').innerHTML = ['REC0001', 'REC0005'].map(c => '<article><a href="/p/' + c + '/">x</a></article>').join('');
+    requestAnimationFrame(() => done(Array.from(document.querySelectorAll('article')).map(a => getComputedStyle(a).display)));
+  }));
+  assert.deepEqual(shown, ['none', 'none']);
+  assert.equal((await feedStats(pg)).anchorAfterEnd, 2);
+});
+
+test('anchor: an appended suggestions page after the end does not use up the anchor of a later reload', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  await parse(pg, page([friend('HOME001'), marker()], { cursor: 'end1' }));
+  // Instagram paging past has_next false: an appended page of suggestions.
+  const appended = await parse(pg, page([recs('REC0001')], { cursor: 'x1', source: 'feed_recs' }));
+  assert.deepEqual(keys(appended), ['explore:REC0001']);
+  const reload = await parse(pg, page([recs('REC0002'), recs('REC0003'), adUnit('AD00001')], { cursor: 'h1' }));
+  assert.notDeepEqual(keys(reload), []);
+  assert.deepEqual(keys(reload), ['explore:REC0002']);
+});
+
+test('skip: a pacing nudge that fires after the skip was forgotten is not an error', async () => {
+  const pg = await fromEndCard(['S000001', 'S000002', 'S000003', 'S000004', 'S000005']);
+  await parse(pg, page([friend('S000001')]));               // the anchor
+  await parse(pg, page([friend('S000002')]));               // seen only: a 400 ms pacing nudge
+  const e0 = await pg.evaluate(() => window.__sg.stats.errors);
+  // Instagram reloads its first page within those 400 ms: the skip ends, 4 posts show.
+  await parse(pg, page([friend('S000002'), friend('NEW0001'), friend('NEW0002'), friend('NEW0003')]));
+  await pg.waitForTimeout(700);
+  const s = await pg.evaluate(() => ({ errors: window.__sg.stats.errors, forgot: window.__sg.stats.feed.skipForgotten }));
+  assert.equal(s.forgot, 1);
+  assert.equal(s.errors, e0, 'no error');
+});
+
+test('B17: nudges alone (no finger, no wheel) are counted as jiggles, never as swipes', async () => {
+  const { pg } = await igEndCard({ params: { trustedOnly: true } });
+  await reachedNew(pg, 12000);
+  const tries = await pg.evaluate(() => window.__sg.stats.feed.tries);
+  assert.equal(tries.swipe, undefined, JSON.stringify(tries));
+  assert.ok(tries.jiggle && tries.jiggle.hit >= 1, JSON.stringify(tries));
+});
+
+test('B18: Home\'s hidden-suggestion anchor gets its scroll room and nudges back after a Story', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+    <div style="height:60px">Stories</div><main id="main"></main><script>window.__igParams=${JSON.stringify({ mode: 'H2', mountMs: 1000, trustedOnly: true })};</script><script>${IGMOCK}</script></body></html>`;
+  const api = {
+    '/api/graphql': u => {
+      const n = +u.searchParams.get('page');
+      if (n === 0) return { body: page([recs('REC0001'), recs('REC0002'), adUnit('AD00001')], { cursor: 'h0' }) };
+      return { body: page([friend('HOMENEW'), marker()], { cursor: 'h1', source: 'feed_recs' }) };
+    },
+    '/api/ayml': { data: { xdt_api__v1__ayml__strict: { users: [] } } },
+  };
+  const pg = await open('https://www.instagram.com/', html, { api });
+  // Hold back the nudges until the Story is open (as if the list had not mounted yet).
+  await pg.waitForFunction(() => !!document.getElementById('sg-skip-room'));
+  await pg.evaluate(() => history.pushState({}, '', '/stories/someone/123/'));
+  await pg.waitForTimeout(6000);
+  assert.equal(await pg.evaluate(() => window.__ig.items.some(i => i.code === 'HOMENEW')), false, 'page 2 waits for Home');
+  await pg.evaluate(() => history.back());
+  await pg.waitForFunction(() => location.pathname === '/');
+  await pg.waitForFunction(() => !!document.getElementById('sg-skip-room'), null, { timeout: 1000 });
+  await pg.waitForFunction(() => window.__ig.items.some(i => i.code === 'HOMENEW'), null, { timeout: 3500 });
+});
+
+// Home drew posts in this session; then Following from the end card, whose
+// list mounts `mountMs` after its first page.
+async function lateMount(mountMs) {
+  const seen = codesOf('S', 19);
+  const list = seen.concat(codesOf('U', 80));
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+    <div style="height:60px">Feed</div><main id="main"></main><script>window.__igParams=Object.assign({ mode: 'H2' }, location.search.includes('following') ? { mountMs: ${mountMs} } : {});</script><script>${IGMOCK}</script></body></html>`;
+  const api = {
+    '/api/graphql': u => {
+      const v = u.searchParams.get('variant'), n = +u.searchParams.get('page');
+      if (v === 'home') return { body: igPage(seen.map(fedge), false, 'h0') };
+      const start = n === 0 ? 0 : 3 + (n - 1) * 8, len = n === 0 ? 3 : 8;
+      return { body: igPage(list.slice(start, start + len).map(fedge), true, v + n) };
+    },
+    '/api/ayml': { data: { xdt_api__v1__ayml__strict: { users: [] } } },
+  };
+  const pg = await open('https://www.instagram.com/', html, { api });
+  await pg.waitForFunction(() => window.__ig && window.__ig.mountedAt > 0);
+  await pg.waitForFunction(() => sessionStorage.getItem('sg_posts_drawn') !== null, null, { timeout: 4000 });
+  await Promise.all([pg.waitForURL(/variant=/), pg.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' }))]);
+  return { pg, seen: new Set(seen) };
+}
+for (const ms of [5000, 6000]) {
+  test(`recovery: Following from the end card whose list mounts ${ms / 1000} s after its first page is not reloaded`, async () => {
+    const { pg, seen } = await lateMount(ms);
+    await pg.waitForTimeout(ms + 3500);
+    const s = await pg.evaluate(() => ({ docN: +sessionStorage.getItem('sg_doc_n'), recovered: window.__sg.stats.feed.recovered || 0,
+      recover: sessionStorage.getItem('sg_feed_recover'), items: window.__ig.items.map(i => i.code), alreadySeen: window.__sg.stats.feed.alreadySeen || 0 }));
+    assert.equal(s.recovered, 0, JSON.stringify(s));
+    assert.equal(s.recover, null);
+    assert.equal(s.docN, 2, 'Home, then the card\'s Following: no reload');
+    assert.ok(s.alreadySeen > 0);
+    assert.ok(s.items.filter(c => seen.has(c)).length <= 1, 'one repeat at most: ' + s.items.slice(0, 4));
+  });
+}
+
+test('recovery: a reload of the page opened from the end card keeps its one-time skip', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  // Posts were drawn in this session.
+  await pg.evaluate(() => { document.getElementById('feed').innerHTML = '<article>x</article>'; window.__sg.checkNotDrawn(); document.getElementById('feed').innerHTML = ''; });
+  await parse(pg, page(['HOME001', 'HOME002', 'HOME003'].map(friend), { more: false }));
+  await Promise.all([pg.waitForURL(/variant=following/), pg.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' }))]);
+  await pg.clock.install();
+  await parse(pg, page([friend('HOME003'), friend('HOME002')], { source: 'following' }));
+  // Kept, but nothing drawn for 10 s: one reload.
+  const nav = pg.waitForNavigation({ timeout: 10000 });
+  for (let i = 0; i < 8; i++) { await pg.clock.fastForward(1600); await pg.evaluate(() => window.__sg.checkNotDrawn()).catch(() => {}); }
+  await nav;
+  await pg.waitForFunction(() => !!window.__sg);
+  assert.equal(await pg.evaluate(() => window.__sg.stats.feed.recovered), 1);
+  const out = await parse(pg, page([friend('HOME003'), friend('HOME002'), friend('NEW0001')], { source: 'following' }));
+  assert.deepEqual(keys(out), ['NEW0001'], 'still skipping Home\'s posts after the reload');
 });

@@ -127,8 +127,12 @@ test('feed: a marker in a page without plain posts still ends Home', async () =>
   const pg = await open('https://www.instagram.com/', FEED_HTML);
   await deliver(pg, page([friend('FRIEND1'), friend('FRIEND2')]));
   const out = await deliver(pg, page([recs('HSMARK1'), marker(), recs('AFTER01')]));
-  assert.deepEqual(keys(out), [], 'the suggestion before the marker is removed too');
+  // The suggestion before the marker is removed too; with nothing else left the
+  // marker stays without its groups (the page may be a head load: never []).
+  assert.deepEqual(keys(out), ['end_of_feed_demarcator']);
+  assert.deepEqual(conn(out).edges[0].node.end_of_feed_demarcator.group_set.groups, []);
   assert.equal(conn(out).page_info.has_next_page, false);
+  assert.equal((await feedStats(pg)).markerKept, 1);
   assert.equal((await feedStats(pg)).unknownPages, 0);
   await toBottom(pg);
   await waitOn(pg);
@@ -292,8 +296,9 @@ test('feed: replaying the phone\'s pages, suggestions are removed and Home ends 
     kept.push(conn(out).edges.map(e => e.node.media ? e.node.media.code : Object.keys(e.node).filter(k => e.node[k] && k !== '__typename')[0]));
     next.push(conn(out).page_info.has_next_page);
   }
-  // After the end, the first page keeps one hidden suggestion (it may be a reload of Home).
-  assert.deepEqual(kept, [['FRIEND1', 'FRIEND2'], [], [], ['explore_story'], [], [], []]);
+  // The marker page keeps the marker alone (no groups); after the end, each page
+  // keeps one hidden suggestion (any of them may be a reload of Home).
+  assert.deepEqual(kept, [['FRIEND1', 'FRIEND2'], [], ['end_of_feed_demarcator'], ['explore_story'], ['explore_story'], ['explore_story'], ['explore_story']]);
   assert.deepEqual(next, [true, true, false, false, false, false, false]);
   const f = await feedStats(pg);
   // 1.1 read: Posts shown 2, Suggested removed 0, Pages read 8 (7 unrecognised).
@@ -305,8 +310,8 @@ test('feed: replaying the phone\'s pages, suggestions are removed and Home ends 
   assert.equal(f.ad, 1);
   assert.equal(f.eof, 1);
   assert.equal(f.inMarker, 2);
-  assert.equal(f.afterEnd, 10, 'the 4 later pages, but the hidden anchor');
-  assert.equal(f.anchorAfterEnd, 1);
+  assert.equal(f.afterEnd, 7, 'the 4 later pages, but their hidden anchors');
+  assert.equal(f.anchorAfterEnd, 4);
   const fs = await feedState(pg);
   assert.equal(fs.ended, true);
   assert.equal(fs.caughtUp, true);

@@ -156,6 +156,28 @@ test('Home tab: at the top, the tap is Instagram\'s (its own refresh: two head l
   assert.equal(last.ps, 'feed_recs');
 });
 
+test('Home tab: at the top with nothing new (second head load [ad, marker]), Home keeps Instagram\'s line, never an empty list', async () => {
+  const saved = PAGES.headB;
+  PAGES.headB = page([adUnit('AD7'), marker()], 'h14', 'feed_recs');
+  try {
+    const pg = await openHome();
+    await scrollToEnd(pg);
+    await pg.tap('#home');                       // to the top
+    await pg.waitForTimeout(300);
+    await pg.tap('#home');                       // Instagram reloads: headA, then headB lands last
+    await pg.waitForFunction(() => window.__c.requests.slice(-1)[0] === 'headB' && document.querySelectorAll('article').length === 0);
+    await pg.waitForTimeout(300);
+    const c = await pg.evaluate(() => ({ edges: window.__c.edges.map(e => Object.keys(e.node).find(k => k !== '__typename')), more: window.__c.pageInfo.has_next_page,
+      groups: window.__c.edges[0] && window.__c.edges[0].node.end_of_feed_demarcator.group_set.groups }));
+    assert.deepEqual(c, { edges: ['end_of_feed_demarcator'], more: false, groups: [] });
+    const s = await state(pg);
+    assert.equal(s.fs.ended, true);
+    assert.equal(s.feed.refreshes, 1);
+  } finally {
+    PAGES.headB = saved;
+  }
+});
+
 test('Home tab: a tap within 8 px of the top is passed to Instagram', async () => {
   const pg = await openHome();
   await pg.evaluate(() => window.scrollTo(0, 6));
@@ -280,14 +302,15 @@ test('recovery: posts kept but none drawn reloads once per address; the next tim
   await draw(pg, 0);
   await parse(pg, page([friend('FAV0001'), friend('FAV0002')], 'v1', 'favorites'));
   const nav = pg.waitForNavigation({ timeout: 10000 });
-  await checks(pg, 4).catch(() => {});
+  // 10 s with no post drawn after the page (Instagram may still be mounting its list).
+  await checks(pg, 8).catch(() => {});
   await nav;
   await pg.waitForFunction(() => !!window.__sg);
   assert.equal(await docN(pg), 2);
   assert.equal(await pg.evaluate(() => window.__sg.stats.feed.recovered), 1);
   await pg.clock.install();
   await parse(pg, page([friend('FAV0001'), friend('FAV0002')], 'v2', 'favorites'));
-  await checks(pg, 4);
+  await checks(pg, 8);
   const f = await pg.evaluate(() => window.__sg.stats.feed);
   assert.equal(f.recoverHeld, 1);
   assert.equal(await docN(pg), 2, 'no second reload');
@@ -317,6 +340,24 @@ test('recovery: never before posts were drawn in this session, never with posts 
   await checks(pg, 4);
   assert.equal(await pg.evaluate(() => window.__sg.stats.feed.recovered || 0), 0);
   assert.equal(await docN(pg), 1);
+});
+
+test('recovery: Instagram\'s own refresh placeholder (no posts until its new page lands) is never reloaded', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  await pg.clock.install();
+  await parse(pg, page([friend('HOME001'), friend('HOME002'), friend('HOME003')], 'c1'));
+  await draw(pg, 3);
+  await checks(pg, 20);                                  // read for half a minute
+  // The Home tab at the top: Instagram shows its placeholder (divs only) while it refetches.
+  await pg.evaluate(() => { document.getElementById('feed').innerHTML = '<div><div class="glimmer" style="height:600px"></div></div>'; });
+  await checks(pg, 8);
+  assert.equal(await docN(pg), 1, 'no reload while the refresh runs');
+  await parse(pg, page([friend('NEW0001'), friend('HOME001')], 'h2'));
+  await draw(pg, 2);
+  await checks(pg, 8);
+  assert.equal(await docN(pg), 1);
+  assert.equal(await pg.evaluate(() => window.__sg.stats.feed.recovered || 0), 0);
+  assert.equal(await pg.evaluate(() => sessionStorage.getItem('sg_feed_recover')), null, 'the one recovery for Home is still there');
 });
 
 test('recovery: Instagram\'s empty-feed screen after SimpleGram handed the feed a post reloads once', async () => {
