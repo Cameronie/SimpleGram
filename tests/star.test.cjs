@@ -183,6 +183,13 @@ test('R5: React re-renders, a new item, a remount and a kept-alive page never lo
   assert.equal(st.frames.reelsSlot, 0);
   assert.deepEqual(st.igClicks, ['/me/', '/']);
   assert.deepEqual(page.__errors, []);
+  // Rows React has committed (and re-rendered since) count as React's at once:
+  // a resize looks at every star again and never waits.
+  for (let i = 0; i < 4; i++) { await page.evaluate(() => window.__app.rerender()); await page.waitForTimeout(20); }
+  await page.setViewportSize({ width: 412, height: 700 });
+  await page.waitForTimeout(1300);
+  assert.equal((await nav(page)).waitReact, 0);
+  assert.deepEqual(await rows(page), [{ stars: 1, afterHome: true, hidden: false }]);
 });
 
 test('R5: a bar drawn before DOMContentLoaded has its star from the first frame', async () => {
@@ -394,6 +401,30 @@ test('R5: a bar drawn before React takes it over gets its star only after hydrat
   await page.waitForTimeout(150);
   assert.deepEqual(await page.evaluate(() => [location.pathname, window.__igClicks]), ['/me/', ['/me/']]);
 });
+
+// React puts its key on the bar while it hydrates, before it commits; a
+// hydration in time slices that starts over (a tap, or any update) would
+// meet a star put in too early, throw #418 and draw the bar again.
+for (const [what, pre, tap] of [
+  ['a tap on a post', () => { window.__suspense = true; window.__hydrateDelay = 300; }, true],
+  ['an update outside the boundary', () => { window.__suspense = true; window.__hydrateDelay = 300; window.__tickAt = 700; }, false],
+]) {
+  test(`R5: a bar hydrated in slices inside a Suspense boundary gets its star only after React commits (${what} mid-hydration)`, async () => {
+    const page = await open('https://www.instagram.com/', { mode: 'hydrate', pre });
+    await page.waitForFunction(() => window.__hydrateCalled);
+    if (tap) { await page.waitForTimeout(700); await page.tap('#slow article:nth-child(3)', { force: true }); }
+    await page.waitForFunction(() => window.__boundaryDone, null, { timeout: 12000 });
+    await page.waitForFunction(() => !!document.querySelector('[data-sg-fav]'), null, { timeout: 3000 });
+    await page.waitForTimeout(500);
+    const st = await page.evaluate(() => ({ errs: window.__renderErrors, kept: window.__beforeHydrate.home === document.querySelector('a[href="/"]'),
+      tick: document.getElementById('tick').textContent, inserted: window.__sg.stats.nav.inserted }));
+    assert.deepEqual(st.errs, [], 'no hydration error (#418)');
+    assert.equal(st.kept, true, 'React kept the drawn bar');
+    assert.equal(st.inserted, 1);
+    if (!tap) assert.equal(st.tick, '1');
+    assert.deepEqual(await rows(page), [{ stars: 1, afterHome: true, hidden: false }]);
+  });
+}
 
 test('R5: a bar React never takes over stops being retried after the limit (no star, no endless timer)', async () => {
   const page = await open('https://www.instagram.com/', { mode: 'static', clock: true });

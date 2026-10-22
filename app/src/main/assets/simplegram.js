@@ -1721,9 +1721,29 @@
   }
   // React's own key on the nodes it manages. A bar drawn by the server and
   // not yet taken over by React must not get an extra child: React would
-  // throw the bar away and draw it again.
+  // throw the bar away and draw it again. The key alone is not enough: React
+  // sets it while it hydrates, before it commits, and a hydration that is
+  // started over (a tap, any update) would meet the star and redraw.
   function reactOwned(el) {
-    return Object.keys(el).some(k => k.startsWith('__reactFiber$'));
+    const k = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+    if (!k) return false;
+    const f = el[k];
+    if (!f || typeof f !== 'object' || typeof f.tag !== 'number' || !('return' in f)) return true;   // not a fiber we know
+    return fiberMounted(f);
+  }
+  // React's own test (getNearestMountedFiber): a fiber React has rendered
+  // before is in the page if its parents lead to the root; a new one only
+  // when no fiber on the way still waits to be placed or hydrated
+  // (Placement 2, Hydrating 4096; cleared when React commits).
+  function fiberMounted(f) {
+    let node = f, nearest = f;
+    for (let i = 0; ; i++) {
+      if (!f.alternate && (node.flags & 4098)) nearest = node.return;
+      if (!node.return) break;
+      if (i > 5000) return true;   // not a shape we know: as before
+      node = node.return;
+    }
+    return node.tag === 3 && nearest === f;
   }
   function reactLike(el) {
     return Object.keys(el).some(k => k.startsWith('__react'));

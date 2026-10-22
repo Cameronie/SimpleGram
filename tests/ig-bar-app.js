@@ -7,7 +7,10 @@
 //
 // window.__mockMode: 'client' (default), 'hydrate' (the bar is in the page as
 // plain HTML first and React takes it over after __hydrateDelay ms), 'static'
-// (plain HTML React never takes over).
+// (plain HTML React never takes over). With window.__suspense, 'hydrate' puts
+// the bar and 400 slow posts (5 ms each) in one Suspense boundary beside a
+// ticker, so React hydrates them in time slices (window.__tickAt: the ticker
+// updates then, from outside the boundary).
 (function () {
   'use strict';
   const h = React.createElement;
@@ -130,6 +133,20 @@
     return opts.maintainFeed ? h(React.Fragment, null, h('div', { key: 'kept', style: { display: 'none' } }, feed), other) : other;
   }
 
+  // The Suspense case: a server-drawn boundary React hydrates in slices.
+  function Post(p) {
+    if (window.__spin) { const t = performance.now(); while (performance.now() - t < 5) { /* a slow post */ } }
+    return h('article', { style: { height: '40px' }, onClick: () => { window.__postClicks = (window.__postClicks || 0) + 1; } }, 'slow ' + p.i);
+  }
+  function Slow() { const out = []; for (let i = 0; i < 400; i++) out.push(h(Post, { key: i, i: i })); return h('div', { id: 'slow' }, out); }
+  function Ticker() {
+    const [n, set] = React.useState(0);
+    React.useEffect(() => { if (window.__tickAt) setTimeout(() => set(1), window.__tickAt); }, []);
+    return h('span', { id: 'tick' }, String(n));
+  }
+  function Done() { React.useEffect(() => { window.__boundaryDone = true; }, []); return null; }   // after React commits the boundary
+  function SuspenseTree() { return h(React.Fragment, null, h(Ticker), h(React.Suspense, { fallback: null }, h(App), h(Slow), h(Done))); }
+
   const rootOpts = {
     onUncaughtError: e => window.__renderErrors.push(String(e && e.message || e)),
     onCaughtError: e => window.__renderErrors.push(String(e && e.message || e)),
@@ -142,14 +159,17 @@
     // output, copied without React's keys on the nodes.
     const tmp = document.createElement('div');
     const r = ReactDOMClient.createRoot(tmp);
-    ReactDOM.flushSync(() => r.render(h(App)));
-    const html = tmp.innerHTML;
+    const susp = mode === 'hydrate' && window.__suspense;
+    ReactDOM.flushSync(() => r.render(susp ? h(React.Fragment, null, h(Ticker), h(App), h(Slow)) : h(App)));
+    let html = tmp.innerHTML;
+    if (susp) html = html.replace('<span id="tick">0</span>', '<span id="tick">0</span><!--$-->') + '<!--/$-->';
     r.unmount();
     mount.innerHTML = html;
     window.__beforeHydrate = { home: mount.querySelector('a[href="/"]') };
     if (mode === 'hydrate') {
       setTimeout(() => {
-        ReactDOMClient.hydrateRoot(mount, h(App), rootOpts);
+        if (susp) window.__spin = true;
+        ReactDOMClient.hydrateRoot(mount, h(susp ? SuspenseTree : App), rootOpts);
         window.__hydrateCalled = true;
       }, window.__hydrateDelay || 600);
     }
