@@ -11,6 +11,7 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.net.Uri;
 import android.os.SystemClock;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -534,6 +535,59 @@ public class ShellTest {
             s.onActivity(MainActivity::onBackPressed);
             idle();
             assertTrue(hidden[0]);
+        }
+    }
+
+    /**
+     * R9 with a real Back key: WebView's full-screen view takes focus and ends
+     * full screen on Back itself (before onBackPressed). Here a focused stand-in
+     * that eats Back the same way: the app still closes only the Reel.
+     */
+    @Test
+    public void backKeyClosesAStoryReelEvenWhenTheFullScreenViewHasFocus() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            boolean[] hidden = new boolean[1];
+            int[] eaten = new int[1];
+            View story = new View(InstrumentationRegistry.getInstrumentation().getTargetContext()) {
+                @Override
+                public boolean dispatchKeyEvent(KeyEvent e) {
+                    if (e.getKeyCode() == KeyEvent.KEYCODE_BACK && e.getAction() == KeyEvent.ACTION_UP) {
+                        eaten[0]++;
+                        hidden[0] = true;              // what WebView's view does: leave full screen
+                        return true;
+                    }
+                    return super.dispatchKeyEvent(e);
+                }
+            };
+            story.setFocusable(true);
+            story.setFocusableInTouchMode(true);
+            String on = new JSONObject().put("action", "fullVideo").put("on", true).toString();
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onShowCustomView(story, () -> hidden[0] = true);
+                    story.requestFocus();
+                    call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", on);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertTrue("the stand-in has focus", story.hasFocus());
+            assertEquals(View.GONE, menuTab(act.get()).getVisibility());
+            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
+            idle();
+            assertEquals("Back never reached the full-screen view", 0, eaten[0]);
+            assertFalse("the Story's full screen stays", hidden[0]);
+            assertNotNull(story.getParent());
+            assertEquals(View.VISIBLE, menuTab(act.get()).getVisibility());
+            // The next Back ends the Story's full screen through the app.
+            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
+            idle();
+            assertTrue(hidden[0]);
+            assertEquals(0, eaten[0]);
+            assertNull(story.getParent());
         }
     }
 }

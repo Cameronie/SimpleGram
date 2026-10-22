@@ -24,6 +24,7 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -1381,6 +1382,22 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         super.onNewIntent(intent);
         setIntent(intent);
         handleIntent(intent, false);
+    }
+
+    /**
+     * WebView's own full-screen view takes focus when the WebView had it (after
+     * any typing) and ends full screen on Back itself, before onBackPressed: a
+     * Story Reel's Back would close the whole Story. While a full-screen view,
+     * R9's Reel or screenshot mode is up, Back is taken here first and goes
+     * through onBackPressed, in its usual order.
+     */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        if (e.getKeyCode() == KeyEvent.KEYCODE_BACK && (pageVideo || customView != null || screenshotMode)) {
+            if (e.getAction() == KeyEvent.ACTION_UP && !e.isCanceled()) onBackPressed();
+            return true;
+        }
+        return super.dispatchKeyEvent(e);
     }
 
     @SuppressWarnings("deprecation")
