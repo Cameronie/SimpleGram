@@ -375,11 +375,17 @@ test('B14: Instagram\'s Home tab tapped before the address changes closes search
   assert.equal((await opens(page)).cancelled, 1);
 });
 
-// Playwright can't evaluate while a page load is pending, so the page presses Back itself.
-const backAt = (page, ms) => page.evaluate(t => setTimeout(() => {
-  window.__fullLoads = window.__sg.stats.searchOpens.fullLoad;
-  window.__back = window.__sg.back();
-}, t), ms);
+// Playwright can't evaluate while a page load is pending, so the page presses Back
+// itself: as soon as SimpleGram has started its own full load, or after `ms` at the latest.
+const backAt = (page, ms) => page.evaluate(t => {
+  const t0 = Date.now();
+  const tick = () => {
+    const n = window.__sg.stats.searchOpens.fullLoad;
+    if (n >= 1 || Date.now() - t0 >= t) { window.__fullLoads = n; window.__back = window.__sg.back(); return; }
+    setTimeout(tick, 50);
+  };
+  setTimeout(tick, 50);
+}, ms);
 
 test('B14: Back while SimpleGram\'s own full load is on its way calls it off and shows the results', async () => {
   // Nothing picks the open up (address already changed), so the page is loaded normally; that load is slow.
@@ -482,4 +488,18 @@ test('B14: from a profile\'s Reels tab, tapping that account opens at once (no s
   assert.ok(Date.now() - t0 < 2000, 'no 8 s spinner');
   assert.equal(await loads(page), 1, 'no full reload');
   assert.equal((await opens(page)).samePage, 1);
+});
+
+test('B14: a query edited just before the tap gets its results when search comes back after a full load', async () => {
+  const page = await start({ exposeRequire: true, forceReload: true, docDelay: 600 });
+  await showPosts(page);
+  // One more letter, then a cell tap inside the 400 ms debounce.
+  await page.evaluate(() => { const r = document.getElementById('sg-search').shadowRoot; const i = r.querySelector('input'); i.focus(); i.value = 'sharksx'; i.dispatchEvent(new Event('input', { bubbles: true })); });
+  await tapCell(page);
+  await page.waitForFunction(() => +sessionStorage.getItem('loads') === 2, null, { timeout: 20000 });
+  await waitPostShown(page);
+  await page.goBack();
+  await page.waitForFunction(() => { const h = document.getElementById('sg-search'); return h && h.style.display !== 'none' && h.shadowRoot.querySelectorAll('.cell').length === 2; }, null, { timeout: 15000 });
+  const st = await page.evaluate(() => ({ q: window.__sg.search.query, postsQ: window.__sg.search.posts.q, spin: document.getElementById('sg-search').shadowRoot.querySelectorAll('.spin').length }));
+  assert.deepEqual(st, { q: 'sharksx', postsQ: 'sharksx', spin: 0 });
 });

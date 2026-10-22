@@ -190,6 +190,49 @@ test('chrome: "Use the app" bar and the Reels tab are hidden; navigation stays',
 });
 
 
+test('chrome: a message or comment that reads like a banner is left alone', async () => {
+  const rows = ['Get the app', 'open the app', 'see you at 8', 'Open Instagram'].map((t, i) =>
+    `<div role="row" id="r${i}" style="height:40px"><div><div dir="auto"><span>${t}</span></div></div></div>`).join('');
+  const html = `<!doctype html><html><body><main><div role="grid">${rows}</div></main>${NAV}</body></html>`;
+  const page = await open('https://www.instagram.com/direct/t/123456/', html);
+  await page.waitForTimeout(1200);
+  const shown = await page.evaluate(() => [0, 1, 2, 3].map(i => getComputedStyle(document.getElementById('r' + i)).display !== 'none'));
+  assert.deepEqual(shown, [true, true, true, true]);
+  assert.equal(await page.evaluate(() => window.__sg.stats.dom.banners), 0);
+  // The same inside the comments panel's page.
+  const c = await open('https://www.instagram.com/p/ABCDEF1/comments/', html, { role: 'comments' });
+  await c.waitForTimeout(1200);
+  assert.deepEqual(await c.evaluate(() => [0, 3].map(i => getComputedStyle(document.getElementById('r' + i)).display !== 'none')), [true, true]);
+});
+
+test('sound: a video with no audio is left alone (pressing its control only shows a toast)', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+    <div style="position:relative;height:915px"><video id="r1" muted playsinline style="width:412px;height:915px"></video>
+    <button id="mute" aria-label="Toggle audio" style="position:absolute;top:20px;right:20px;width:40px;height:40px"><svg aria-label="Video has no audio"></svg></button></div>
+    <script>document.getElementById('mute').addEventListener('click',()=>{window.__toggled=(window.__toggled||0)+1;});</script></body></html>`;
+  const page = await open('https://www.instagram.com/reel/ABCDEFG/', html);
+  await page.evaluate(() => { const v = document.getElementById('r1'); v.src = '/clip.webm'; v.dispatchEvent(new Event('play')); });
+  await page.waitForTimeout(700);
+  assert.equal(await page.evaluate(() => window.__toggled || 0), 0);
+  // The same button, whose icon now says the sound is off, is pressed as before.
+  await page.evaluate(() => {
+    document.querySelector('#mute svg').setAttribute('aria-label', 'Audio is muted');
+    const v = document.getElementById('r1'); v.muted = true; v.dispatchEvent(new Event('play'));
+  });
+  await page.waitForFunction(() => window.__toggled === 1);
+});
+
+test('downloads: a video with no downloadable file is reported, never saved as its cover picture', async () => {
+  const info = { items: [media('ABCDEFG', user('friend', true))] };   // a picture only: no progressive video
+  const html = `<!doctype html><html><body><video src="blob:https://www.instagram.com/y" style="width:412px;height:732px"></video></body></html>`;
+  const page = await open('https://www.instagram.com/reel/ABCDEFG/', html, { api: {} });
+  await page.route('**/api/v1/media/*/info/', r => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(info) }));
+  await page.evaluate(() => { window.__sg.onNative({ type: 'menu' }); window.__sg.onNative({ type: 'download' }); });
+  const [t] = await waitSent(page, 'toast');
+  assert.match(t.message, /could not be matched/);
+  assert.equal((await sent(page, 'download')).length, 0, 'nothing was sent for saving');
+});
+
 test('backup filter: a post labelled Sponsored/Suggested is hidden, captions are not misread', async () => {
   const html = `<!doctype html><html><body><main>
     ${article('FRIEND1', 'Original audio', { caption: '<span>Sponsored</span> by nobody' })}
@@ -587,12 +630,6 @@ test('search: when the old endpoints fail, the website\'s current requests are u
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
   const badge = await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell .badge').length);
   assert.equal(badge, 1, 'the video is marked');
-});
-
-test('search: place links use Instagram\'s own slug rule', async () => {
-  const page = await open('https://www.instagram.com/', BLANK);
-  const out = await page.evaluate(() => window.__sg.search && true);
-  assert.equal(out, true);
 });
 
 test('feed: the no-repeats list is used once; reloading Following shows everything', async () => {

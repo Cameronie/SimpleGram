@@ -38,7 +38,9 @@ android {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            signingConfig keyProps['storeFile'] ? signingConfigs.simplegram : signingConfigs.debug
+            // Without the key the release APK is left unsigned (it won't install),
+            // never quietly signed with the public debug key.
+            if (keyProps['storeFile']) signingConfig signingConfigs.simplegram
         }
     }
 

@@ -375,3 +375,19 @@ test('search data: after a refused request id, Try again looks the id up again',
   await waitCells(page, 1);
   assert.deepEqual(s.log.filter(r => r.name === 'PolarisKeywordSearchExplorePageRelayQuery').map(r => r.id), ['1111', IDS.PolarisKeywordSearchExplorePageRelayQuery]);
 });
+
+test('search data: "Open Instagram\'s own page" for a place uses Instagram\'s own slug and the Most recent path', async () => {
+  const s = site({ answers: { PolarisLocationPageTabContentQuery: () => null } });
+  const { page } = await start(Object.assign(s.api, placesApi(HYATT)));
+  await query(page, 'hyatt');
+  await openPlace(page);
+  await waitText(page, 'Try again');
+  await shadowClick(page, 'own page');
+  assert.equal(await page.evaluate(() => location.pathname), '/explore/locations/213385402/hyatt-regency-waikiki/');
+  await page.evaluate(() => window.__sg.back());
+  await waitText(page, 'Try again');
+  await shadowClick(page, 'Most recent');
+  await waitText(page, 'Try again');
+  await shadowClick(page, 'own page');
+  assert.equal(await page.evaluate(() => location.pathname), '/explore/locations/213385402/hyatt-regency-waikiki/recent/');
+});

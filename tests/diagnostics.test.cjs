@@ -44,3 +44,13 @@ test('diagnostics: Instagram\'s "please wait" answers are counted, whichever way
   await page.evaluate(() => JSON.parse('{"errors":[{"message":"execution error","code":1675004}],"data":null}'));
   assert.equal(await page.evaluate(() => window.__sg.stats.diag.pleaseWait), 2);
 });
+
+test('diagnostics: full-screen requests are counted with the page they came from', async () => {
+  const page = await open('https://www.instagram.com/', BLANK);
+  await page.evaluate(() => {
+    history.pushState(null, '', '/stories/friend/3700000000000000001/');
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => document.body });
+    document.dispatchEvent(new Event('fullscreenchange'));
+  });
+  assert.deepEqual(await page.evaluate(() => [window.__sg.stats.diag.fullscreen, window.__sg.stats.diag.fullscreenLast]), [1, 'body on story']);
+});

@@ -34,7 +34,6 @@ import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
 import android.webkit.GeolocationPermissions;
-import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.RenderProcessGoneDetail;
 import android.webkit.ValueCallback;
@@ -94,12 +93,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private View feedBar;
     private TextView feedTitle;
     private TextView feedSub;
+    private GradientDrawable feedBg;
     private boolean feedWanted;
     private boolean searchOpen;
     private boolean restarting;
     private View screenshotShield;
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
+    private int fullScreens;
+    private String fullScreenLast = "";
     private Downloads downloads;
 
     private String route = "other";
@@ -170,11 +172,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> onRootLayout(r - l, b - t));
         guardEdgeToEdge();
 
-        if (state != null && web.restoreState(state) != null) {
-            handleIntent(getIntent(), false);
-        } else {
-            handleIntent(getIntent(), true);
-        }
+        // A restored page (after a renderer restart or process death) keeps its
+        // place; the launch intent was already handled the first time.
+        if (state == null || web.restoreState(state) == null) handleIntent(getIntent(), true);
     }
 
     /* ------------------------------------------------------------------ *
@@ -225,13 +225,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         Script s = new Script(w, role);
         scripts.add(s);
         registerScript(s);
+        // Only the origin-restricted, main-frame-only listener. A WebView too old
+        // for it (before 2020) gets no bridge at all; the page copes without one.
         if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
             WebViewCompat.addWebMessageListener(w, "SGNative", ORIGINS,
                     (view, message, origin, isMainFrame, reply) -> {
                         if (isMainFrame && message.getData() != null) onMessage(role, message.getData());
                     });
-        } else {
-            w.addJavascriptInterface(new LegacyBridge(role, w), "SGNative");
         }
     }
 
@@ -302,6 +302,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
             injectFallback(view);
+            // A page outside Instagram (Meta login, Accounts Center) sends no
+            // 'ready': forget the last Instagram page's state so Back goes back.
+            if ("main".equals(role) && url != null && !Links.isInstagram(Uri.parse(url))) {
+                route = "other";
+                searchOpen = false;
+                feedWanted = false;
+                updateFeedBar();
+            }
         }
 
         @Override
@@ -409,6 +417,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             }
             customView = view;
             customViewCallback = callback;
+            fullScreens++;
+            fullScreenLast = route + " at " + clock();
             view.setBackgroundColor(Color.BLACK);
             root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
             setSystemBarsHidden(true);
@@ -447,23 +457,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     /** Fallback bridge for WebViews without origin-restricted message listeners. */
-    final class LegacyBridge {
-        private final String role;
-        private final WebView view;
-
-        LegacyBridge(String role, WebView view) {
-            this.role = role;
-            this.view = view;
-        }
-
-        @JavascriptInterface
-        public void postMessage(String data) {
-            ui.post(() -> {
-                String url = view.getUrl();
-                if (url != null && Links.isInstagram(Uri.parse(url))) onMessage(role, data);
-            });
-        }
-    }
 
     /* ------------------------------------------------------------------ *
      * Messages from the page script
@@ -487,6 +480,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         // A new page: nothing from the old one carries over.
                         searchOpen = false;
                         feedWanted = false;
+                        setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
                         if (!prefs.getBoolean("tabTip", false)) {
                             prefs.edit().putBoolean("tabTip", true).apply();
@@ -606,7 +600,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bar.setOrientation(android.widget.LinearLayout.VERTICAL);
         bar.setGravity(Gravity.CENTER_HORIZONTAL);
         bar.setPadding(dp(16), dp(12), dp(16), dp(14));
-        GradientDrawable bg = new GradientDrawable();
+        GradientDrawable bg = feedBg = new GradientDrawable();
         bg.setColor(dark ? 0xF2262626 : 0xF2FFFFFF);
         bg.setCornerRadius(dp(18));
         bg.setStroke(dp(1), dark ? 0x33FFFFFF : 0x22000000);
@@ -614,6 +608,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bar.setElevation(dp(8));
         // The card is solid: a tap on its text must not like the post underneath.
         bar.setClickable(true);
+        bar.setContentDescription("End of Home");
 
         TextView title = new TextView(this);
         title.setTextColor(dark ? Color.WHITE : Color.BLACK);
@@ -1143,6 +1138,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         b.append("\nApp\n")
                 .append("  WebView: ").append(device.optString("webView")).append('\n')
                 .append("  Android memory callbacks: ").append(trimLog.isEmpty() ? "none" : String.join(", ", trimLog)).append('\n')
+                .append("  Full-screen video: ").append(fullScreens)
+                .append(fullScreens > 0 ? " (last: " + fullScreenLast + ")" : "").append('\n')
                 .append("  Page restarts: ").append(device.optInt("rendererGone"));
         String last = device.optString("rendererGoneLast");
         if (!last.isEmpty()) b.append(" (last: ").append(last).append(')');
@@ -1161,6 +1158,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("android", Build.VERSION.SDK_INT);
             n.put("webView", p != null ? p.versionName : "unknown");
             n.put("memoryWarnings", new JSONArray(trimLog));
+            n.put("fullScreens", fullScreens);
+            n.put("fullScreenLast", fullScreenLast);
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
         } catch (JSONException e) {
@@ -1253,7 +1252,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (storyMode()) zoom.hold();
         menuButton.setVisibility(View.GONE);
         zoomChip.setVisibility(View.GONE);
-        showFeedBar(false);
+        updateFeedBar();                      // hidden while screenshotMode, back afterwards
         setSystemBarsHidden(true);
         screenshotShield = new View(this);
         screenshotShield.setOnClickListener(v -> exitScreenshot());
@@ -1373,6 +1372,28 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         super.onResume();
         web.onResume();
         comments.web().onResume();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        boolean night = (newConfig.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        if (night != dark) {
+            dark = night;
+            applyTheme();
+        }
+    }
+
+    /** Recolours the native parts (dialogs read `dark` when they open). */
+    private void applyTheme() {
+        int bg = dark ? Color.BLACK : Color.WHITE;
+        root.setBackgroundColor(bg);
+        web.setBackgroundColor(bg);
+        comments.setDark(dark);
+        feedBg.setColor(dark ? 0xF2262626 : 0xF2FFFFFF);
+        feedBg.setStroke(dp(1), dark ? 0x33FFFFFF : 0x22000000);
+        feedTitle.setTextColor(dark ? Color.WHITE : Color.BLACK);
+        feedSub.setTextColor(dark ? 0xFFA8A8A8 : 0xFF737373);
     }
 
     // Android's memory callbacks since the app started, newest last (Filter status).

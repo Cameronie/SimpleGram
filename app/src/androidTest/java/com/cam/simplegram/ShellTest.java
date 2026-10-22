@@ -190,7 +190,7 @@ public class ShellTest {
             View bar = null;
             for (int i = 0; i < root.getChildCount(); i++) {
                 View c = root.getChildAt(i);
-                if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE && textOf((ViewGroup) c).contains("Favorites")) bar = c;
+                if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE && "End of Home".equals(String.valueOf(c.getContentDescription()))) bar = c;
             }
             assertNotNull("end-of-Home bar visible", bar);
             String text = textOf((ViewGroup) bar);
@@ -261,7 +261,7 @@ public class ShellTest {
         ViewGroup root = (ViewGroup) ((ViewGroup) a.findViewById(android.R.id.content)).getChildAt(0);
         for (int i = 0; i < root.getChildCount(); i++) {
             View c = root.getChildAt(i);
-            if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE && textOf((ViewGroup) c).contains("Favorites")) {
+            if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE && "End of Home".equals(String.valueOf(c.getContentDescription()))) {
                 return (ViewGroup) c;
             }
         }

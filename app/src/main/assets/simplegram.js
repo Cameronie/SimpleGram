@@ -528,7 +528,8 @@
       for (const x of media) { x.drop = false; x.reason = ''; }
     }
     const seenCodes = skipping();
-    const onHome = route() === 'home' && feedVariant() === 'home';
+    // Home's own page, even when it lands while a Story or post is open.
+    const onHome = home;
     const kept = [];
     let keptMedia = 0, alreadySeen = 0, lastKept = null;
     verdicts.forEach((x, i) => {
@@ -926,9 +927,13 @@
         : want(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP });
   }
   function tidyBanners() {
+    // In a conversation a message or comment can read exactly like a banner,
+    // and Instagram never shows its app banner on DM or comments pages anyway.
+    const r = route();
+    const skipText = CFG.role !== 'main' || r === 'direct' || r === 'comments';
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let n, guard = 0;
-    while ((n = walker.nextNode()) && guard++ < 20000) {
+    while (!skipText && (n = walker.nextNode()) && guard++ < 20000) {
       const t = n.nodeValue;
       if (!t || t.length > 40 || !BANNER_TEXT.test(t.trim())) continue;
       const el = n.parentElement;
@@ -1257,6 +1262,7 @@
     const previous = route(new URL(lastUrl).pathname);
     lastUrl = location.href;
     post('route', { url: location.href, route: route() });
+    safe(syncSwipeGuard)();
     if (CFG.role === 'main' && route() === 'reels-tab') {
       // The endless Reels tab is not part of SimpleGram.
       location.replace('/');
@@ -1321,17 +1327,7 @@
     return null;
   }
   let swipe = null;
-  window.addEventListener('touchstart', safe(e => {
-    swipe = null;
-    if (CFG.role !== 'main' || e.touches.length !== 1) return;
-    const r = route();
-    if (r === 'home' || r === 'direct' || r === 'story') return;
-    // Only a vertically snapping viewer (one Reel per screen) is guarded;
-    // ordinary lists such as Share or comments scroll normally.
-    const sc = snapScroller(e.target);
-    if (sc) swipe = { sc: sc, x: e.touches[0].clientX, y: e.touches[0].clientY, top: sc.scrollTop, vertical: null };
-  }), { capture: true, passive: true });
-  window.addEventListener('touchmove', safe(e => {
+  const guardMove = safe(e => {
     if (!swipe || e.touches.length !== 1) return;
     const t = e.touches[0];
     const dx = t.clientX - swipe.x, dy = t.clientY - swipe.y;
@@ -1340,7 +1336,30 @@
       if (e.cancelable) e.preventDefault();
       e.stopPropagation();
     }
-  }), { capture: true, passive: false });
+  });
+  // A blocking touch listener makes every scroll wait for the page, so it is
+  // registered only where a Reel viewer can be: never on Home, DMs or Stories.
+  let guardOn = false;
+  function syncSwipeGuard() {
+    const r = route();
+    const want = CFG.role === 'main' && r !== 'home' && r !== 'direct' && r !== 'story';
+    if (want === guardOn) return;
+    guardOn = want;
+    if (want) window.addEventListener('touchmove', guardMove, { capture: true, passive: false });
+    else { window.removeEventListener('touchmove', guardMove, true); swipe = null; }
+  }
+  syncSwipeGuard();
+  window.addEventListener('touchstart', safe(e => {
+    swipe = null;
+    if (!guardOn || e.touches.length !== 1) return;
+    const r = route();
+    if (r === 'home' || r === 'direct' || r === 'story') return;
+    // Only a vertically snapping viewer (one Reel per screen) is guarded;
+    // ordinary lists such as Share or comments scroll normally.
+    const sc = snapScroller(e.target);
+    if (sc) swipe = { sc: sc, x: e.touches[0].clientX, y: e.touches[0].clientY, top: sc.scrollTop, vertical: null };
+  }), { capture: true, passive: true });
+  window.addEventListener('touchcancel', safe(() => { swipe = null; }), { capture: true, passive: true });
   window.addEventListener('touchend', safe(() => {
     if (swipe && swipe.vertical) {
       stats.swipesBlocked++;
@@ -1376,6 +1395,14 @@
     if (svg) return svg.getAttribute('aria-label').trim();
     const title = el.querySelector && el.querySelector('svg title');
     return title ? norm(title) : '';
+  }
+  // The control's state. Instagram's "Toggle audio" button says nothing itself;
+  // its icon does ("Audio is muted", "Audio is playing", "Video has no audio").
+  function controlState(el) {
+    const own = controlLabel(el);
+    if (/playing|muted|no audio|no sound|is on|is off|^mute$|^unmute$|turn (on|off)/i.test(own)) return own;
+    const svg = el.querySelector && el.querySelector('svg[aria-label]');
+    return svg ? svg.getAttribute('aria-label').trim() : own;
   }
   function audioLabel(el) {
     const l = controlLabel(el);
@@ -1431,9 +1458,10 @@
     unmuteBudget.set(m, used);
     const r = route();
     const toggle = findControl(m, /audio|sound|mute/i, r === 'story' || r === 'reel');
-    const label = toggle ? controlLabel(toggle) : '';
-    // "Audio is playing" means Instagram already thinks sound is on.
-    if (toggle && !/playing|is on|^mute$|turn off/i.test(label)) {
+    const label = toggle ? controlState(toggle) : '';
+    // "Audio is playing" means Instagram already thinks sound is on; a video
+    // with no audio has nothing to turn on (pressing only shows a toast).
+    if (toggle && !/playing|is on|^mute$|turn off|no audio|no sound/i.test(label)) {
       try { press(toggle); } catch (e) { /* ignore */ }
       setTimeout(() => { if (m.muted && !userMuted) m.muted = false; }, 300);
     } else {
@@ -1957,14 +1985,14 @@
         else if (s.slide >= 0 && s.slide < children.length && children[s.slide].video) idx = s.slide;
         else out.choices = vids.map(i => ({ url: children[i].video, kind: 'video', name: nameFor(rec, i, children.length, 'video'), label: 'Video in slide ' + (i + 1) }));
       }
-      if (idx >= 0) {
+      if (idx >= 0 && !(s.kind === 'video' && !children[idx].video)) {
         const c = children[idx];
         const kind = s.kind === 'video' && c.video ? 'video' : (c.video && !c.image ? 'video' : (s.kind === 'image' ? 'image' : (c.video ? 'video' : 'image')));
         current = { url: kind === 'video' ? c.video : c.image, kind: kind, name: nameFor(rec, idx, children.length, kind) };
       }
     } else if (rec) {
       if (s.kind === 'video' && rec.video) current = { url: rec.video, kind: 'video', name: nameFor(rec, 0, 1, 'video') };
-      else if (rec.image && (s.kind === 'image' || !rec.video)) current = { url: rec.image, kind: 'image', name: nameFor(rec, 0, 1, 'image') };
+      else if (rec.image && s.kind !== 'video') current = { url: rec.image, kind: 'image', name: nameFor(rec, 0, 1, 'image') };
       else if (rec.video) current = { url: rec.video, kind: 'video', name: nameFor(rec, 0, 1, 'video') };
     }
     if (!current && s.kind === 'image' && s.imgUrl) {
@@ -2393,14 +2421,23 @@
   }
 
   /* Recent searches */
+  // Recent searches belong to the signed-in account, not to the phone.
+  function recentKey() { return RECENT_KEY + ':' + (viewerId() || 'anon'); }
   function recents() {
-    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]').slice(0, 15); } catch (e) { return []; }
+    try {
+      const old = localStorage.getItem(RECENT_KEY);   // 1.2 kept one list for every account
+      if (old !== null) {
+        localStorage.removeItem(RECENT_KEY);
+        if (viewerId() && localStorage.getItem(recentKey()) === null) localStorage.setItem(recentKey(), old);
+      }
+      return JSON.parse(localStorage.getItem(recentKey()) || '[]').slice(0, 15);
+    } catch (e) { return []; }
   }
   function remember(item) {
     try {
       const list = recents().filter(x => !(x.kind === item.kind && x.id === item.id));
       list.unshift(item);
-      localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, 15)));
+      localStorage.setItem(recentKey(), JSON.stringify(list.slice(0, 15)));
     } catch (e) { /* ignore */ }
   }
 
@@ -3030,6 +3067,8 @@
   window.addEventListener('pageshow', safe(e => {
     if (!e.persisted) return;
     safe(loadOpens)();                        // the newer page may have counted since
+    post('search', { open: !!search.open });  // the app's own flags may be stale
+    post('route', { url: location.href, route: route() });
     if (!leaving) return;
     endOpen();
     if (search.open && history.state && history.state.sgSearch === search.token) dropMark();
@@ -3158,6 +3197,8 @@
     dropMark();
     showSearch();
     render();
+    // A query edited just before the open (its debounce never fired) has no results yet.
+    if (search.tab === 'posts' && !search.view) runQuery();
     const y = saved && saved.scroll;
     if (y && search.body) requestAnimationFrame(() => { search.body.scrollTop = y; });
   }
@@ -3186,7 +3227,8 @@
    * Instagram is slowing requests down, and long main-thread stalls.
    * Counts and timings only; everything is passive (no requests, no shims).
    * ------------------------------------------------------------------ */
-  const diag = (stats.diag = { storyMs: [], storyVideos: 0, s429: 0, s5xx: 0, pleaseWait: 0, longTasks: 0, longestTask: 0 });
+  const diag = (stats.diag = { storyMs: [], storyVideos: 0, s429: 0, s5xx: 0, pleaseWait: 0, longTasks: 0, longestTask: 0,
+    fullscreen: 0, fullscreenLast: '' });
   let storyStart = 0;
   function storyOpened() {
     storyStart = performance.now();
@@ -3201,6 +3243,11 @@
   if (CFG.role === 'main') {
     // Media events don't bubble; listen in the capture phase.
     document.addEventListener('playing', safe(storyShown), true);
+    // Which pages ask the browser for full screen (Stories are suspected).
+    document.addEventListener('fullscreenchange', safe(() => {
+      const el = document.fullscreenElement;
+      if (el) { diag.fullscreen++; diag.fullscreenLast = (el.tagName || '?').toLowerCase() + ' on ' + route(); }
+    }));
     document.addEventListener('load', safe(e => {
       const t = e.target;
       if (!storyStart || !t || t.tagName !== 'IMG') return;

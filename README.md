@@ -79,7 +79,7 @@ went and how long Stories took to load. **Copy details** copies the counts and d
 
 ## Limits
 
-- Tested against fixture data shaped like Instagram's (124 browser tests), checked against
+- Tested against fixture data shaped like Instagram's (130 browser tests), checked against
   the code of Instagram's current website, and on an Android 10 emulator (9 native tests).
   It is not tested against a signed-in Instagram account, so your phone is the real test.
 - Instagram's website, not the app: calls, music on Stories, and some posting features
@@ -123,5 +123,5 @@ Signing: release builds use `signing/simplegram.jks` with its passwords in
 `signing/keystore.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`).
 Both are git-ignored and are never committed. A build signed with the same key installs
 as an update over the previous one and keeps your Instagram login; a different key means
-uninstalling first and logging in again. Without the files the build falls back to a
-debug key.
+uninstalling first and logging in again. Without the files the release APK is left
+unsigned, so it can't be installed by mistake with the wrong key.

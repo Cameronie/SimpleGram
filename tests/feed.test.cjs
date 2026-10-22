@@ -674,3 +674,19 @@ test('feed: paging past posts already seen stops after 15 pages, not 40', async 
   }, timeline([edge({ media: media('SEEN001', user('a', true)) })]));
   assert.deepEqual(flags, Array(14).fill(true).concat([false, false]));
 });
+
+test('feed: a Home page that lands while a Story is open still counts as seen on Home', async () => {
+  const pg = await open('https://www.instagram.com/', FEED_HTML);
+  await parse(pg, page([friend('HOME001')]));
+  await pg.evaluate(() => history.pushState(null, '', '/stories/friend/3700000000000000001/'));
+  const out = await parse(pg, page([friend('HOME002'), friend('HOME003')]));
+  assert.deepEqual(keys(out), ['HOME002', 'HOME003'], 'still Home\'s own page');
+  await pg.evaluate(() => history.back());
+  await pg.waitForFunction(() => location.pathname === '/');
+  await Promise.all([
+    pg.waitForURL('https://www.instagram.com/?variant=following'),
+    pg.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' })),
+  ]);
+  const f = await parse(pg, page([friend('HOME001'), friend('HOME002'), friend('HOME003'), friend('NEW0001')]));
+  assert.deepEqual(keys(f), ['NEW0001']);
+});

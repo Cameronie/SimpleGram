@@ -27,6 +27,9 @@ final class CommentsPanel extends LinearLayout {
     private final float density;
     private String url;
     private boolean open;
+    private GradientDrawable sheet;
+    private GradientDrawable pill;
+    private TextView close;
 
     @SuppressLint("ClickableViewAccessibility")
     CommentsPanel(Context context, WebView web, boolean dark, Host host) {
@@ -39,7 +42,7 @@ final class CommentsPanel extends LinearLayout {
         int bg = dark ? Color.BLACK : Color.WHITE;
         int fg = dark ? Color.WHITE : Color.BLACK;
 
-        GradientDrawable sheet = new GradientDrawable();
+        sheet = new GradientDrawable();
         sheet.setColor(bg);
         float r = 14 * density;
         sheet.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
@@ -50,14 +53,14 @@ final class CommentsPanel extends LinearLayout {
         // Header: drag handle, title and close button.
         FrameLayout header = new FrameLayout(context);
         View handle = new View(context);
-        GradientDrawable pill = new GradientDrawable();
+        pill = new GradientDrawable();
         pill.setColor(dark ? 0x66FFFFFF : 0x40000000);
         pill.setCornerRadius(2 * density);
         handle.setBackground(pill);
         FrameLayout.LayoutParams hp = new FrameLayout.LayoutParams(dp(36), dp(4), Gravity.CENTER_HORIZONTAL | Gravity.TOP);
         hp.topMargin = dp(8);
         header.addView(handle, hp);
-        TextView close = new TextView(context);
+        close = new TextView(context);
         close.setText("✕");
         close.setTextColor(fg);
         close.setTextSize(18);
@@ -112,9 +115,20 @@ final class CommentsPanel extends LinearLayout {
         }
     }
 
+    /** Follows the phone's light/dark setting while the app is open. */
+    void setDark(boolean dark) {
+        sheet.setColor(dark ? Color.BLACK : Color.WHITE);
+        pill.setColor(dark ? 0x66FFFFFF : 0x40000000);
+        close.setTextColor(dark ? Color.WHITE : Color.BLACK);
+        web.setBackgroundColor(dark ? Color.BLACK : Color.WHITE);
+    }
+
     void close() {
         if (!open) return;
         open = false;
+        // Navigated inside the panel (to a profile): the next open reloads the comments.
+        String current = web.getUrl();
+        if (web.canGoBack() && current != null && !current.equals(url)) url = null;
         web.evaluateJavascript("document.querySelectorAll('video').forEach(v=>v.pause())", null);
         animate().translationY(getHeight()).setDuration(200).withEndAction(() -> setVisibility(GONE)).start();
     }

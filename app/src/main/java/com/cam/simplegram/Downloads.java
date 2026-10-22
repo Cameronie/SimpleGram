@@ -65,7 +65,12 @@ final class Downloads {
         if (userAgent != null) r.addRequestHeader("User-Agent", userAgent);
         r.addRequestHeader("Referer", Links.HOME);
         DownloadManager dm = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);
-        pending.add(dm.enqueue(r));
+        try {
+            pending.add(dm.enqueue(r));
+        } catch (RuntimeException e) {
+            // Android's Download Manager is disabled or restricted on this phone.
+            return false;
+        }
         return true;
     }
 
