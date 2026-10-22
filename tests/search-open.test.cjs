@@ -423,3 +423,63 @@ test('B14: Back while a full load after a stuck router is on its way also return
   await waitResults(page);
   assert.equal(await loads(page), 1, 'the load was called off');
 });
+
+/* ---------------- 1.2 review fixes ---------------- */
+
+test('B14: after a result opens through a full page load, Back shows the results and the app knows search is open', async () => {
+  // Instagram turns the router push into a full page load (e.g. after a deploy).
+  const page = await start({ exposeRequire: true, forceReload: true, docDelay: 600 });
+  await showPosts(page);
+  await tapCell(page);
+  await page.waitForFunction(() => +sessionStorage.getItem('loads') === 2, null, { timeout: 20000 });
+  await waitPostShown(page);
+  await page.goBack();
+  // A new document: search comes back from its saved state.
+  await page.waitForFunction(() => { const h = document.getElementById('sg-search'); return h && h.style.display !== 'none' && h.shadowRoot.querySelectorAll('.cell').length === 2; }, null, { timeout: 15000 });
+  // 'ready' resets the app's searchOpen, so search must be announced after it.
+  const order = await page.evaluate(() => window.__sent.filter(m => m.action === 'ready' || m.action === 'search')
+    .map(m => m.action === 'search' ? 'search:' + m.open : 'ready'));
+  assert.equal(order[order.length - 1], 'search:true', order.join(','));
+  assert.ok(order.includes('ready'));
+});
+
+test('B14: an open called off with two Backs does not complete by itself when Instagram answers late', async () => {
+  const page = await start({ exposeRequire: true, fetchMs: 3000, renderMs: 300 });
+  await showPosts(page);
+  await tapCell(page);
+  await sleep(150);
+  assert.equal(await page.evaluate(() => window.__sg.back()), true);
+  await waitResults(page);
+  assert.equal(await page.evaluate(() => window.__sg.back()), true);
+  assert.equal(await searchUp(page), false, 'the second Back closes search');
+  await sleep(4500);   // Instagram's route answer arrives and it pushes the post
+  assert.equal(await page.evaluate(() => location.pathname), '/');
+  await page.waitForFunction(() => document.querySelector('main').textContent.startsWith('HOME'));
+});
+
+test('B14: after Back during the spinner, tapping another result opens it', async () => {
+  const page = await start({ exposeRequire: true, fetchMs: 2500, renderMs: 500 });
+  await showPosts(page);
+  const t0 = await tapCell(page, 0);
+  await sleep(200);
+  assert.equal(await page.evaluate(() => window.__sg.back()), true);
+  await waitResults(page);
+  await tapCell(page, 1);
+  await sleep(300);
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-search').shadowRoot.querySelector('.wrap.leaving')), true, 'the cover is up');
+  await waitPostShown(page, /KEYW002/);
+  assert.equal((await frames(page, t0)).filter(homeShowing).length, 0, 'Home never shows on its own');
+  await page.goBack();
+  await waitResults(page);
+});
+
+test('B14: from a profile\'s Reels tab, tapping that account opens at once (no spinner, no reload)', async () => {
+  const page = await start({ start: '/sanjosesharks/reels/', exposeRequire: true, sameHeader: true, fetchMs: 300, renderMs: 400 });
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
+  const t0 = Date.now();
+  await shadowClick(page, 'sanjosesharks');
+  await page.waitForFunction(() => { const h = document.getElementById('sg-search'); return !(h && h.style.display !== 'none'); }, null, { timeout: 5000 });
+  assert.ok(Date.now() - t0 < 2000, 'no 8 s spinner');
+  assert.equal(await loads(page), 1, 'no full reload');
+  assert.equal((await opens(page)).samePage, 1);
+});

@@ -530,7 +530,7 @@
     const seenCodes = skipping();
     const onHome = route() === 'home' && feedVariant() === 'home';
     const kept = [];
-    let keptMedia = 0, alreadySeen = 0;
+    let keptMedia = 0, alreadySeen = 0, lastKept = null;
     verdicts.forEach((x, i) => {
       stats.feed.seen++;
       const code = x.media ? edgeCode(list[i]) : null;
@@ -540,12 +540,14 @@
         kept.push(list[i]);
         if (x.media) {
           keptMedia++;
+          if (code) lastKept = code;
           if (home && x.follow === null) stats.feed.followUnknown = (stats.feed.followUnknown || 0) + 1;
           if (onHome && code) { homeSeen.add(code); if (homeSeen.size > 4000) homeSeen.delete(homeSeen.values().next().value); }
         }
       }
       if (ctx) noteUnit(list[i], x.drop ? x.reason : 'kept', ctx);
     });
+    if (lastKept) fs.lastKeptCode = lastKept;
     if (onHome && keptMedia > 0) fs.homePages++;
     stats.feed.kept += keptMedia;
     stats.feed.lastPageKept = keptMedia;
@@ -553,8 +555,10 @@
     const more = hasMore(owner);
     if (keptMedia === 0 && more) {
       if (alreadySeen > 0) {
-        // Paging past posts you already saw in Home: keep going (a while).
-        if (++fs.seenStreak >= 15) { stopPagination(owner); endFeed(fs); }
+        // Paging past posts you already saw in Home: each comes once in Following,
+        // so allow about as many pages as Home showed (12 a page), within limits.
+        const cap = Math.min(60, Math.max(15, Math.ceil(seenCodes.size / 10)));
+        if (++fs.seenStreak >= cap) { stopPagination(owner); endFeed(fs); }
       } else if (++fs.emptyStreak >= 4) {
         stopPagination(owner); stats.feed.stopped++; endFeed(fs);
       }
@@ -673,8 +677,22 @@
 
   const INTEREST = /"(?:edges|items|feed_items|reels|reels_media|image_versions2|video_versions|ad_id|injected|suggested_users|sectional_items|media_grid|users)"|chaining|ayml|explore_grid|injected_/;
   const nativeParse = JSON.parse;
+  // Diagnostics: Instagram's "please wait" throttling answers, which often
+  // come with an ordinary status. Counted once stats.diag exists; never throws.
+  function noteThrottle(o) {
+    try {
+      if (!o || typeof o !== 'object' || !stats.diag) return;
+      const m = typeof o.message === 'string' ? o.message : '';
+      const errs = Array.isArray(o.errors) ? o.errors : null;
+      if ((o.status === 'fail' && (/please wait|try again|rate limit/i.test(m) || o.spam === true || m === 'feedback_required')) ||
+          (errs && errs.some(e => e && (/rate limit|please wait/i.test(String(e.message || '')) || e.code === 1675004 && /rate/i.test(String(e.summary || '')))))) {
+        stats.diag.pleaseWait++;
+      }
+    } catch (e) { /* never throw into Instagram */ }
+  }
   const wrappedParse = function parse(text, reviver) {
     const out = nativeParse.apply(this, arguments);
+    if (out && typeof out === 'object' && (out.status === 'fail' || out.errors)) noteThrottle(out);
     if (typeof text === 'string' && text.length > 150 && out && typeof out === 'object' && INTEREST.test(text)) {
       try { cleanse(out, 'parse'); } catch (e) { stats.errors++; }
     }
@@ -686,7 +704,7 @@
     const nativeJson = Response.prototype.json;
     Response.prototype.json = function json() {
       return nativeJson.apply(this, arguments).then(out => {
-        if (out && typeof out === 'object') { try { cleanse(out, 'fetch'); } catch (e) { stats.errors++; } }
+        if (out && typeof out === 'object') { noteThrottle(out); try { cleanse(out, 'fetch'); } catch (e) { stats.errors++; } }
         return out;
       });
     };
@@ -702,6 +720,7 @@
           const out = desc.get.call(this);
           if (this.responseType === 'json' && out && typeof out === 'object' && !done.has(out)) {
             done.add(out);
+            noteThrottle(out);
             try { cleanse(out, 'xhr'); } catch (e) { stats.errors++; }
           }
           return out;
@@ -781,7 +800,6 @@
     const fs = currentFeed();
     const onHome = route() === 'home' && feedVariant() === 'home';
     const searching = typeof search !== 'undefined' && search.open;
-    endRoom(onHome && fs.ended);
     let show = false, stalled = false;
     if (onHome && !searching) {
       const se = document.scrollingElement || document.documentElement;
@@ -797,6 +815,7 @@
     } else {
       atBottomSince = 0;
     }
+    endRoom(onHome && (fs.ended || stalled));
     const end = fs.caughtUp && fs.endText;
     const msg = { on: show, caughtUp: !!fs.caughtUp, stalled: stalled,
       title: end ? fs.endText.title : '', subtitle: end ? fs.endText.subtitle : '' };
@@ -899,15 +918,15 @@
     if (close && !close.dataset.sgClicked) { close.dataset.sgClicked = '1'; try { close.click(); } catch (e) { /* ignore */ } }
     if (hide(el, 'banner')) stats.dom.banners++;
   }
-  // Page walks skip posts and anything SimpleGram hid: Home's feed can stay
-  // mounted under Stories, and walking all of it there made Stories slow.
+  // The Story check's walk skips posts and anything SimpleGram hid: Home's feed
+  // can stay mounted under Stories, and walking all of it there made Stories slow.
   function walkOutsidePosts(show, want) {
     return document.createTreeWalker(document.body, show, { acceptNode: n =>
       n.nodeType === 1 && (n.tagName === 'ARTICLE' || n.hasAttribute('data-sg-hidden')) ? NodeFilter.FILTER_REJECT
         : want(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP });
   }
   function tidyBanners() {
-    const walker = walkOutsidePosts(NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, n => n.nodeType === 3);
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let n, guard = 0;
     while ((n = walker.nextNode()) && guard++ < 20000) {
       const t = n.nodeValue;
@@ -1014,9 +1033,19 @@
   // Hiding is only safe with a stop: several labelled posts in a row at the
   // end of Home means Instagram is paging through suggestions that all get
   // hidden, which never ends. Home ends there instead.
+  // Instagram's list draws the posts after a hidden one only once it has
+  // measured it, so the run must reach the last post Home has loaded, not
+  // just the last one drawn.
+  function atLoadedEnd(a, fs) {
+    const t = a && a.querySelector('a[href] time');
+    const l = t && t.closest('a[href]');
+    const m = l && /\/(?:p|reel)\/([^/?#]+)/.exec(l.getAttribute('href') || '');
+    return !m || !fs.lastKeptCode || m[1] === fs.lastKeptCode;
+  }
   function checkHiddenRun() {
-    let run = 0, any = 0, longest = 0;
+    let run = 0, any = 0, longest = 0, last = null;
     for (const a of document.querySelectorAll(POST)) {
+      last = a;
       const why = a.dataset.sgHidden;
       any = why ? any + 1 : 0;
       run = why === 'suggested' || why === 'ads' ? run + 1 : 0;
@@ -1024,7 +1053,7 @@
     }
     stats.feed.hiddenRun = Math.max(stats.feed.hiddenRun || 0, longest);
     const fs = currentFeed();
-    if (run >= 4 && feedVariant() === 'home' && fs.key === 'home' && !fs.ended) {
+    if (run >= 4 && feedVariant() === 'home' && fs.key === 'home' && !fs.ended && atLoadedEnd(last, fs)) {
       endFeed(fs);
       stats.feed.domStop = (stats.feed.domStop || 0) + 1;
       setTimeout(safe(checkFeedEnd), 0);
@@ -1238,6 +1267,7 @@
       // back to the marked entry keeps it up too.
       const backToSearch = !!(history.state && history.state.sgSearch && history.state.sgSearch === search.token);
       if (leaving) safe(leavingRouteChanged)();
+      else if (calledOff && safe(lateArrival)()) { /* undone unseen */ }
       else if (search.open && !backToSearch) { hideSearch(false); search.suspended = false; clearSaved(); }
       restoreSearch();
       if (route() === 'explore' && !search.open && !search.suspended) openSearch(true);
@@ -1611,8 +1641,16 @@
 
   // The Instagram website's own GraphQL requests. Their ids change every few
   // weeks, so they are looked up in the page's loaded code at run time.
+  // A module that isn't defined is reported to Instagram's error logging, so
+  // each missing name is asked for once per page (until a bundle defines it).
+  const igMiss = new Set();
   function igModule(name) {
-    try { return typeof window.require === 'function' ? window.require(name) : null; } catch (e) { return null; }
+    if (igMiss.has(name)) return null;
+    try {
+      const m = typeof window.require === 'function' ? window.require(name) : null;
+      if (m == null) igMiss.add(name);
+      return m;
+    } catch (e) { igMiss.add(name); return null; }
   }
   const docIds = {}, idSource = {};
   // Ids in Instagram's website code (bundles fetched 2026-10-21), used only
@@ -1647,8 +1685,9 @@
     const ops = /__d\("([A-Za-z0-9_]+)_instagramRelayOperation",\[\],\(function\([^)]*\)\{[^}]*?exports="(\d+)"/g;
     const mods = /__d\("([A-Za-z0-9_]+)\.graphql",\[([^\]]*)\]/g;
     let m;
-    while ((m = ops.exec(text))) scanned.ops[m[1]] = m[2];
+    while ((m = ops.exec(text))) { scanned.ops[m[1]] = m[2]; igMiss.delete(m[1] + '_instagramRelayOperation'); }
     while ((m = mods.exec(text))) {
+      igMiss.delete(m[1] + '.graphql');
       const pv = [];
       const deps = /"([A-Za-z0-9_]+)\.relayprovider"/g;
       let d;
@@ -1678,16 +1717,17 @@
     return (docIds[name] = id);
   }
   // Order: this page's memo, the page's own modules, its script files, then KNOWN.
-  async function docIdFor(name) {
+  async function docIdFor(name, p) {
     if (docIds[name]) return docIds[name];
     const op = igModule(name + '_instagramRelayOperation');
     if (typeof op === 'string' && /^\d+$/.test(op)) return keepId(name, op, 'module');
-    const p = gqlParams(name);
     if (p && /^\d+$/.test(String(p.id))) return keepId(name, String(p.id), 'graphql');
     if (!scanned.ops[name]) await scanBundles(name);
     if (scanned.ops[name]) return keepId(name, scanned.ops[name], 'scan');
+    // Remembered like the others; a failed request clears it so Try again looks again.
+    if (KNOWN_DOC_IDS[name]) return keepId(name, KNOWN_DOC_IDS[name], 'known');
     idSource[name] = 'known';
-    return KNOWN_DOC_IDS[name] || null;
+    return null;
   }
   // Settings named in an error answer, remembered per query for this page.
   const addedPv = {};
@@ -1700,10 +1740,9 @@
   }
   // The query's declared settings with the values Instagram's page uses:
   // from its compiled module, else its script file, else KNOWN_PV (false).
-  function providedVars(name) {
+  function providedVars(name, p) {
     const out = {};
     let source = 'none';
-    const p = gqlParams(name);
     if (p) {
       source = 'graphql';
       const pvs = p.providedVariables;
@@ -1748,10 +1787,10 @@
   // Returns data[root] (the answer's main object), or null. At most 2 POSTs.
   async function igGraphQL(name, variables, root) {
     try {
-      const id = await docIdFor(name);
-      if (!id) return null;
       const params = gqlParams(name);
-      const pv = providedVars(name);
+      const id = await docIdFor(name, params);
+      if (!id) return null;
+      const pv = providedVars(name, params);
       // The caller's variables in its order, then the settings, as the website sends them.
       const vars = Object.assign({}, variables);
       for (const k in pv.vars) if (!(k in vars)) vars[k] = pv.vars[k];
@@ -1786,6 +1825,11 @@
           if (res.ok) { text = await res.text(); data = parseIg(text); }
         } catch (e) { note.message = 'network error'; }
         note.ms = Date.now() - t0;
+        if (res && (res.status === 429 || res.status === 401 || res.status === 403)) {
+          note.message = 'refused (HTTP ' + res.status + ')';
+          gqlNote(note);
+          break;                            // the other path would be refused too
+        }
         if (!data || typeof data !== 'object') {
           if (res && res.ok) note.message = 'unreadable answer';
           gqlNote(note);
@@ -2305,7 +2349,10 @@
         if (m) m.rest = true;
         return { media: media, more: m };
       }
-      markDead('tags/web_info');            // gone or empty: keyword results from now on
+      // Gone (404) or answering without a top list: keyword results from now on.
+      // A network blip, a 429 or a 5xx is not remembered.
+      const code = meta.status || 0;
+      if (code === 404 || (code >= 200 && code < 300 && !top)) markDead('tags/web_info');
     }
     // What the website itself shows for a hashtag now.
     if (!cursor) searchStats.tagGrid.keyword++;
@@ -2680,7 +2727,7 @@
     const res = await loadPosts(q, more ? st.more : null);
     if (seq !== search.seqPosts || search.posts !== st) return;
     st.loading = false;
-    if (!res) { if (!st.media.length) st.error = true; }
+    if (!res) { if (!st.media.length) st.error = true; else st.more = null; }   // a failed Show more ends the list
     else {
       const had = st.media.length;
       st.media = addNew(st.media, slim(res.media));
@@ -2695,25 +2742,27 @@
     let st = search.grid;
     if (!more || !st) st = search.grid = { media: [], more: null, pages: 0, loading: true };
     else { if (!st.more || st.loading) return; st.loading = true; }
-    render();
+    // Show more refills only the grid, so the list keeps its scroll position.
+    const draw = () => { if (more && search.body) renderGrid(search.body, st, () => runGrid(true), null); else render(); };
+    draw();
     const seq = ++search.seqGrid;
     const res = await loadTagOrPlace(v, more ? st.more : null);
     if (seq !== search.seqGrid || search.grid !== st || search.view !== v) return;
     st.loading = false;
-    if (!res) { if (!st.media.length) st.error = true; }
+    if (!res) { if (!st.media.length) st.error = true; else st.more = null; }   // a failed Show more ends the list
     else {
       const had = st.media.length;
       st.media = addNew(st.media, slim(res.media));
       st.more = st.media.length > had ? res.more : null;     // a page that adds nothing ends the list
       st.pages++; st.noRecent = !!res.noRecent; st.unordered = !!res.unordered;
     }
-    render();
+    draw();
   }
 
   // Open a profile/post from search. Try Instagram's in-app navigation;
   // if Instagram doesn't draw the new page, load it normally. Back to the
   // page search was opened from brings search back as you left it.
-  let openTimer = 0, syntheticPop = false, leaving = null;
+  let openTimer = 0, syntheticPop = false, leaving = null, calledOff = null;
   function pageSig() {
     const m = document.querySelector('main') || document.body;
     let txt = '';
@@ -2818,10 +2867,20 @@
   // Search stays on screen (dimmed, with a spinner) until Instagram has drawn
   // the new page, so whatever is underneath (usually Home) never shows in between.
   function openPath(path) {
-    if (leaving) return;                      // one open at a time
+    if (leaving) {
+      // Back was pressed during the spinner and the results are showing:
+      // a tap on another result replaces the called-off open.
+      if (!leaving.abandoned || here() !== leaving.from) return;   // one open at a time
+      endOpen();
+      countOpen('cancelled');
+    }
     const target = new URL(path, location.href);
     if (target.origin !== location.origin) { location.assign(target.href); return; }
-    if (target.pathname + target.search === here()) return openSamePage(path);
+    // The same page, or another tab (Reels, Tagged) of the same profile:
+    // what is under the cover is that profile already.
+    const tp = target.pathname, lp = location.pathname;
+    if (target.pathname + target.search === here() ||
+        (/^\/[^/]+\/$/.test(tp) && lp.startsWith(tp) && /^(?:reels|tagged)\/?$/.test(lp.slice(tp.length)))) return openSamePage(path);
     markSearch();
     if (search.body) search.lastScroll = search.body.scrollTop;
     saveSearch();
@@ -2891,12 +2950,32 @@
   }
   // The open is over (or called off): no watcher, no cover.
   function endOpen() {
+    const l = leaving;
+    // Called off before Instagram switched: its router may still finish the
+    // open later; that late arrival is undone (lateArrival).
+    calledOff = l && here() === l.from ? { path: l.path, from: l.from, until: Date.now() + 10000 } : null;
     leaving = null;
     clearTimeout(openTimer);
     coverSearch(false);
   }
+  function sameTarget(a, b) {
+    const code = p => { const m = /\/(?:p|reel|reels|tv)\/([^/?#]+)/.exec(p); return m ? m[1] : p; };
+    return code(a) === code(b);
+  }
+  // Instagram finished an open that was called off: step back unseen.
+  function lateArrival() {
+    const c = calledOff;
+    if (Date.now() > c.until) { calledOff = null; return false; }
+    if (here() === c.from) return false;
+    calledOff = null;
+    if (!sameTarget(here(), c.path)) return false;
+    countOpen('cancelled');
+    setTimeout(() => history.back(), 0);
+    return true;
+  }
   function settle() {
     const l = leaving;
+    calledOff = null;
     leaving = null;
     clearTimeout(openTimer);
     opens.lastMs = Date.now() - l.at;
@@ -2922,7 +3001,7 @@
     const moved = here() !== l.from;
     const drawn = moved && !busy && pageSig() !== l.before;
     if (drawn && !l.drawnAt) l.drawnAt = now;
-    if (l.via === 'router' && !l.sawBusy && !l.ack && !moved && !busy && !l.abandoned) {
+    if (l.via === 'router' && !l.sawBusy && !l.ack && !moved && !busy && !l.abandoned && !l.docNav) {
       // Instagram's router didn't take the push (nothing started): the older way.
       if (popOpen()) armWatch(100);
       return;
@@ -2956,8 +3035,11 @@
     if (search.open && history.state && history.state.sgSearch === search.token) dropMark();
   }));
   // Our own full load may still be on its way: call it off too.
+  // Instagram may also have started a full load itself (beforeunload): only
+  // then, never for a router navigation, whose requests window.stop() would abort.
+  window.addEventListener('beforeunload', safe(() => { if (leaving) leaving.docNav = true; }));
   function stopFullLoad(l) {
-    if (l.via === 'fullLoad') { try { window.stop(); } catch (e) { /* ignore */ } }
+    if (l.via === 'fullLoad' || l.docNav) { try { window.stop(); } catch (e) { /* ignore */ } }
   }
   // The open is called off for the page search was opened over: close search as before.
   function cancelToOrigin() {
@@ -2980,6 +3062,7 @@
   // underneath (usually Home) may not change the address at all, so the tap
   // itself calls the open off; Instagram then handles the tap as usual.
   window.addEventListener('click', safe(e => {
+    if (!leaving && e.isTrusted) calledOff = null;   // a later tap of yours is never undone
     if (!leaving || !e.isTrusted || !(e.target instanceof Element)) return;
     const a = e.target.closest('a[href]');
     if (!a) return;
@@ -3103,7 +3186,7 @@
    * Instagram is slowing requests down, and long main-thread stalls.
    * Counts and timings only; everything is passive (no requests, no shims).
    * ------------------------------------------------------------------ */
-  const diag = (stats.diag = { storyMs: [], storyVideos: 0, s429: 0, s5xx: 0, longTasks: 0, longestTask: 0 });
+  const diag = (stats.diag = { storyMs: [], storyVideos: 0, s429: 0, s5xx: 0, pleaseWait: 0, longTasks: 0, longestTask: 0 });
   let storyStart = 0;
   function storyOpened() {
     storyStart = performance.now();
@@ -3204,6 +3287,7 @@
     new MutationObserver(records => { safe(hideAddedPosts)(records); queueTidy(); })
       .observe(document.documentElement, { childList: true, subtree: true });
     post('ready', { url: location.href, route: route() });
+    if (search.open) post('search', { open: true });   // 'ready' clears the app's searchOpen
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', safe(start), { once: true });
   else safe(start)();

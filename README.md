@@ -79,7 +79,7 @@ went and how long Stories took to load. **Copy details** copies the counts and d
 
 ## Limits
 
-- Tested against fixture data shaped like Instagram's (116 browser tests), checked against
+- Tested against fixture data shaped like Instagram's (124 browser tests), checked against
   the code of Instagram's current website, and on an Android 10 emulator (9 native tests).
   It is not tested against a signed-in Instagram account, so your phone is the real test.
 - Instagram's website, not the app: calls, music on Stories, and some posting features

@@ -23,6 +23,8 @@
       const video = CFG.reelVideo && m[1] === 'reel' ? '<video id="rv" muted playsinline style="display:block;width:400px;height:700px"></video>' : '';
       return { title: 'Post ' + m[2], html: '<article>POST ' + m[2] + '<img src="https://scontent.cdninstagram.com/v/' + m[2] + '_n.jpg" width="300" height="300">' + video + '</article>' };
     }
+    // A profile whose tabs share the title and the first 400 characters (a long header).
+    if (CFG.sameHeader) { const u = p.split('/')[1]; return { title: 'Profile ' + u, html: '<div>OTHER /' + u + '/ header ' + 'x'.repeat(400) + '</div><div>' + p + '</div>' }; }
     return { title: 'Other ' + p, html: '<div>OTHER ' + p + '</div>' };
   }
   function render(p) {
@@ -42,6 +44,8 @@
   async function go(url, opts) {
     opts = opts || {};
     window.__goCalls = (window.__goCalls || 0) + 1;
+    // Instagram's forced full loads (ClientConsistency refresh, navigation_limit): goForceFullPageRedirectTo.
+    if (CFG.forceReload && loads === 1 && opts.navigationType !== 'popstate') { status = 'GOIMPL_TRIGGERED'; if (opts.replace) location.replace(url); else window.location = url; return; }
     const nav = ++latest;                 // a newer navigation replaces a pending one
     status = 'GOIMPL_TRIGGERED';
     await wait(0);

@@ -33,3 +33,14 @@ test('diagnostics: the status report carries counts only', async () => {
   for (const key of ['storyMs', 's429', 's5xx', 'longTasks', 'longestTask']) assert.ok(key in stats.diag, key);
   assert.doesNotMatch(JSON.stringify(stats.diag), /instagram\.com|friend/);
 });
+
+test('diagnostics: Instagram\'s "please wait" answers are counted, whichever way they are read', async () => {
+  const body = { message: 'Please wait a few minutes before you try again.', status: 'fail' };
+  const page = await open('https://www.instagram.com/', BLANK, { api: { '/api/v1/feed/x/': () => ({ status: 400, body }) } });
+  await page.evaluate(b => JSON.parse(JSON.stringify(b)), body);
+  await page.evaluate(() => fetch('/api/v1/feed/x/').then(r => r.json()));
+  // Ordinary answers and GraphQL errors that aren't throttling are not counted.
+  await page.evaluate(() => JSON.parse('{"status":"ok","items":[]}'));
+  await page.evaluate(() => JSON.parse('{"errors":[{"message":"execution error","code":1675004}],"data":null}'));
+  assert.equal(await page.evaluate(() => window.__sg.stats.diag.pleaseWait), 2);
+});

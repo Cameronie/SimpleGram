@@ -306,6 +306,36 @@ test('search data: at most 2 POSTs per request; never /graphql/query after Insta
   assert.equal(s.log.filter(r => r.path === '/graphql/query').length, 0);
 });
 
+test('search data: a throttled or refused request (429/401/403) is not resent to the other path', async () => {
+  const s = site({ users: [NBA], status: 429 });
+  const { page } = await start(s.api);
+  await query(page, 'nba');
+  await waitText(page, 'Try again');
+  assert.deepEqual(s.log.map(r => r.path), ['/api/graphql']);
+});
+
+test('search data: Show more keeps the place grid where you scrolled, and a failed page ends the list', async () => {
+  const many = Array.from({ length: 30 }, (_, i) => 'PLCE' + String(i).padStart(3, '0'));
+  const state = { fail: false };
+  const s = site({ place: many, placeMore: 'cur1', placeNext: ['PLCX001'],
+    answers: { PolarisLocationPageTabContentQuery_connection: () => (state.fail ? null
+      : { edges: [{ node: keywordGrid(['PLCX001']).edges[1].node.items[0] }], page_info: { has_next_page: true, end_cursor: 'cur2' } }) } });
+  const { page } = await start(Object.assign(s.api, placesApi(HYATT)));
+  await query(page, 'hyatt');
+  await openPlace(page);
+  await waitCells(page, 30);
+  const before = await page.evaluate(() => { const b = document.getElementById('sg-search').shadowRoot.querySelector('.body'); b.scrollTop = b.scrollHeight; return b.scrollTop; });
+  assert.ok(before > 0);
+  await shadowClick(page, 'Show more');
+  await waitCells(page, 31);
+  const after = await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelector('.body').scrollTop);
+  assert.ok(after >= before - 2, `kept ${after} of ${before}`);
+  state.fail = true;
+  await shadowClick(page, 'Show more');
+  await page.waitForFunction(() => !document.getElementById('sg-search').shadowRoot.textContent.includes('Show more'));
+  assert.equal(await page.evaluate(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length), 31);
+});
+
 test('search data: Try again asks once more, and the diagnostics record each try without the search words', async () => {
   const state = { fail: true };
   const s = site({ users: [NBA], answers: { PolarisKeywordSearchExplorePageRelayQuery: () => (state.fail ? null : keywordGrid(['KEYW001'], null)) } });

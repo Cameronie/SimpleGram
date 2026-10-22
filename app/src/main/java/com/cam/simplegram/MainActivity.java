@@ -96,6 +96,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private TextView feedSub;
     private boolean feedWanted;
     private boolean searchOpen;
+    private boolean restarting;
     private View screenshotShield;
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
@@ -313,6 +314,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
         @Override
         public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+            // Both WebViews share the renderer and each reports it: act once.
+            if (restarting) return true;
+            restarting = true;
             // The page's renderer stopped; start over with fresh views rather than crash.
             // Remembered for Filter status (the page's own counts are lost with it).
             prefs.edit().putInt("rendererGone", prefs.getInt("rendererGone", 0) + 1)
@@ -1095,9 +1099,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 for (int i = 0; i < n; i++) {
                     JSONObject e = log.optJSONObject(i);
                     if (e == null) continue;
-                    if (e.has("code") || e.optInt("status") != 200) {
+                    if (e.has("code") || e.has("message") || e.optInt("status") != 200) {
                         failed++;
-                        lastFail = e.optString("query") + " " + e.optString("code", String.valueOf(e.optInt("status")));
+                        String why = e.has("code") ? e.optString("code")
+                                : e.optInt("status") != 200 ? String.valueOf(e.optInt("status"))
+                                : e.optString("message");
+                        lastFail = e.optString("query") + " " + why;
                     }
                 }
                 b.append("  Requests: ").append(n).append(" (").append(failed).append(" failed)\n");
@@ -1114,7 +1121,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             JSONArray ms = dg.optJSONArray("storyMs");
             b.append("\nSpeed\n")
                     .append("  Stories took: ").append(ms == null || ms.length() == 0 ? "not opened yet" : ms.toString().replace(",", ", ") + " ms").append('\n')
-                    .append("  Instagram slow-downs: ").append(dg.optInt("s429"))
+                    .append("  Instagram slow-downs: ").append(dg.optInt("s429") + dg.optInt("pleaseWait"))
                     .append(" · server errors: ").append(dg.optInt("s5xx")).append('\n')
                     .append("  Page stalls: ").append(dg.optInt("longTasks"))
                     .append(" (longest ").append(dg.optInt("longestTask")).append(" ms)\n");
@@ -1135,7 +1142,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         JSONObject device = deviceDiagnostics();
         b.append("\nApp\n")
                 .append("  WebView: ").append(device.optString("webView")).append('\n')
-                .append("  Memory warnings: ").append(trimLog.isEmpty() ? "none" : String.join(", ", trimLog)).append('\n')
+                .append("  Android memory callbacks: ").append(trimLog.isEmpty() ? "none" : String.join(", ", trimLog)).append('\n')
                 .append("  Page restarts: ").append(device.optInt("rendererGone"));
         String last = device.optString("rendererGoneLast");
         if (!last.isEmpty()) b.append(" (last: ").append(last).append(')');
@@ -1368,13 +1375,17 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         comments.web().onResume();
     }
 
-    // Android's memory warnings since the app started, newest last (Filter status).
-    private final ArrayList<String> trimLog = new ArrayList<>();
+    // Android's memory callbacks since the app started, newest last (Filter status).
+    // Static so they survive the recreate() after the renderer is lost.
+    private static final ArrayList<String> trimLog = new ArrayList<>();
 
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        trimLog.add(level + " at " + clock());
+        if (level == TRIM_MEMORY_UI_HIDDEN) return;   // only "the app left the screen"
+        String name = level >= 80 ? "complete" : level >= 60 ? "moderate" : level >= 40 ? "background"
+                : level >= 15 ? "critical" : level >= 10 ? "low" : "running moderate";
+        trimLog.add(name + " at " + clock());
         if (trimLog.size() > 10) trimLog.remove(0);
     }
 

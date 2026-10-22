@@ -371,6 +371,7 @@ test('feed end: when nothing arrives for 15 s at the bottom, the card says Home 
   assert.equal(m.on, true);
   assert.equal(m.stalled, true);
   assert.equal(m.caughtUp, false);
+  assert.equal(await pg.evaluate(() => !!document.getElementById('sg-end-room')), true, 'room under the last post');
   // A page arriving takes it away again.
   await deliver(pg, page([friend('LATE001')]));
   await pg.clock.runFor(400);
@@ -444,7 +445,8 @@ test('backup filter: a label Instagram draws a moment after the post is still ca
 
 test('backup filter: four hidden suggestions in a row at the end of Home end it', async () => {
   const pg = await open('https://www.instagram.com/', FEED_HTML);
-  await deliver(pg, page([friend('FRIEND1'), friend('FRIEND2')], { cursor: 'c1' }));
+  // Posts the data layer can't judge (no follow info) that Instagram labels on screen.
+  await deliver(pg, page([friend('FRIEND1'), friend('FRIEND2'), noInfo('SUGG001'), noInfo('SUGG002'), noInfo('ADPOST1'), noInfo('SUGG003')], { cursor: 'c1' }));
   const add = list => pg.evaluate(html => document.getElementById('feed').insertAdjacentHTML('beforeend', html), list.join(''));
   await add([article('SUGG001', 'Suggested for you'), article('SUGG002', 'Suggested for you'), article('ADPOST1', 'Sponsored')]);
   await pg.waitForTimeout(100);
@@ -463,6 +465,18 @@ test('backup filter: four hidden suggestions in a row at the end of Home end it'
   assert.equal(conn(out).page_info.has_next_page, false);
 });
 
+test('backup filter: a hidden run that is not the end of what Home loaded does not end it', async () => {
+  const pg = await open('https://www.instagram.com/', FEED_HTML);
+  // Four labelled posts, then friends Instagram has loaded but not drawn yet.
+  await deliver(pg, page([friend('FRIEND1'), noInfo('SUGG001'), noInfo('SUGG002'), noInfo('SUGG003'), noInfo('SUGG004'),
+    friend('FRIEND2'), friend('FRIEND3')], { cursor: 'c1' }));
+  await pg.evaluate(html => document.getElementById('feed').insertAdjacentHTML('beforeend', html),
+    [article('SUGG001', 'Suggested for you'), article('SUGG002', 'Suggested for you'), article('SUGG003', 'Suggested for you'), article('SUGG004', 'Suggested for you')].join(''));
+  await pg.waitForTimeout(150);
+  assert.equal((await feedState(pg)).ended, false);
+  assert.equal((await feedStats(pg)).domStop || 0, 0);
+});
+
 // Instagram's Home list keeps only a window of posts mounted, reserves room for
 // posts it hasn't drawn yet, and asks for the next page when the end comes near
 // (a port of PolarisIGVirtualList/PolarisSizeCache/PolarisBatchDOM). 1.1 hid
@@ -470,7 +484,7 @@ test('backup filter: four hidden suggestions in a row at the end of Home end it'
 // and Instagram kept paging through them (23 pages in 25 s).
 const VLIST = `
 window.__mkArticle = function (i, o) {
-  const code = 'C' + String(i).padStart(9, '0');
+  const code = o.code || 'C' + String(i).padStart(9, '0');
   const label = o.label ? '<div><span>' + o.label + '</span></div>' : '';
   const m = o.video ? '<video playsinline preload="none" style="display:block;width:100%;height:700px"></video>'
     : '<img sizes="412px" style="display:block;width:100%;height:515px" src="/blank.png">';
@@ -524,7 +538,7 @@ window.__mkArticle = function (i, o) {
     try {
       const data = await (await fetch('/api/graphql?page=' + V.cursor, { method: 'POST' })).json();
       const c = data.data.xdt_api__v1__feed__timeline__connection;
-      for (const e of c.edges) { const m = e.node.media; if (m) V.items.push({ video: !!m.video_versions, label: m.__domtag || '' }); }
+      for (const e of c.edges) { const m = e.node.media; if (m) V.items.push({ code: m.code, video: !!m.video_versions, label: m.__domtag || '' }); }
       V.hasNext = !!c.page_info.has_next_page; V.cursor++;
     } finally { V.loading = false; render(); update(); }
   }
@@ -581,7 +595,7 @@ test('stories: the Story checks skip Home\'s feed mounted underneath, and still 
   const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"><script>
     window.__walks = 0; window.__reads = 0; window.__next = 0;
     const nn = TreeWalker.prototype.nextNode;
-    TreeWalker.prototype.nextNode = function () { window.__walks++; return nn.call(this); };
+    TreeWalker.prototype.nextNode = function () { if (this.whatToShow !== NodeFilter.SHOW_TEXT) window.__walks++; return nn.call(this); };
     const tc = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent');
     Object.defineProperty(Node.prototype, 'textContent', { configurable: true, get() { window.__reads++; return tc.get.call(this); }, set(v) { tc.set.call(this, v); } });
     </script></head><body style="margin:0"><main>${Array.from({ length: 60 }, (_, i) => post(i)).join('')}</main>
