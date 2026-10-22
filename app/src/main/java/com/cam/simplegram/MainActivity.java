@@ -1070,12 +1070,54 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             b.append("Home feed\n")
                     .append("  Posts shown: ").append(feed.optInt("kept")).append('\n')
                     .append("  Ads removed: ").append(feed.optInt("ad")).append('\n')
-                    .append("  Suggested removed: ").append(feed.optInt("suggested") + feed.optInt("notFollowed")).append('\n')
+                    .append("  Suggested removed: ").append(feed.optInt("suggested") + feed.optInt("notFollowed")
+                            + feed.optInt("exploreTitle")).append('\n')
                     .append("  Reposts removed: ").append(feed.optInt("repost")).append('\n')
                     .append("  Other promos removed: ").append(feed.optInt("unit")).append('\n')
                     .append("  Pages read: ").append(feed.optInt("pages"))
-                    .append(feed.optInt("unknownPages") > 0 ? " (" + feed.optInt("unknownPages") + " unrecognised)" : "")
-                    .append('\n');
+                    .append(" (").append(feed.optInt("unknownPages")).append(" unrecognised, ")
+                    .append(feed.optInt("streamed")).append(" streamed)\n")
+                    .append("  \"Caught up\" seen: ").append(feed.optInt("eof"))
+                    .append(" · removed after it: ").append(feed.optInt("afterEnd") + feed.optInt("inMarker")).append('\n')
+                    .append("  Posts with a Follow button: ").append(feed.optInt("followButtons"))
+                    .append(" · follow unknown: ").append(feed.optInt("followUnknown")).append('\n')
+                    .append("  Blank screen: ").append(feed.optInt("blank"))
+                    .append(" · most posts loaded: ").append(feed.optInt("peakPosts")).append('\n');
+        }
+        JSONObject sd = stats.optJSONObject("searchData");
+        JSONObject opens = stats.optJSONObject("searchOpens");
+        if (sd != null || opens != null) {
+            b.append("\nSearch\n");
+            if (sd != null) {
+                JSONArray log = sd.optJSONArray("gqlLog");
+                int n = log == null ? 0 : log.length(), failed = 0;
+                String lastFail = "";
+                for (int i = 0; i < n; i++) {
+                    JSONObject e = log.optJSONObject(i);
+                    if (e == null) continue;
+                    if (e.has("code") || e.optInt("status") != 200) {
+                        failed++;
+                        lastFail = e.optString("query") + " " + e.optString("code", String.valueOf(e.optInt("status")));
+                    }
+                }
+                b.append("  Requests: ").append(n).append(" (").append(failed).append(" failed)\n");
+                if (!lastFail.isEmpty()) b.append("  Last failure: ").append(lastFail).append('\n');
+            }
+            if (opens != null) {
+                b.append("  Results opened: ").append(opens.optInt("router") + opens.optInt("popstate") + opens.optInt("samePage"))
+                        .append(" · full reloads: ").append(opens.optInt("fullLoad"))
+                        .append(" · last: ").append(opens.optInt("lastMs")).append(" ms\n");
+            }
+        }
+        JSONObject dg = stats.optJSONObject("diag");
+        if (dg != null) {
+            JSONArray ms = dg.optJSONArray("storyMs");
+            b.append("\nSpeed\n")
+                    .append("  Stories took: ").append(ms == null || ms.length() == 0 ? "not opened yet" : ms.toString().replace(",", ", ") + " ms").append('\n')
+                    .append("  Instagram slow-downs: ").append(dg.optInt("s429"))
+                    .append(" · server errors: ").append(dg.optInt("s5xx")).append('\n')
+                    .append("  Page stalls: ").append(dg.optInt("longTasks"))
+                    .append(" (longest ").append(dg.optInt("longestTask")).append(" ms)\n");
         }
         b.append("\nElsewhere\n")
                 .append("  Ads removed (Stories etc.): ").append(stats.optInt("ads")).append('\n')

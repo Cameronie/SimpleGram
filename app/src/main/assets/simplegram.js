@@ -1244,6 +1244,7 @@
       atBottomSince = 0;
       safe(checkFeedEnd)(true);
     }
+    if (CFG.role === 'main' && route() === 'story' && previous !== 'story') safe(storyOpened)();
     if (CFG.role === 'main' && route() === 'comments' && previous !== 'comments' && !split) {
       // Instagram opened its full-page comments by itself; show them in the
       // half-screen panel instead and put the post back.
@@ -3095,6 +3096,52 @@
       for (const v of looped) v.loop = false;
       looped.clear();
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Diagnostics for Filter status: how long Stories take to show, whether
+   * Instagram is slowing requests down, and long main-thread stalls.
+   * Counts and timings only; everything is passive (no requests, no shims).
+   * ------------------------------------------------------------------ */
+  const diag = (stats.diag = { storyMs: [], storyVideos: 0, s429: 0, s5xx: 0, longTasks: 0, longestTask: 0 });
+  let storyStart = 0;
+  function storyOpened() {
+    storyStart = performance.now();
+    diag.storyVideos = document.getElementsByTagName('video').length;
+  }
+  function storyShown() {
+    if (!storyStart || route() !== 'story') return;
+    diag.storyMs.push(Math.round(performance.now() - storyStart));
+    if (diag.storyMs.length > 5) diag.storyMs.shift();
+    storyStart = 0;
+  }
+  if (CFG.role === 'main') {
+    // Media events don't bubble; listen in the capture phase.
+    document.addEventListener('playing', safe(storyShown), true);
+    document.addEventListener('load', safe(e => {
+      const t = e.target;
+      if (!storyStart || !t || t.tagName !== 'IMG') return;
+      const r = t.getBoundingClientRect();
+      if (r.width * r.height >= innerWidth * innerHeight * 0.5) storyShown();
+    }), true);
+    try {
+      new PerformanceObserver(safe(list => {
+        for (const e of list.getEntries()) {
+          const st = e.responseStatus;
+          if (!st || !/^https:\/\/[^/]*instagram\.com\/(?:api\/|graphql\/|ajax\/)/.test(e.name)) continue;
+          if (st === 429) diag.s429++;
+          else if (st >= 500) diag.s5xx++;
+        }
+      })).observe({ type: 'resource' });
+    } catch (e) { /* resource timing unavailable */ }
+    try {
+      new PerformanceObserver(safe(list => {
+        for (const e of list.getEntries()) {
+          diag.longTasks++;
+          diag.longestTask = Math.max(diag.longestTask, Math.round(e.duration));
+        }
+      })).observe({ type: 'longtask' });
+    } catch (e) { /* long task timing unavailable */ }
   }
 
   /* ------------------------------------------------------------------ *
