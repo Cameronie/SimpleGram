@@ -169,7 +169,7 @@ public class ShellTest {
     }
 
     @Test
-    public void endOfHomeBarShowsBothFeedsAndHides() throws Exception {
+    public void endOfHomeBarShowsFollowingOnlyAndHides() throws Exception {
         try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
             AtomicReference<MainActivity> act = new AtomicReference<>();
             s.onActivity(act::set);
@@ -194,7 +194,8 @@ public class ShellTest {
             }
             assertNotNull("end-of-Home bar visible", bar);
             String text = textOf((ViewGroup) bar);
-            assertTrue(text, text.contains("Following") && text.contains("Favorites"));
+            // Following only: Favorites stays in the menu.
+            assertTrue(text, text.contains("Following") && !text.contains("Favorites"));
             s.onActivity(x -> {
                 try {
                     call(x, "showFeedBar", new Class<?>[]{boolean.class}, false);
@@ -243,7 +244,8 @@ public class ShellTest {
             SystemClock.sleep(400);
             idle();
             String text = textOf(feedCard(act.get()));
-            assertTrue(text, text.contains("You're all caught up") && text.contains("past 3 days") && text.contains("Favorites"));
+            assertTrue(text, text.contains("You're all caught up") && text.contains("past 3 days")
+                    && text.contains("Following") && !text.contains("Favorites"));
             s.onActivity(x -> {
                 try {
                     call(x, "onMessage", new Class<?>[]{String.class, String.class}, "main", stalled);
@@ -254,6 +256,79 @@ public class ShellTest {
             idle();
             text = textOf(feedCard(act.get()));
             assertTrue(text, text.contains("Home isn't loading more") && !text.contains("past 3 days"));
+        }
+    }
+
+    private static void message(ActivityScenario<MainActivity> s, String json) {
+        s.onActivity(x -> {
+            try {
+                call(x, "onMessage", new Class<?>[]{String.class, String.class}, "main", json);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    private static View visibleChild(MainActivity a, String description) {
+        ViewGroup root = (ViewGroup) ((ViewGroup) a.findViewById(android.R.id.content)).getChildAt(0);
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View c = root.getChildAt(i);
+            if (c.getVisibility() == View.VISIBLE && description.equals(String.valueOf(c.getContentDescription()))) return c;
+        }
+        return null;
+    }
+
+    @Test
+    public void endOfHomeCardIsIgnoredOnFollowing() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString());
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).toString());
+            SystemClock.sleep(400);
+            idle();
+            assertEquals(null, visibleChild(act.get(), "End of Home"));
+            // Back on Home the same message shows the card.
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).toString());
+            SystemClock.sleep(400);
+            idle();
+            assertNotNull(visibleChild(act.get(), "End of Home"));
+        }
+    }
+
+    @Test
+    public void skipStatusShowsOnFollowingOnlyNeverAsTheCard() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", true).put("kind", "skipping").put("n", 19).toString());
+            idle();
+            View chip = visibleChild(act.get(), "Skip status");
+            assertNotNull("skip note visible", chip);
+            String text = String.valueOf(((android.widget.TextView) chip).getText());
+            assertTrue(text, text.contains("Skipping 19 posts you saw in Home"));
+            assertEquals(null, visibleChild(act.get(), "End of Home"));
+            message(s, new JSONObject().put("action", "skipStatus").put("on", true).put("kind", "nothingNew").toString());
+            idle();
+            chip = visibleChild(act.get(), "Skip status");
+            assertNotNull(chip);
+            assertTrue(String.valueOf(((android.widget.TextView) chip).getText()).contains("Nothing new since Home"));
+            // Not on Home, even if asked.
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            idle();
+            assertEquals(null, visibleChild(act.get(), "Skip status"));
+            // Turned off on Following.
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", false).toString());
+            idle();
+            assertEquals(null, visibleChild(act.get(), "Skip status"));
         }
     }
 

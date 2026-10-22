@@ -430,7 +430,8 @@ test('feed: continuing from the end of Home into Following skips posts already s
 test('feed: pages of only already-seen posts keep loading instead of stopping', async () => {
   const page = await open('https://www.instagram.com/', BLANK);
   await page.evaluate(p => JSON.parse(JSON.stringify(p)), timeline([edge({ media: media('SEEN001', user('a', true)) })]));
-  await Promise.all([page.waitForURL(/variant=favorites/), page.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'favorites' }))]);
+  // (Following: the end card no longer offers Favorites.)
+  await Promise.all([page.waitForURL(/variant=following/), page.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' }))]);
   const flags = await page.evaluate(p => {
     const out = [];
     for (let i = 0; i < 8; i++) out.push(JSON.parse(JSON.stringify(p)).data.xdt_api__v1__feed__timeline__connection.page_info.has_next_page);

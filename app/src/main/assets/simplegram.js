@@ -27,7 +27,17 @@
     dom: { ads: 0, suggested: 0, reposts: 0, banners: 0, reelsTab: 0, exploreGrid: 0 },
     swipesBlocked: 0, indexed: 0, autoplayed: 0,
     downloads: { ok: 0, failed: {} },
+    // Instagram's bottom bar and header links (counts only).
+    nav: { homeFull: { bar: 0, header: 0 } },
   });
+  function bump(o, k, n) { o[k] = (o[k] || 0) + (n == null ? 1 : n); }
+  // Session storage that never throws (private windows, blocked storage).
+  function readSession(key) {
+    try { return JSON.parse(sessionStorage.getItem(key) || 'null'); } catch (e) { return null; }
+  }
+  function writeSession(key, v) {
+    try { sessionStorage.setItem(key, JSON.stringify(v)); } catch (e) { /* storage unavailable */ }
+  }
 
   /* ------------------------------------------------------------------ *
    * Native bridge
@@ -310,22 +320,41 @@
   // keeps the feed it loaded; a reload or a refresh of the feed starts over.
   const feedStates = new Map();
   let lastVariant = 'home';
+  // shownAny: this feed has handed Instagram something (a post or an anchor);
+  // shownCount: posts handed that show on screen; handed: edges handed;
+  // anchorKind: what anchored the first page (seen, marker, recs).
   function freshFeed(key) {
     return { key: key, emptyStreak: 0, seenStreak: 0, ended: false, caughtUp: false, homePages: 0,
-      endText: null, endCursor: null, lastCursor: null, lastPageAt: 0 };
+      endText: null, endCursor: null, lastCursor: null, lastPageAt: 0,
+      shownAny: false, shownCount: 0, handed: 0, anchorKind: '', resetAt: 0 };
   }
-  function currentFeed() {
-    if (route() === 'home') lastVariant = feedVariant();
-    let fs = feedStates.get(lastVariant);
-    if (!fs) feedStates.set(lastVariant, fs = freshFeed(lastVariant));
+  function feedFor(key) {
+    let fs = feedStates.get(key);
+    if (!fs) feedStates.set(key, fs = freshFeed(key));
     return fs;
   }
+  // The feed the address shows (the last one, while a post or Story is open).
+  function addressVariant() {
+    if (route() === 'home') lastVariant = feedVariant();
+    return lastVariant;
+  }
+  function currentFeed() { return feedFor(addressVariant()); }
   SG.feedState = () => Object.assign({}, currentFeed());
+  // Which feed a page belongs to. Instagram names Following, Favorites and
+  // Older posts pages itself (pagination_source), and the address can lag
+  // behind an in-page switch. Home pages carry null; 'feed_recs' is also the
+  // server's label for any page holding the "caught up" marker (perhaps on
+  // Following too), so both use the address.
+  function pageVariant(owner) {
+    const ps = owner && owner.pagination_source;
+    return ps === 'following' || ps === 'favorites' || ps === 'past_posts' ? ps : addressVariant();
+  }
   // The page that ends a feed is remembered: reading it again is still the end.
   function endFeed(fs, caughtUp) {
     fs.ended = true;
     if (caughtUp) fs.caughtUp = true;
     fs.endCursor = fs.lastCursor;
+    safe(releaseRoom)();
   }
 
   // Which home feed is showing: home (Instagram's picks), following, favorites,
@@ -334,22 +363,35 @@
     const v = new URLSearchParams(location.search).get('variant');
     return v === 'following' || v === 'favorites' || v === 'past_posts' ? v : 'home';
   }
-  // Posts Home has shown, so Following/Favorites can skip them when you
-  // continue from the end of Home.
+  function here() { return location.pathname + location.search; }
+  // Posts Home has shown, so Following can skip them when you continue from
+  // the end of Home.
   const homeSeen = new Set();
   const SKIP_KEY = 'sg_skip_seen';
-  // Used once, by the page the end-of-Home buttons open, then forgotten:
-  // opening Following or Favorites any other way shows everything.
+  // Used once, by the page the end-of-Home card opens, then forgotten:
+  // opening Following any other way shows everything. passed: seen posts
+  // already skipped here; nudgedAt: the skip's own pace (not Home's).
   let skip = null;
   try {
     const saved = JSON.parse(sessionStorage.getItem(SKIP_KEY) || 'null');
     sessionStorage.removeItem(SKIP_KEY);
     if (saved && saved.variant === feedVariant() && Array.isArray(saved.codes) && Date.now() - saved.at < 60 * 1000) {
-      skip = { variant: saved.variant, path: location.pathname + location.search, codes: new Set(saved.codes) };
+      skip = { variant: saved.variant, path: here(), codes: new Set(saved.codes),
+        passed: new Set(), nudgedAt: [], halted: false, status: '', statusTimer: 0 };
     }
   } catch (e) { /* storage unavailable */ }
   function skipping() {
-    return skip && location.pathname + location.search === skip.path ? skip.codes : null;
+    return skip && here() === skip.path ? skip.codes : null;
+  }
+  // The skip is over (a reload or a loop of seen posts, or you went to another
+  // feed in the page): what comes next is shown as Instagram sends it.
+  function forgetSkip(counter) {
+    if (!skip) return;
+    clearTimeout(skip.statusTimer);
+    if (skip.status) post('skipStatus', { on: false, kind: '', n: 0 });
+    skip = null;
+    if (counter) bump(stats.feed, counter);
+    safe(dropRoom)();
   }
   function continueFeed(variant) {
     try {
@@ -421,10 +463,13 @@
   // suggestions, so the marker and everything after it go and paging stops;
   // the app's own card marks the end and carries Instagram's line.
   // (Kept with emptied groups, Instagram would still advertise more pages.)
+  // Returns the marker it cut (the first page's anchor may put it back).
   function endHome(owner, list, fs, ctx) {
     const at = markerAt(list);
+    let cut = null;
     if (at >= 0) {
-      const marker = unitOf(list[at]);
+      cut = list[at];
+      const marker = unitOf(cut);
       const d = marker.end_of_feed_demarcator;
       fs.endText = { title: markerText(d.title), subtitle: markerText(d.subtitle) };
       for (const g of markerGroups(marker)) stats.feed.inMarker = (stats.feed.inMarker || 0) + g.feed_items.length;
@@ -440,10 +485,89 @@
       stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length - keep.length;
       list.splice(0, list.length, ...keep);
     } else {
-      return;
+      return null;
     }
-    stopPagination(owner);
+    endHomePaging(owner);
     endFeed(fs, true);
+    return cut;
+  }
+  // The one place that stops Home's paging at its end (here and for the
+  // anchored marker). A continuation past "caught up" would leave it on.
+  function endHomePaging(owner) {
+    stopPagination(owner);
+  }
+
+  /* The anchor: a feed's first page is never handed to Instagram empty.
+   * An empty first page makes Instagram show its own empty-feed screen
+   * (suggested accounts, which SimpleGram blanks, or Favorites' star), and it
+   * never asks for a second page. One rule for every feed, in this order:
+   *  - seen: the page's oldest post you already saw in Home (the last one; it
+   *    sits next to the first new post);
+   *  - marker: Instagram's own "caught up" line, without its groups;
+   *  - recs: on Home, the first suggestion (never an ad), hidden before it is
+   *    drawn, while the scroll room and nudges bring the next page. */
+  const anchorCodes = [];
+  function anchorFirstPage(fs, owner, list, verdicts, cut, home) {
+    let at = -1;
+    verdicts.forEach((x, i) => { if (x.reason === 'alreadySeen') at = i; });
+    if (at >= 0) {
+      verdicts[at].drop = false;
+      verdicts[at].reason = 'anchor';
+      return { kind: 'seen' };
+    }
+    if (cut) return keepMarker(fs, owner, cut);
+    const i = home ? recsAnchorAt(list) : -1;
+    if (i >= 0 && hideAnchor(list[i])) {
+      verdicts[i].drop = false;
+      verdicts[i].reason = 'anchor';
+      return { kind: 'recs' };
+    }
+    return null;
+  }
+  // Instagram's marker, neutralised: no groups, so Instagram neither offers
+  // its suggestions nor more pages; the app's card then leaves out its line.
+  function keepMarker(fs, owner, cut) {
+    const d = unitOf(cut).end_of_feed_demarcator;
+    if (d.group_set && typeof d.group_set === 'object') { d.group_set.groups = []; d.group_set.active_group_id = null; }
+    if (fs.endText) fs.endText.subtitle = '';
+    endHomePaging(owner);
+    return { kind: 'marker', edge: cut };
+  }
+  function recsAnchorAt(list) {
+    for (let i = 0; i < list.length; i++) {
+      const n = unitOf(list[i]);
+      if (n && n.explore_story && !adLike(n) && !adLike(n.explore_story)) return i;
+    }
+    return -1;
+  }
+  // Hidden by a style rule keyed on the post's own link, so it is never drawn
+  // and nothing in Instagram's list changes height later. Returns false when
+  // it cannot be hidden (no usable link, or the rule is full): it is not kept.
+  // Never unhidden: Instagram may still hold an older one.
+  function hideAnchor(e) {
+    const n = unitOf(e);
+    const m = n && (mediaOf(n.explore_story) || n.explore_story);
+    const code = m && (m.code || m.shortcode);
+    if (typeof code !== 'string' || !/^[A-Za-z0-9_-]{1,40}$/.test(code)) return false;
+    if (anchorCodes.indexOf(code) < 0) {
+      if (anchorCodes.length >= 40) return false;
+      anchorCodes.push(code);
+    }
+    let st = document.getElementById('sg-anchor-style');
+    if (!st && document.documentElement) {
+      st = document.createElement('style');
+      st.id = 'sg-anchor-style';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    if (!st) return false;
+    st.textContent = anchorCodes.map(c => ['/p/', '/reel/'].map(k => 'article:has(a[href*="' + k + c + '/"]),div[role="article"]:has(a[href*="' + k + c + '/"])').join(','))
+      .join(',') + '{display:none!important}';
+    return true;
+  }
+  function countAnchor(kind) {
+    bump(stats.feed, 'anchor');
+    const k = stats.feed.anchorKind || (stats.feed.anchorKind = { seen: 0, marker: 0, recs: 0 });
+    bump(k, kind);
   }
 
   // Diagnostics: the shapes of the last 40 Home units, for Filter status.
@@ -483,16 +607,132 @@
     if (ring.length > 40) ring.splice(0, ring.length - 40);
   }
 
+  /* Diagnostics that survive a restart: a trail of the last feed pages and
+   * feed events, mirrored to the app as each entry is written (Copy details).
+   * Counts, flags and Instagram's type values only. Page entries: d page load
+   * in this session, pg feed page in it, nav how this page load started
+   * (navigate, reload, back_forward, bfcache; spa after an in-page address
+   * change), va feed by address, vp feed by page, ps pagination_source, in/out
+   * edges, k posts kept, sk skipped as seen, ad, sg suggestions, mk marker
+   * index, nx0/nx1 has_next in/out, an anchor kind, first, ae after the end. */
+  const TRAIL_MAX = 30;
+  const docN = (readSession('sg_doc_n') | 0) + 1;
+  writeSession('sg_doc_n', docN);
+  const docHref = location.href;
+  let navType = '', fromBfcache = false;
+  try {
+    const n = performance.getEntriesByType('navigation')[0];
+    navType = n && typeof n.type === 'string' ? n.type : '';
+  } catch (e) { /* navigation timing unavailable */ }
+  function navKind() { return fromBfcache ? 'bfcache' : location.href !== docHref ? 'spa' : shapeToken(navType) || '?'; }
+  function tenths() { return Math.round(performance.now() / 100) * 100; }
+  function pushTrail(entry) {
+    if (CFG.role !== 'main') return;
+    entry.d = docN;
+    if (entry.pg == null) entry.pg = stats.feed.pages;
+    entry.nav = navKind();
+    entry.t = tenths();
+    const ring = stats.trail || (stats.trail = []);
+    ring.push(entry);
+    if (ring.length > TRAIL_MAX) ring.splice(0, ring.length - TRAIL_MAX);
+    post('trail', { entry: entry });
+    if (entry.ev === 'page') sampleDrawnSoon();
+  }
+  SG.trail = () => (stats.trail || []).slice();
+  // What is drawn 3 s after a feed page: posts, the Stories tray, Instagram's
+  // Favorites star screen, a list of Follow buttons with no posts (its
+  // suggested-accounts screen), its header and bar, and frames drawn in half
+  // a second (0: a frozen or white page).
+  const STAR_NULL = 'svg[aria-label="Star outline icon in circle."]';
+  let drawnTimer = 0;
+  function sampleDrawnSoon() {
+    if (drawnTimer) return;
+    drawnTimer = setTimeout(safe(() => {
+      // Bounded by count, never by a clock: a frame loop must always end.
+      let frames = 0, done = false;
+      const tick = () => { if (done) return; frames++; if (frames < 60) requestAnimationFrame(tick); };
+      requestAnimationFrame(tick);
+      setTimeout(safe(() => { done = true; drawnTimer = 0; pushTrail(Object.assign({ ev: 'drawn', raf: frames }, drawnShape())); }), 500);
+    }), 2500);
+  }
+  function followButtons(scope, max) {
+    let n = 0;
+    if (scope) for (const b of scope.querySelectorAll('button,[role="button"]')) if (/^follow$/i.test(norm(b)) && ++n >= max) break;
+    return n;
+  }
+  function drawnShape() {
+    const posts = document.querySelectorAll(POST).length;
+    return { posts: Math.min(posts, 99), tray: !!document.querySelector('a[href^="/stories/"],main canvas'),
+      star: !!document.querySelector(STAR_NULL), sul: posts ? 0 : followButtons(document.querySelector('main'), 5),
+      hdr: !!document.querySelector('header,[role="banner"]'), bar: !!document.querySelector('a[href="/direct/inbox/"],a[href="/explore/"]'),
+      hidden: !!document.hidden };
+  }
+  // Instagram asking for suggested accounts right after a feed's first page
+  // came out empty: its empty-feed screen.
+  let emptyFirstAt = 0;
+  function noteAyml() {
+    if (!emptyFirstAt || Date.now() - emptyFirstAt > 3000) return;
+    emptyFirstAt = 0;
+    bump(stats.feed, 'aymlAfterEmpty');
+    pushTrail({ ev: 'ayml' });
+  }
+
+  /* Diagnostics for Home jumping back to its top (B16), shapes only: Home's
+   * events (Home-tab taps, same-address history writes, the app going to the
+   * background, jumps to the top with no touch, leaving and coming back) and
+   * Home's pages with the list height in screens when each was read and
+   * 1.5 s later (a reload shrinks it, a next page grows it). */
+  function screens(px) { return Math.round(px / Math.max(1, innerHeight) * 10) / 10; }
+  function homeEvent(e) {
+    if (CFG.role !== 'main') return;
+    e.t = tenths();
+    const ring = stats.homeEvents || (stats.homeEvents = []);
+    const last = ring[ring.length - 1];
+    if (last && e.e === 'hist' && last.e === 'hist' && last.k === e.k && e.t - last.t < 1000) { last.n = (last.n || 1) + 1; return; }
+    ring.push(e);
+    if (ring.length > 30) ring.shift();
+  }
+  let lastHomePageAt = 0;
+  function noteHomePage(owner, list) {
+    if (CFG.role !== 'main') return;
+    const se = document.scrollingElement || document.documentElement;
+    const pi = owner.page_info || owner.pageInfo || {};
+    const now = Date.now();
+    const e = { pg: stats.feed.pages, dt: lastHomePageAt ? now - lastHomePageAt : -1, y: screens(se.scrollTop),
+      sh0: screens(se.scrollHeight), sh1: null,
+      seen: list.filter(x => followedPost(x) && homeSeen.has(edgeCode(x))).length,
+      hp: [!!(pi.has_previous_page || pi.hasPreviousPage), !!(pi.start_cursor || pi.startCursor)],
+      mk: markerAt(list) >= 0, ps: shapeToken(owner.pagination_source), nx: hasMore(owner) };
+    lastHomePageAt = now;
+    const ring = stats.homeRing || (stats.homeRing = []);
+    ring.push(e);
+    if (ring.length > 20) ring.shift();
+    setTimeout(safe(() => { e.sh1 = screens(se.scrollHeight); }), 1500);
+  }
+  function yBucket() {
+    const se = document.scrollingElement || document.documentElement;
+    if (se.scrollTop <= 8) return 'top';
+    return se.scrollHeight - (se.scrollTop + innerHeight) < innerHeight ? 'end' : 'mid';
+  }
+
   function filterFeedList(owner, list) {
     if (markerLists.has(list)) { filterMarkerList(list); return; }
     stats.feed.pages++;
-    let fs = currentFeed();
-    const home = fs.key === 'home';
+    const variant = pageVariant(owner);
+    let fs = feedFor(variant);
+    const home = variant === 'home';
     const ctx = home ? unitContext(owner, list) : null;
+    const sentMore = hasMore(owner);
+    // The trail entry for this page (shapes and counts only).
+    const tr = { ev: 'page', va: addressVariant(), vp: variant, ps: shapeToken(owner.pagination_source),
+      in: list.length, mk: markerAt(list), nx0: sentMore };
+    if (home) safe(noteHomePage)(owner, list);
+    safe(triedHit)();
     fs.lastPageAt = Date.now();
     if (streamed) {
       stats.feed.streamed++;
       if (ctx) for (const e of list) noteUnit(e, 'streamed', ctx);
+      safe(pushTrail)(Object.assign(tr, { out: list.length, st: true }));
       return;
     }
     const cursor = cursorOf(owner);
@@ -500,26 +740,46 @@
       if (markerAt(list) >= 0 || list.some(followedPost)) {
         // Instagram refreshed the feed (pull to refresh, the Home tab): start over.
         feedStates.set(fs.key, fs = freshFeed(fs.key));
-        fs.lastPageAt = Date.now();
+        fs.lastPageAt = fs.resetAt = Date.now();
         stats.feed.refreshes = (stats.feed.refreshes || 0) + 1;
       } else {
-        // Instagram's suggestions after the end: never shown, never left alone.
-        if (ctx) for (const e of list) noteUnit(e, 'afterEnd', ctx);
-        stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length;
-        list.length = 0;
+        // Instagram's suggestions after the end are never shown. Paging was
+        // already stopped, so this may be a reload that replaces Home's whole
+        // list (each refresh is one or two): one hidden suggestion stays, never
+        // an empty list. Hidden, so stacked ones on appended pages draw nothing.
+        let keep = home ? recsAnchorAt(list) : -1;
+        if (keep >= 0 && !hideAnchor(list[keep])) keep = -1;
+        if (ctx) list.forEach((e, i) => noteUnit(e, i === keep ? 'anchor' : 'afterEnd', ctx));
+        stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length - (keep >= 0 ? 1 : 0);
+        if (keep >= 0) {
+          list.splice(0, list.length, list[keep]);
+          fs.handed++;
+          countAnchor('recs');
+          bump(stats.feed, 'anchorAfterEnd');
+        } else {
+          list.length = 0;
+        }
         stopPagination(owner);
         fs.endCursor = cursor;
+        safe(pushTrail)(Object.assign(tr, { out: list.length, nx1: false, an: keep >= 0 ? 'recs' : '', ae: true }));
         return;
       }
     }
+    // A refresh sends two head loads and Instagram keeps the one that lands
+    // last: a Home page right after a refresh reset is a first page too.
+    const first = !fs.shownAny || (home && Date.now() - fs.resetAt < 2000);
+    const prevCursor = fs.lastCursor;
     fs.lastCursor = cursor;
-    if (home) endHome(owner, list, fs, ctx);
-    else for (const e of list) for (const g of markerGroups(unitOf(e))) markerLists.add(g.feed_items);
+    const cut = home ? endHome(owner, list, fs, ctx) : null;
+    if (!home) for (const e of list) for (const g of markerGroups(unitOf(e))) markerLists.add(g.feed_items);
     const verdicts = list.map(e => feedVerdict(unitOf(e)));
     if (list.length && !verdicts.some(x => x.known)) {
       // Nothing recognisable: Instagram probably changed its format. Fail open.
       stats.feed.unknownPages++;
       if (ctx) for (const e of list) noteUnit(e, 'open', ctx);
+      fs.shownAny = true;
+      fs.handed += list.length;
+      safe(pushTrail)(Object.assign(tr, { out: list.length, open: true }));
       return;
     }
     const media = verdicts.filter(x => x.media);
@@ -527,17 +787,39 @@
       stats.feed.followSuspect = (stats.feed.followSuspect || 0) + 1;
       for (const x of media) { x.drop = false; x.reason = ''; }
     }
-    const seenCodes = skipping();
+    let seenCodes = skip && skip.variant === variant ? skipping() : null;
+    if (seenCodes) {
+      // Following never repeats a post: a page whose seen posts were all
+      // skipped here already is Instagram reloading its first page (pull to
+      // refresh) or looping. The skip ends; the page shows as sent.
+      const seenHere = verdicts.map((x, i) => x.media && !x.drop ? edgeCode(list[i]) : null).filter(c => c && seenCodes.has(c));
+      if (seenHere.length && seenHere.every(c => skip.passed.has(c))) { forgetSkip('skipForgotten'); seenCodes = null; }
+      else for (const c of seenHere) skip.passed.add(c);
+    }
+    if (seenCodes) {
+      verdicts.forEach((x, i) => {
+        const code = x.media && !x.drop ? edgeCode(list[i]) : null;
+        if (code && seenCodes.has(code)) { x.drop = true; x.reason = 'alreadySeen'; }
+      });
+    }
+    let anchor = null;
+    if (first && !verdicts.some(x => x.media && !x.drop) && (sentMore || cut)) {
+      anchor = anchorFirstPage(fs, owner, list, verdicts, cut, home);
+      if (anchor) { fs.anchorKind = anchor.kind; countAnchor(anchor.kind); }
+    }
     // Home's own page, even when it lands while a Story or post is open.
     const onHome = home;
     const kept = [];
+    const tally = {};
     let keptMedia = 0, alreadySeen = 0, lastKept = null;
     verdicts.forEach((x, i) => {
       stats.feed.seen++;
       const code = x.media ? edgeCode(list[i]) : null;
-      if (!x.drop && code && seenCodes && seenCodes.has(code)) { x.drop = true; x.reason = 'alreadySeen'; alreadySeen++; }
-      if (x.drop) stats.feed[x.reason] = (stats.feed[x.reason] || 0) + 1;
-      else {
+      if (x.drop) {
+        stats.feed[x.reason] = (stats.feed[x.reason] || 0) + 1;
+        bump(tally, x.reason);
+        if (x.reason === 'alreadySeen') alreadySeen++;
+      } else {
         kept.push(list[i]);
         if (x.media) {
           keptMedia++;
@@ -546,20 +828,36 @@
           if (onHome && code) { homeSeen.add(code); if (homeSeen.size > 4000) homeSeen.delete(homeSeen.values().next().value); }
         }
       }
-      if (ctx) noteUnit(list[i], x.drop ? x.reason : 'kept', ctx);
+      if (ctx) noteUnit(list[i], x.drop ? x.reason : x.reason === 'anchor' ? 'anchor' : 'kept', ctx);
     });
+    if (anchor && anchor.kind === 'marker') kept.push(anchor.edge);
+    else if (!anchor && cut && !kept.length) {
+      // Home cut to nothing at its marker: this may be a head load that
+      // replaces the list, so the neutralised marker stays, never [].
+      anchor = keepMarker(fs, owner, cut);
+      kept.push(cut);
+      bump(stats.feed, 'markerKept');
+    }
     if (lastKept) fs.lastKeptCode = lastKept;
     if (onHome && keptMedia > 0) fs.homePages++;
     stats.feed.kept += keptMedia;
     stats.feed.lastPageKept = keptMedia;
-    if (kept.length !== list.length) list.splice(0, list.length, ...kept);
+    if (keptMedia > 0 || anchor) fs.shownAny = true;
+    fs.shownCount += keptMedia;
+    // Diagnostics: ms from the page load to the first new post past the skip.
+    if (seenCodes && !stats.feed.skipFirstNewMs && keptMedia > (anchor ? 1 : 0)) stats.feed.skipFirstNewMs = Math.round(performance.now());
+    fs.handed += kept.length;
+    if (kept.length !== list.length || kept.some((e, i) => e !== list[i])) list.splice(0, list.length, ...kept);
+    if (first && !list.length) emptyFirstAt = Date.now();
     const more = hasMore(owner);
     if (keptMedia === 0 && more) {
-      if (alreadySeen > 0) {
-        // Paging past posts you already saw in Home: each comes once in Following,
-        // so allow about as many pages as Home showed (12 a page), within limits.
-        const cap = Math.min(60, Math.max(15, Math.ceil(seenCodes.size / 10)));
-        if (++fs.seenStreak >= cap) { stopPagination(owner); endFeed(fs); }
+      if (alreadySeen > 0 && seenCodes) {
+        // Paging past posts you already saw in Home. Each comes once, so stop
+        // when Instagram repeats its cursor, or after more pages than there
+        // are seen posts (a loop), at most 80.
+        const echo = cursor != null && cursor === prevCursor;
+        if (echo) bump(stats.feed, 'cursorEcho');
+        if (echo || ++fs.seenStreak >= Math.min(80, seenCodes.size + 3)) { stopPagination(owner); endFeed(fs); }
       } else if (++fs.emptyStreak >= 4) {
         stopPagination(owner); stats.feed.stopped++; endFeed(fs);
       }
@@ -568,9 +866,14 @@
       fs.emptyStreak = 0;
       fs.seenStreak = 0;
       // Only a post or two came through: ask for the next batch early.
-      if (keptMedia <= 2 && more) scheduleNudge(false);
+      if (keptMedia <= 2 && more) scheduleNudge(!!seenCodes);
     }
     if (!more && pagingOwner(owner)) endFeed(fs);
+    safe(syncRoom)(fs, more);
+    if (seenCodes) safe(skipProgress)(fs);
+    safe(pushTrail)(Object.assign(tr, { out: list.length, k: keptMedia, sk: alreadySeen, ad: tally.ad || 0,
+      sg: (tally.suggested || 0) + (tally.notFollowed || 0) + (tally.exploreTitle || 0), nx1: more,
+      an: anchor ? anchor.kind : '', first: first, ae: false }));
     setTimeout(safe(checkFeedEnd), 300);
   }
   function edgeCode(e) {
@@ -639,7 +942,7 @@
       else if (CHAINING_KEY.test(k)) trimChaining(v);
       else if (EXPLORE_KEY.test(k)) blankLists(v, 'exploreBlanked');
       else if (k === 'sectional_items' && Array.isArray(v) && route() !== 'search' && !ownFetch) { blankLists(v, 'exploreBlanked'); stopPagination(o); }
-      else if (SUGGEST_KEY.test(k)) blankLists(v, 'suggestionsBlanked');
+      else if (SUGGEST_KEY.test(k)) { if (/ayml/i.test(k)) safe(noteAyml)(); blankLists(v, 'suggestionsBlanked'); }
       else if (AD_CONTAINER_KEY.test(k)) blankLists(v, 'ads');
       else if (SEARCH_KEY.test(k) && route() === 'search' && !ownFetch) limitSearch(v);
       if (Array.isArray(v) && v.length && AD_LIST_KEY.test(k)) dropAds(v);
@@ -733,52 +1036,193 @@
   // Instagram loads the next batch when the end of the list comes into
   // view. When a batch adds little or nothing, the end never "arrives", so
   // give Instagram a scroll signal. `hard` also handles a page too short to scroll.
-  let nudgeTimer = 0, touching = false, lastUserScroll = 0;
-  window.addEventListener('touchstart', () => { touching = true; }, { capture: true, passive: true });
-  window.addEventListener('touchend', () => { touching = false; lastUserScroll = Date.now(); }, { capture: true, passive: true });
+  let nudgeTimer = 0, touching = false, lastUserScroll = 0, lastTouchEnd = 0;
+  // Your own input (a finger or a wheel), and SimpleGram's own scrolls (the
+  // jiggle, the pad, the room going), which fire trusted scroll events too.
+  let lastInputAt = 0, ownScrollAt = 0;
+  window.addEventListener('touchstart', () => { touching = true; lastInputAt = Date.now(); }, { capture: true, passive: true });
+  window.addEventListener('touchend', () => { touching = false; lastUserScroll = lastTouchEnd = lastInputAt = Date.now(); }, { capture: true, passive: true });
+  window.addEventListener('wheel', () => { lastInputAt = Date.now(); }, { capture: true, passive: true });
   window.addEventListener('touchcancel', () => { touching = false; }, { capture: true, passive: true });
   const nudgedAt = [];
-  function scheduleNudge(hard) {
+  // Diagnostics: which ways of asking for the next page work on the device
+  // (scroll events only, a 2 px jiggle, the pad, your own swipe into the
+  // scroll room): each try, and whether a feed page came within 3 s.
+  let lastTry = null;
+  function noteTry(kind) {
+    const k = stats.feed.tries || (stats.feed.tries = {});
+    const t = k[kind] || (k[kind] = { n: 0, hit: 0 });
+    t.n++;
+    lastTry = { t: t, at: Date.now() };
+  }
+  function triedHit() {
+    if (lastTry && Date.now() - lastTry.at < 3000) lastTry.t.hit++;
+    lastTry = null;
+  }
+  // Nudges that keep trying (about 1, 2, 4 and 8 s apart, 8 at most) until a
+  // page comes: on the page opened from the end card, and on Home's first
+  // page while only its hidden anchor is there. Elsewhere one nudge, as before.
+  function keepsTrying(fs) {
+    return !fs.ended && (!!skipping() || (fs.key === 'home' && fs.anchorKind === 'recs' && fs.shownCount === 0));
+  }
+  // Instagram slowing requests down stops the skip's nudges for good.
+  function skipThrottled() {
+    const d = stats.diag;
+    if (!skip || !d) return false;
+    if (!skip.halted && d.s429 + d.pleaseWait > 0) { skip.halted = true; bump(stats.feed, 'skipThrottled'); }
+    return skip.halted;
+  }
+  function scheduleNudge(hard, tries) {
+    tries = tries || 0;
     clearTimeout(nudgeTimer);
+    const at = currentFeed().lastPageAt;
+    // Paging past seen posts: quicker, on its own budget (40 a minute), so
+    // Home's 10 a minute is left for Home.
+    const pacing = !!skipping() && currentFeed().seenStreak > 0;
+    const delay = pacing ? 400 : 600;
     nudgeTimer = setTimeout(safe(() => {
       const se = document.scrollingElement;
+      const fs = currentFeed();
       // Never after the end of a feed or while the app is in the background.
-      if (!se || route() !== 'home' || document.hidden || currentFeed().ended) return;
-      if (se.scrollHeight - (se.scrollTop + innerHeight) > innerHeight * 2) return;
-      // At most 10 a minute, however many pages come back empty.
+      if (!se || route() !== 'home' || document.hidden || fs.ended) return;
+      if (tries && fs.lastPageAt !== at) return;   // a retry is only for the page it was made for
+      if (skipping() && skipThrottled()) return;
+      const trying = keepsTrying(fs);
+      const later = ms => {
+        nudgeTimer = setTimeout(safe(() => {
+          const f = currentFeed();
+          if (f.lastPageAt === at && keepsTrying(f)) scheduleNudge(true, tries + 1);
+        }), Math.max(0, ms - delay));
+      };
+      if (se.scrollHeight - (se.scrollTop + innerHeight) > innerHeight * 2) {
+        if (trying && tries < 8) later(Math.min(8000, 1000 * Math.pow(2, tries)));
+        return;
+      }
       const now = Date.now();
-      while (nudgedAt.length && now - nudgedAt[0] > 60000) nudgedAt.shift();
-      if (nudgedAt.length >= 10) { stats.feed.nudgesCapped = (stats.feed.nudgesCapped || 0) + 1; return; }
-      nudgedAt.push(now);
+      // The skip may have been forgotten since: Home's budget then.
+      if (pacing && skip && skipping()) {
+        skip.nudgedAt = skip.nudgedAt.filter(t => now - t < 60000);
+        if (skip.nudgedAt.length >= 40) {
+          bump(stats.feed, 'skipCapped');
+          later(60000 - (now - skip.nudgedAt[0]) + 50);   // again when the minute frees up
+          return;
+        }
+        skip.nudgedAt.push(now);
+        bump(stats.feed, 'skipNudges');
+      } else {
+        // At most 10 a minute, however many pages come back empty.
+        while (nudgedAt.length && now - nudgedAt[0] > 60000) nudgedAt.shift();
+        if (nudgedAt.length >= 10) {
+          stats.feed.nudgesCapped = (stats.feed.nudgesCapped || 0) + 1;
+          if (trying) later(60000 - (now - nudgedAt[0]) + 50);
+          return;
+        }
+        nudgedAt.push(now);
+      }
       stats.feed.nudges = (stats.feed.nudges || 0) + 1;
+      if (trying && tries < 8) later(Math.min(8000, 1000 * Math.pow(2, tries)));
       window.dispatchEvent(new Event('scroll'));
       document.dispatchEvent(new Event('scroll'));
       // Never move the page under your finger or during a fling.
-      if (touching || Date.now() - lastUserScroll < 400) return;
+      if (touching || Date.now() - lastUserScroll < 400) { noteTry('synthetic'); return; }
       const y = se.scrollTop;
+      noteTry(se.scrollHeight - innerHeight > 4 ? 'jiggle' : (hard || trying) && document.body ? 'pad' : 'synthetic');
       if (se.scrollHeight - innerHeight > 4) {
         const d = y >= 2 ? -2 : 2;
+        ownScrollAt = Date.now();
         se.scrollTop += d;
-        requestAnimationFrame(() => { se.scrollTop -= d; });
-      } else if (hard && document.body) {
+        requestAnimationFrame(() => { ownScrollAt = Date.now(); se.scrollTop -= d; });
+      } else if ((hard || trying) && document.body) {
         // Nothing to scroll: briefly add room below so the list's end leaves and re-enters view.
         const pad = document.createElement('div');
         pad.setAttribute('aria-hidden', 'true');
         pad.style.cssText = 'height:' + (innerHeight * 3) + 'px;pointer-events:none';
         document.body.appendChild(pad);
+        ownScrollAt = Date.now();
         se.scrollTop = innerHeight * 2;
         let done = false;
-        const restore = () => { if (done) return; done = true; se.scrollTop = y; pad.remove(); };
+        const restore = () => { if (done) return; done = true; ownScrollAt = Date.now(); se.scrollTop = y; pad.remove(); };
         requestAnimationFrame(() => requestAnimationFrame(restore));
         // Frames can stop (the app going to the background): never leave the room behind.
         setTimeout(restore, 150);
       }
-    }), 600);
+    }), delay);
+  }
+
+  // The scroll room: while the page opened from the end card shows fewer
+  // than 3 posts (or Home's first page only its hidden anchor), room below
+  // the list lets your own swipe reach Instagram's loader as a real scroll,
+  // whether or not synthetic nudges work on the device.
+  const ROOM_ID = 'sg-skip-room';
+  let roomTimer = 0;
+  function roomWanted(fs, more) {
+    if (CFG.role !== 'main' || fs.ended || !more || fs !== currentFeed()) return false;
+    if (skipping()) return fs.shownCount < 3;
+    return fs.key === 'home' && fs.anchorKind === 'recs' && fs.shownCount === 0;
+  }
+  function syncRoom(fs, more) {
+    if (fs !== currentFeed()) return;
+    const room = document.getElementById(ROOM_ID);
+    if (!roomWanted(fs, more)) { if (room) releaseRoom(); return; }
+    clearTimeout(roomTimer);
+    roomTimer = 0;
+    if (room || !document.body) return;
+    const el = document.createElement('div');
+    el.id = ROOM_ID;
+    el.setAttribute('aria-hidden', 'true');
+    // Enough to scroll by a good half screen, however short the page is yet.
+    const h = innerHeight * 0.6 + Math.max(0, innerHeight - document.body.getBoundingClientRect().height);
+    el.style.cssText = 'height:' + Math.round(h) + 'px;pointer-events:none';
+    document.body.appendChild(el);
+    bump(stats.feed, 'skipRoom');
+  }
+  // Removed only once that cannot move the page (Instagram draws new posts a
+  // moment after their data), checked every 100 ms, 3 s at most.
+  function releaseRoom() {
+    if (!document.getElementById(ROOM_ID) || roomTimer) return;
+    const t0 = Date.now();
+    const tick = () => {
+      roomTimer = 0;
+      const r = document.getElementById(ROOM_ID);
+      if (!r) return;
+      const se = document.scrollingElement || document.documentElement;
+      if (se.scrollHeight - r.offsetHeight >= se.scrollTop + innerHeight - 1 || Date.now() - t0 > 3000) { ownScrollAt = Date.now(); r.remove(); return; }
+      roomTimer = setTimeout(safe(tick), 100);
+    };
+    roomTimer = setTimeout(safe(tick), 0);
+  }
+  function dropRoom() {
+    clearTimeout(roomTimer);
+    roomTimer = 0;
+    const r = document.getElementById(ROOM_ID);
+    if (r) { ownScrollAt = Date.now(); r.remove(); }
+  }
+
+  // The app's note on the page opened from the end card (never the end-of-Home
+  // card): "Skipping N posts you saw in Home…" once the anchor has stood alone
+  // for 3 s, "Nothing new since Home" when the feed ends with only the anchor.
+  function onlyAnchor(fs) { return fs.anchorKind === 'seen' && fs.shownCount <= 1; }
+  function skipStatus(kind) {
+    if (!skip || skip.status === kind) return;
+    skip.status = kind;
+    post('skipStatus', { on: !!kind, kind: kind, n: kind === 'skipping' ? skip.codes.size : 0 });
+  }
+  function skipProgress(fs) {
+    if (!skip || !skipping() || fs !== currentFeed()) return;
+    if (fs.ended) { skipStatus(onlyAnchor(fs) ? 'nothingNew' : ''); return; }
+    if (!onlyAnchor(fs)) { skipStatus(''); return; }
+    if (skip.status || skip.statusTimer) return;
+    skip.statusTimer = setTimeout(safe(() => {
+      if (!skip) return;
+      skip.statusTimer = 0;
+      const f = currentFeed();
+      if (skipping() && !f.ended && onlyAnchor(f)) skipStatus('skipping');
+    }), 3000);
   }
 
   /* ------------------------------------------------------------------ *
-   * End of Home: offer Following and Favorites (newest first), skipping
-   * what you already saw. Shown by the app, outside Instagram's page.
+   * End of Home: offer Following (newest first), skipping what you
+   * already saw. Shown by the app, outside Instagram's page.
    * ------------------------------------------------------------------ */
   let feedEndShown = null, feedEndSent = '', atBottomSince = 0;
   const STALL_MS = 15000;  // nothing at all arrived for this long while you wait at the bottom
@@ -827,17 +1271,91 @@
       post('feedEnd', msg);
     }
   }
-  let feedEndTimer = 0;
+  let feedEndTimer = 0, lastTop = 0, selfScrollAt = 0;
+  // Home jumping to its top with no finger on the screen (diagnostics).
+  const noteJump = safe(() => {
+    if (CFG.role !== 'main' || route() !== 'home') { lastTop = 0; return; }
+    const top = (document.scrollingElement || document.documentElement).scrollTop;
+    if (lastTop > innerHeight && top < 10 && !touching && Date.now() - lastTouchEnd > 300 && Date.now() - selfScrollAt > 500) {
+      homeEvent({ e: 'jump', from: screens(lastTop) });
+    }
+    lastTop = top;
+  });
+  let roomSwipeAt = 0;
   window.addEventListener('scroll', e => {
     if (e.isTrusted) lastUserScroll = Date.now();
+    noteJump();
+    // A swipe into the room: your own input, never SimpleGram's own scrolls.
+    const now = Date.now();
+    if (e.isTrusted && (touching || now - lastInputAt < 1000) && now - ownScrollAt > 100 && now - roomSwipeAt > 1000 &&
+        document.getElementById(ROOM_ID)) { roomSwipeAt = now; safe(noteTry)('swipe'); }
     if (feedEndTimer) return;
     feedEndTimer = setTimeout(() => { feedEndTimer = 0; safe(checkFeedEnd)(); }, 250);
   }, { passive: true, capture: true });
+  let hiddenAt = 0;
+  document.addEventListener('visibilitychange', safe(() => {
+    if (document.hidden) hiddenAt = Date.now();
+    if (route() !== 'home') return;
+    if (document.hidden) { homeEvent({ e: 'vis', s: 'hidden' }); return; }
+    const h = hiddenAt ? Date.now() - hiddenAt : 0;
+    homeEvent({ e: 'vis', s: 'visible', h: h < 10000 ? '<10s' : h < 60000 ? '<1m' : h < 600000 ? '<10m' : '>10m' });
+  }));
   setInterval(() => {
     if (route() !== 'home' || document.hidden) return;
     safe(checkFeedEnd)();
     safe(sampleFeed)();
+    safe(checkNotDrawn)();
   }, 1500);
+
+  /* The Home tab. Instagram's bottom-bar Home and the "< Following" /
+   * "< Favorites" link in its header are both a[href="/"]; one dispatcher
+   * decides what a tap on them does (a Favorites star would join here).
+   * - On Home: scrolled down, the tap only goes to the top and keeps the list
+   *   (Instagram's answer is to reload the whole feed 30 s after its last load
+   *   and jump to the top, which can swap an ended Home for a few posts). At
+   *   the top the tap is Instagram's: its own refresh rule applies.
+   * - On Following, Favorites or Older posts: a fresh page of Home, never an
+   *   in-page switch (Instagram's empty-feed screen and its stored copy of a
+   *   feed would follow you there). */
+  function swallow(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }
+  function homeTab(e, a) {
+    if (a.getAttribute('href') !== '/' || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return false;
+    if (route() !== 'home' || CFG.role !== 'main') return false;
+    const variant = feedVariant();
+    if (variant === 'home') {
+      // Search open or a result opening: search's own handling decides.
+      if (search.open || leaving) return false;
+      const se = document.scrollingElement || document.documentElement;
+      const y = yBucket();
+      if (se.scrollTop > 8) {
+        swallow(e);
+        selfScrollAt = Date.now();
+        se.scrollTop = 0;
+        bump(stats.feed, 'homeTapTop');
+        homeEvent({ e: 'tap', a: 'top', y: y });
+        return true;
+      }
+      bump(stats.feed, 'homeTapRefresh');
+      homeEvent({ e: 'tap', a: 'passed', y: y });
+      return false;
+    }
+    swallow(e);
+    const where = a.closest('nav') || a.getBoundingClientRect().top > innerHeight / 2 ? 'bar' : 'header';
+    bump(stats.nav.homeFull, where);
+    openFeedFresh('home');
+    return true;
+  }
+  // A feed as a new page, like the app's menu (which also closes the comments
+  // panel and resets zoom); location.assign when the app's bridge is missing.
+  function openFeedFresh(variant) {
+    if (leaving) { stopFullLoad(leaving); endOpen(); countOpen('cancelled'); }
+    if (search.open) { hideSearch(false); search.suspended = false; clearSaved(); }
+    if (!post('openFeed', { variant: variant })) location.assign(variant === 'home' ? '/' : '/?variant=' + variant);
+  }
 
 
 
@@ -1256,6 +1774,109 @@
     }), 100);
   }
 
+  // The feed this page last showed. Switching feeds inside the page
+  // (Instagram's logo menu, Back over its own entries) loads the new feed as
+  // a fresh page: Instagram's empty-feed screen and its stored, already
+  // filtered copy of a feed never follow you. Once per page, and never again
+  // within 2 s of the last one.
+  const SWITCH_KEY = 'sg_switch';
+  let shownFeed = route() === 'home' ? feedVariant() : null, switched = false;
+  function switchFeed() {
+    if (route() !== 'home') return false;
+    const v = feedVariant(), from = shownFeed;
+    shownFeed = v;
+    if (!from || v === from || leaving) return false;
+    const saved = readSession(SWITCH_KEY) || {};
+    if (switched || Date.now() - (Number(saved.at) || 0) < 2000) {
+      bump(stats.feed, 'switchHeld');
+      pushTrail({ ev: 'switchHeld', from: from, to: v });
+      return false;
+    }
+    switched = true;
+    const n = (saved.n | 0) + 1;
+    writeSession(SWITCH_KEY, { at: Date.now(), n: n });
+    stats.feed.switchLoads = n;
+    pushTrail({ ev: 'switch', from: from, to: v });
+    location.replace(location.href);
+    return true;
+  }
+  // Leaving the page opened from the end card for another feed ends its skip;
+  // opening a post or Stories from it and coming back does not (same list).
+  function feedRouteChanged(previous) {
+    const now = route();
+    if ((previous === 'home') !== (now === 'home')) homeEvent({ e: 'route', to: now === 'home' ? 'home' : now });
+    lastTop = 0;
+    if (skip && now === 'home' && here() !== skip.path) forgetSkip('skipLeft');
+    // Back on the feed from a Story or post: the room and the nudges that
+    // keep trying come back (their timers end while you are away).
+    const back = now === 'home' && previous !== 'home';
+    if (skipping()) {
+      const fs = currentFeed();
+      syncRoom(fs, !fs.ended);
+      if (back && keepsTrying(fs)) scheduleNudge(true);
+      skipProgress(fs);
+    } else {
+      if (skip && skip.status) { clearTimeout(skip.statusTimer); skip.statusTimer = 0; skip.status = ''; post('skipStatus', { on: false, kind: '', n: 0 }); }
+      const fs = currentFeed();
+      if (back && roomWanted(fs, !fs.ended)) { syncRoom(fs, true); if (keepsTrying(fs)) scheduleNudge(true); }
+      if (!(now === 'home' && roomWanted(fs, !fs.ended))) dropRoom();
+    }
+  }
+
+  // A feed that kept posts but draws none, or shows Instagram's empty-feed
+  // screen although SimpleGram handed it something: one reload, at most once
+  // per address per app session, and only once posts have been drawn in this
+  // session (if Instagram changes its markup, this stays quiet, never loops).
+  // Never while the app's end card or Instagram's own "caught up" line is
+  // what the feed shows. "Kept but none drawn" needs a page newer than the
+  // last posts drawn in this page load and 10 s without any: Instagram's
+  // refresh shows a placeholder until its new page lands, and its list can
+  // mount seconds after the first page on a slow phone.
+  const RECOVER_KEY = 'sg_feed_recover', DRAWN_KEY = 'sg_posts_drawn', DRAW_GRACE = 10000;
+  let notDrawn = 0, recoverHeldNoted = false, postsDrawnOnce = !!readSession(DRAWN_KEY), lastDrawnAt = 0;
+  function checkNotDrawn() {
+    if (CFG.role !== 'main') return;
+    if (document.querySelector(POST)) {
+      notDrawn = 0;
+      lastDrawnAt = Date.now();
+      if (!postsDrawnOnce) { postsDrawnOnce = true; writeSession(DRAWN_KEY, 1); }
+      return;
+    }
+    const fs = currentFeed();
+    if (route() !== 'home' || document.hidden || search.open || leaving || document.querySelector('[role="dialog"]') ||
+        !postsDrawnOnce || feedEndShown || (fs.anchorKind === 'marker' && fs.shownCount === 0)) { notDrawn = 0; return; }
+    const stale = fs.shownCount > 0 && fs.lastPageAt > 0 && fs.lastPageAt >= lastDrawnAt && Date.now() - fs.lastPageAt > DRAW_GRACE;
+    const emptyScreen = fs.handed > 0 && (!!document.querySelector(STAR_NULL) || followButtons(document.querySelector('main'), 3) >= 3);
+    if (!stale && !emptyScreen) { notDrawn = 0; return; }
+    if (++notDrawn < 2) return;
+    notDrawn = 0;
+    const saved = readSession(RECOVER_KEY) || {};
+    const paths = Array.isArray(saved.paths) ? saved.paths : [];
+    if (paths.indexOf(here()) >= 0) {
+      if (!recoverHeldNoted) { recoverHeldNoted = true; bump(stats.feed, 'recoverHeld'); pushTrail({ ev: 'recoverHeld' }); }
+      return;
+    }
+    paths.push(here());
+    const n = (saved.n | 0) + 1;
+    writeSession(RECOVER_KEY, { paths: paths.slice(-20), n: n });
+    stats.feed.recovered = n;
+    pushTrail({ ev: 'recover', why: stale ? 'notDrawn' : 'emptyScreen' });
+    // The page opened from the end card keeps its one-time skip across the reload.
+    if (skipping()) {
+      try {
+        sessionStorage.setItem(SKIP_KEY, JSON.stringify({ variant: skip.variant, codes: Array.from(skip.codes), at: Date.now() }));
+      } catch (e) { /* storage unavailable: no skipping */ }
+    }
+    location.reload();
+  }
+  SG.checkNotDrawn = () => safe(checkNotDrawn)();
+  {
+    // Counted across this session's page loads (each switch or recovery is one).
+    const sw = readSession(SWITCH_KEY), rc = readSession(RECOVER_KEY);
+    if (sw && sw.n > 0) stats.feed.switchLoads = sw.n | 0;
+    if (rc && rc.n > 0) stats.feed.recovered = rc.n | 0;
+  }
+
   let lastUrl = location.href;
   function routeChanged() {
     if (location.href === lastUrl) return;
@@ -1268,6 +1889,8 @@
       location.replace('/');
       return;
     }
+    if (CFG.role === 'main' && safe(switchFeed)()) return;
+    if (CFG.role === 'main') safe(feedRouteChanged)(previous);
     if (CFG.role === 'main') {
       // Opening a result keeps search up until the new page is drawn; coming
       // back to the marked entry keeps it up too.
@@ -1294,16 +1917,25 @@
   }
   const nativePush = history.pushState;
   const nativeReplace = history.replaceState;
+  // Diagnostics: Instagram writing the same Home address again (a refresh
+  // of the feed by navigation leaves exactly this).
+  function noteSameAddress(before, kind) {
+    if (location.href === before && route() === 'home') homeEvent({ e: 'hist', k: kind });
+  }
   history.pushState = function pushState() {
     safe(rememberScroll)();
+    const before = location.href;
     const out = nativePush.apply(this, arguments);
     safe(noteHistoryWrite)();
+    safe(noteSameAddress)(before, 'push');
     safe(routeChanged)();
     return out;
   };
   history.replaceState = function replaceState() {
+    const before = location.href;
     const out = nativeReplace.apply(this, arguments);
     safe(noteHistoryWrite)();
+    safe(noteSameAddress)(before, 'replace');
     safe(routeChanged)();
     return out;
   };
@@ -2091,6 +2723,12 @@
     if (route() === 'story') storyDirection = e.clientX < innerWidth / 3 ? 'back' : 'next';
     if (CFG.role !== 'main') return;
     const a = t.closest('a[href]');
+    // On its own: a failure here must never skip the Search tab below.
+    if (a) {
+      let took = false;
+      try { took = homeTab(e, a); } catch (err) { stats.errors++; }
+      if (took) return;
+    }
     if (a && new URL(a.href, location.href).pathname === '/explore/' && a.closest('nav,div')) {
       e.preventDefault();
       e.stopPropagation();
@@ -2844,7 +3482,6 @@
       return true;
     } catch (e) { return false; }
   }
-  function here() { return location.pathname + location.search; }
   // Media that was on the page when a result was tapped (usually Home's) and
   // is still there under the cover: never started or unmuted meanwhile.
   function isOldMedia(v) { return !!(leaving && leaving.oldMedia.has(v)); }
@@ -3066,7 +3703,8 @@
   window.addEventListener('pagehide', safe(() => { if (leaving) { clearTimeout(openTimer); leaving.unloading = true; } }));
   window.addEventListener('pageshow', safe(e => {
     if (!e.persisted) return;
-    safe(loadOpens)();                        // the newer page may have counted since
+    fromBfcache = true;
+    safe(loadOpens)();                       // the newer page may have counted since
     post('search', { open: !!search.open });  // the app's own flags may be stale
     post('route', { url: location.href, route: route() });
     if (!leaving) return;
@@ -3277,6 +3915,21 @@
   /* ------------------------------------------------------------------ *
    * Commands from the Android app.
    * ------------------------------------------------------------------ */
+  // Session storage by key family (counts only; key names are never sent):
+  // Instagram's screen-time snapshots, its tab ids and scroll positions,
+  // SimpleGram's own keys, everything else.
+  function storageShape() {
+    const out = { screenTime: 0, tabId: 0, scroll: 0, sg: 0, other: 0 };
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i) || '';
+      if (/^ig_screen_time|^has_user_dismissed/.test(k)) out.screenTime++;
+      else if (/TabId/.test(k)) out.tabId++;
+      else if (/routeScrollPos/.test(k)) out.scroll++;
+      else if (/^sg_/.test(k)) out.sg++;
+      else out.other++;
+    }
+    return out;
+  }
   function shareUrl() {
     const r = route();
     if (r === 'story') return location.origin + location.pathname;
@@ -3311,11 +3964,15 @@
       }
       case 'splitClosed': closeSplit(); break;
       case 'continueFeed':
-        if (cmd.variant === 'following' || cmd.variant === 'favorites') continueFeed(cmd.variant);
+        // The end card offers Following only (Favorites has its own way in).
+        if (cmd.variant === 'following') continueFeed(cmd.variant);
         break;
       case 'storyHold': storyHold(!!cmd.on); break;
       case 'viewer': if (cmd.id) CFG.viewerId = String(cmd.id); break;
-      case 'status': post('status', { stats: stats, route: route(), version: CFG.version }); break;
+      case 'status':
+        stats.storage = safe(storageShape)() || null;
+        post('status', { stats: stats, route: route(), version: CFG.version });
+        break;
       case 'tidy': queueTidy(); break;
       default: break;
     }

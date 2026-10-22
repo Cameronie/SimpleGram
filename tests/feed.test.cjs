@@ -72,10 +72,13 @@ const feedStats = pg => pg.evaluate(() => window.__sg.stats.feed);
 // Instagram's timers run on a fake clock, so 15 s waits take no time. (The
 // script's own 1.5 s interval starts before the clock does; a scroll event
 // runs the same end-of-Home check at the current fake time.)
+// The clock is paused: time moves only by runFor, never by the machine's own
+// time (under load a flowing fake clock could skip or rewind a long runFor).
 async function openClocked(url, html) {
   const pg = await open(url, html);
   await pg.clock.install();
   await pg.reload();
+  await pg.clock.pauseAt(await pg.evaluate(() => Date.now() + 1000));
   return pg;
 }
 async function check(pg) {
@@ -127,20 +130,31 @@ test('feed: a marker in a page without plain posts still ends Home', async () =>
   const pg = await open('https://www.instagram.com/', FEED_HTML);
   await deliver(pg, page([friend('FRIEND1'), friend('FRIEND2')]));
   const out = await deliver(pg, page([recs('HSMARK1'), marker(), recs('AFTER01')]));
-  assert.deepEqual(keys(out), [], 'the suggestion before the marker is removed too');
+  // The suggestion before the marker is removed too; with nothing else left the
+  // marker stays without its groups (the page may be a head load: never []).
+  assert.deepEqual(keys(out), ['end_of_feed_demarcator']);
+  assert.deepEqual(conn(out).edges[0].node.end_of_feed_demarcator.group_set.groups, []);
   assert.equal(conn(out).page_info.has_next_page, false);
+  assert.equal((await feedStats(pg)).markerKept, 1);
   assert.equal((await feedStats(pg)).unknownPages, 0);
   await toBottom(pg);
   await waitOn(pg);
 });
 
-test('feed: the marker as the very first item ends Home and the card shows', async () => {
+test('feed: the marker as the very first item ends Home, stays as Instagram\'s own line (no groups), and the card shows', async () => {
   const pg = await open('https://www.instagram.com/', FEED_HTML);
   const out = await deliver(pg, page([marker()]));
-  assert.deepEqual(keys(out), []);
+  // 1.2 handed an empty first page here (Instagram's empty-feed screen, B18).
+  assert.deepEqual(keys(out), ['end_of_feed_demarcator']);
+  const gs = conn(out).edges[0].node.end_of_feed_demarcator.group_set;
+  assert.deepEqual(gs.groups, []);
+  assert.equal(gs.active_group_id, null);
   assert.equal(conn(out).page_info.has_next_page, false);
   await waitOn(pg);
-  assert.equal((await lastEnd(pg)).subtitle, SUBTITLE);
+  const m = await lastEnd(pg);
+  assert.equal(m.caughtUp, true);
+  assert.equal(m.subtitle, '', 'Instagram draws its own line: the card does not repeat it');
+  assert.deepEqual((await feedStats(pg)).anchorKind, { seen: 0, marker: 1, recs: 0 });
 });
 
 test('feed: the suggested accounts Instagram shows on an empty Home are emptied', async () => {
@@ -207,9 +221,10 @@ test('feed: after the end, a refresh starts over and anything else stays out', a
   assert.deepEqual(keys(again), ['FRIEND1', 'FRIEND2']);
   assert.equal(conn(again).page_info.has_next_page, false);
   // Instagram loads more after the end, with nobody you follow: never shown,
-  // and never left alone as an unknown format.
+  // and never left alone as an unknown format. It may be a reload that
+  // replaces Home's list, so one suggestion stays, hidden (once per end).
   const extra = await deliver(pg, page([recs('EOF0001'), stranger('EOF0002'), noInfo('EOF0003'), edge({ post_v2: { code: 'EOF0004' } })], { cursor: 'eofrecs' }));
-  assert.deepEqual(keys(extra), []);
+  assert.deepEqual(keys(extra), ['explore:EOF0001']);
   assert.equal(conn(extra).page_info.has_next_page, false);
   const noCursor = await parse(pg, page([noInfo('EOF0005'), edge({ post_v2: { code: 'EOF0006' } })], { cursor: null }));
   assert.deepEqual(keys(noCursor), [], 'a page without a cursor is not let through either');
@@ -284,7 +299,9 @@ test('feed: replaying the phone\'s pages, suggestions are removed and Home ends 
     kept.push(conn(out).edges.map(e => e.node.media ? e.node.media.code : Object.keys(e.node).filter(k => e.node[k] && k !== '__typename')[0]));
     next.push(conn(out).page_info.has_next_page);
   }
-  assert.deepEqual(kept, [['FRIEND1', 'FRIEND2'], [], [], [], [], [], []]);
+  // The marker page keeps the marker alone (no groups); after the end, each page
+  // keeps one hidden suggestion (any of them may be a reload of Home).
+  assert.deepEqual(kept, [['FRIEND1', 'FRIEND2'], [], ['end_of_feed_demarcator'], ['explore_story'], ['explore_story'], ['explore_story'], ['explore_story']]);
   assert.deepEqual(next, [true, true, false, false, false, false, false]);
   const f = await feedStats(pg);
   // 1.1 read: Posts shown 2, Suggested removed 0, Pages read 8 (7 unrecognised).
@@ -296,7 +313,8 @@ test('feed: replaying the phone\'s pages, suggestions are removed and Home ends 
   assert.equal(f.ad, 1);
   assert.equal(f.eof, 1);
   assert.equal(f.inMarker, 2);
-  assert.equal(f.afterEnd, 11, 'the 4 later pages');
+  assert.equal(f.afterEnd, 7, 'the 4 later pages, but their hidden anchors');
+  assert.equal(f.anchorAfterEnd, 4);
   const fs = await feedState(pg);
   assert.equal(fs.ended, true);
   assert.equal(fs.caughtUp, true);
@@ -459,9 +477,10 @@ test('backup filter: four hidden suggestions in a row at the end of Home end it'
   assert.equal(f.hiddenRun, 4);
   await toBottom(pg);
   await waitOn(pg);
-  // Instagram asks for more: nobody you follow there, so it is not shown and paging stops.
+  // Instagram asks for more: nobody you follow there, so it is not shown and
+  // paging stops (one suggestion stays, hidden: it may be a reload of Home).
   const out = await deliver(pg, page([noInfo('SUGG004'), noInfo('SUGG005'), recs('REC0001')], { cursor: 'c2' }));
-  assert.deepEqual(keys(out), []);
+  assert.deepEqual(keys(out), ['explore:REC0001']);
   assert.equal(conn(out).page_info.has_next_page, false);
 });
 
@@ -663,16 +682,37 @@ test('nudges: the extra room below is removed even when frames stop', async () =
   assert.equal(await pg.evaluate(() => document.scrollingElement.scrollTop), 0);
 });
 
-test('feed: paging past posts already seen stops after 15 pages, not 40', async () => {
+test('feed: paging past posts already seen stops after min(80, seen + 3) pages (1.2: 15 to 60 by a guess of 12 a page)', async () => {
   const pg = await open('https://www.instagram.com/', BLANK);
-  await parse(pg, timeline([edge({ media: media('SEEN001', user('a', true)) })]));
+  const seen = Array.from({ length: 100 }, (_, i) => 'SEEN' + String(i).padStart(3, '0'));
+  const friendOf = {};
+  const fe = c => edge({ media: media(c, friendOf[c] || (friendOf[c] = user('f' + c, true))) });
+  await parse(pg, timeline(seen.map(fe)));
   await Promise.all([pg.waitForURL(/variant=following/), pg.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' }))]);
-  const flags = await pg.evaluate(p => {
-    const out = [];
-    for (let i = 0; i < 16; i++) out.push(JSON.parse(JSON.stringify(p)).data.xdt_api__v1__feed__timeline__connection.page_info.has_next_page);
-    return out;
-  }, timeline([edge({ media: media('SEEN001', user('a', true)) })]));
-  assert.deepEqual(flags, Array(14).fill(true).concat([false, false]));
+  // The first page anchors one seen post; then one distinct seen post a page.
+  const out = [];
+  for (let i = 0; i < 81; i++) {
+    const o = await parse(pg, page([fe(seen[i])], { cursor: 'f' + i }));
+    out.push([keys(o).length, conn(o).page_info.has_next_page]);
+  }
+  assert.deepEqual(out[0], [1, true], 'the anchor');
+  assert.ok(out.slice(1, 80).every(([n, more]) => n === 0 && more), JSON.stringify(out.slice(1, 80)));
+  assert.deepEqual(out[80], [0, false], 'the 80th page of only seen posts ends it');
+  assert.equal((await feedState(pg)).ended, true);
+});
+
+test('feed: paging past seen posts stops when Instagram repeats its cursor', async () => {
+  const pg = await open('https://www.instagram.com/', BLANK);
+  const fr = {};
+  const fe = c => edge({ media: media(c, fr[c] || (fr[c] = user('f' + c, true))) });
+  await parse(pg, timeline(['SEEN001', 'SEEN002', 'SEEN003', 'SEEN004'].map(fe)));
+  await Promise.all([pg.waitForURL(/variant=following/), pg.evaluate(() => window.__sg.onNative({ type: 'continueFeed', variant: 'following' }))]);
+  await parse(pg, page([fe('SEEN001')], { cursor: 'x1' }));
+  const a = await parse(pg, page([fe('SEEN002')], { cursor: 'x2' }));
+  assert.equal(conn(a).page_info.has_next_page, true);
+  const b = await parse(pg, page([fe('SEEN003')], { cursor: 'x2' }));
+  assert.equal(conn(b).page_info.has_next_page, false);
+  assert.equal((await feedStats(pg)).cursorEcho, 1);
 });
 
 test('feed: a Home page that lands while a Story is open still counts as seen on Home', async () => {

@@ -503,3 +503,45 @@ test('B14: a query edited just before the tap gets its results when search comes
   const st = await page.evaluate(() => ({ q: window.__sg.search.query, postsQ: window.__sg.search.posts.q, spin: document.getElementById('sg-search').shadowRoot.querySelectorAll('.spin').length }));
   assert.deepEqual(st, { q: 'sharksx', postsQ: 'sharksx', spin: 0 });
 });
+
+/* ---------------- Batch 4: the Home tab with search (B16, R5's "Home elsewhere") ---------------- */
+
+const goCalls = page => page.evaluate(() => window.__goCalls || 0);
+const openFeeds = page => page.evaluate(() => window.__sent.filter(m => m.action === 'openFeed').map(m => m.variant));
+
+test('Home tab on Home with SimpleGram\'s search open is Instagram\'s (search\'s own handling), never swallowed', async () => {
+  const page = await start({ exposeRequire: true, linkNav: true, fetchMs: 100, renderMs: 100 });
+  await page.evaluate(() => window.scrollTo(0, 50));
+  const before = await goCalls(page);
+  await page.tap('#nav a[href="/"]');
+  await sleep(300);
+  assert.equal(await goCalls(page), before + 1, 'Instagram\'s router got the tap');
+  assert.deepEqual(await openFeeds(page), []);
+  assert.equal(await page.evaluate(() => window.__sg.stats.feed.homeTapTop || 0), 0);
+});
+
+test('Home tab on Following with SimpleGram\'s search open closes search and loads Home afresh', async () => {
+  const page = await start({ start: '/?variant=following', exposeRequire: true, linkNav: true, fetchMs: 100, renderMs: 100 });
+  const before = await goCalls(page);
+  await page.tap('#nav a[href="/"]');
+  await sleep(300);
+  assert.equal(await goCalls(page), before, 'no in-page switch');
+  assert.equal(await searchUp(page), false);
+  assert.deepEqual(await openFeeds(page), ['home']);
+  assert.equal(await page.evaluate(() => sessionStorage.getItem('sg_search_state')), null, 'search is not brought back later');
+});
+
+test('Home tab on Following while a result is opening calls the open off and loads Home afresh', async () => {
+  const page = await start({ start: '/?variant=following', exposeRequire: true, linkNav: true, fetchMs: 1500, renderMs: 500 });
+  await showPosts(page);
+  await tapCell(page);
+  await sleep(300);
+  await page.tap('#nav a[href="/"]');
+  await sleep(300);
+  assert.deepEqual(await openFeeds(page), ['home']);
+  assert.equal(await searchUp(page), false);
+  assert.equal((await opens(page)).cancelled, 1);
+  await sleep(9000);   // past every full-load rule: the result is never loaded
+  assert.equal(await loads(page), 1);
+  assert.ok(!(await page.evaluate(() => location.pathname)).startsWith('/p/'));
+});
