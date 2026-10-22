@@ -175,4 +175,7 @@ async function shadowClick(page, text) {
   }, text);
 }
 
-module.exports = { SCRIPT, ME, useBrowser, open, sent, waitSent, PNG, BLANK, user, media, edge, timeline, codes, mixedFeed, NAV, article, SNAP, swipe, grid, NAVPAGE, openSearchTab, searchText, shadowClick };
+// The shared browser, for files that build their own pages (star.test.cjs).
+function getBrowser() { return browser; }
+
+module.exports = { SCRIPT, ME, useBrowser, getBrowser, open, sent, waitSent, PNG, BLANK, user, media, edge, timeline, codes, mixedFeed, NAV, article, SNAP, swipe, grid, NAVPAGE, openSearchTab, searchText, shadowClick };

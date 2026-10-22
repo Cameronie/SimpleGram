@@ -27,8 +27,11 @@
     dom: { ads: 0, suggested: 0, reposts: 0, banners: 0, reelsTab: 0, exploreGrid: 0 },
     swipesBlocked: 0, indexed: 0, autoplayed: 0,
     downloads: { ok: 0, failed: {} },
-    // Instagram's bottom bar and header links (counts only).
-    nav: { homeFull: { bar: 0, header: 0 } },
+    // Instagram's bottom bar and header links, and the Favorites star (counts,
+    // timings and layout shapes only).
+    nav: { homeFull: { bar: 0, header: 0 }, inserted: 0, moved: 0, notBottom: 0, waitReact: 0, waitReactGaveUp: 0,
+      igHasFav: 0, taps: 0, top: 0, refresh: 0, refreshHeld: 0, closedSearch: 0, openCancelled: 0, tidyScans: 0,
+      obsMs: 0, geo: null },
   });
   function bump(o, k, n) { o[k] = (o[k] || 0) + (n == null ? 1 : n); }
   // Session storage that never throws (private windows, blocked storage).
@@ -1328,7 +1331,8 @@
 
   /* The Home tab. Instagram's bottom-bar Home and the "< Following" /
    * "< Favorites" link in its header are both a[href="/"]; one dispatcher
-   * decides what a tap on them does (a Favorites star would join here).
+   * decides what a tap on them, or on SimpleGram's Favorites star, does.
+   * - The star: openFavorites() (R5).
    * - On Home: scrolled down, the tap only goes to the top and keeps the list
    *   (Instagram's answer is to reload the whole feed 30 s after its last load
    *   and jump to the top, which can swap an ended Home for a few posts). At
@@ -1342,8 +1346,16 @@
     e.stopImmediatePropagation();
   }
   function homeTab(e, a) {
-    if (a.getAttribute('href') !== '/' || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return false;
-    if (route() !== 'home' || CFG.role !== 'main') return false;
+    if (CFG.role !== 'main' || e.button) return false;
+    // The star is SimpleGram's own: Instagram never sees its taps.
+    if (a.closest('[data-sg-fav]')) {
+      swallow(e);
+      stats.nav.taps++;
+      openFavorites();
+      return true;
+    }
+    if (a.getAttribute('href') !== '/' || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return false;
+    if (route() !== 'home') return false;
     const variant = feedVariant();
     if (variant === 'home') {
       // Search open or a result opening: search's own handling decides.
@@ -1371,9 +1383,55 @@
   // A feed as a new page, like the app's menu (which also closes the comments
   // panel and resets zoom); location.assign when the app's bridge is missing.
   function openFeedFresh(variant) {
-    if (leaving) { stopFullLoad(leaving); endOpen(); countOpen('cancelled'); }
+    cancelOpen();
     if (search.open) { hideSearch(false); search.suspended = false; clearSaved(); }
     if (!post('openFeed', { variant: variant })) location.assign(variant === 'home' ? '/' : '/?variant=' + variant);
+  }
+  // A search result still opening (B14) is called off first: its watcher's
+  // own full load of the result would otherwise replace the page asked for.
+  function cancelOpen() {
+    if (!leaving) return;
+    stopFullLoad(leaving);
+    endOpen();
+    countOpen('cancelled');
+    stats.nav.openCancelled++;
+  }
+  // The Favorites star (R5). Favorites opens as a new page, like the menu
+  // (B18: an in-page switch can bring Instagram's stored copy of a feed or
+  // its empty-feed screen along). Already on Favorites, a tap is Instagram's
+  // Home-tab answer: search closed first, then to the top, then (at the top)
+  // a fresh load, at most once per 30 s after the last load or feed page
+  // (Instagram's shouldRefreshOnHomeClick rule). No skip list is written:
+  // Favorites shows everything, newest first.
+  const FAV_URL = '/?variant=favorites';
+  const FAV_REFRESH_MS = 30000;
+  function onFavorites() { return route() === 'home' && feedVariant() === 'favorites'; }
+  function openFavorites() {
+    cancelOpen();
+    if (!onFavorites()) {
+      post('feedEnd', { on: false });
+      openFeedFresh('favorites');
+      return;
+    }
+    if (search.open) {
+      hideSearch(true);
+      search.suspended = false;
+      clearSaved();
+      stats.nav.closedSearch++;
+      return;
+    }
+    const se = document.scrollingElement || document.documentElement;
+    if (se.scrollTop > 8) {
+      selfScrollAt = Date.now();
+      se.scrollTop = 0;
+      stats.nav.top++;
+      return;
+    }
+    const loadedAt = performance.timeOrigin || Date.now() - performance.now();
+    const last = Math.max(loadedAt, feedFor('favorites').lastPageAt || 0);
+    if (Date.now() - last <= FAV_REFRESH_MS) { stats.nav.refreshHeld++; return; }
+    stats.nav.refresh++;
+    location.replace(FAV_URL);
   }
 
 
@@ -1439,7 +1497,7 @@
       'video[data-sg-full]:fullscreen::-webkit-media-controls{display:none!important}',
       'video[data-sg-full]:fullscreen::-webkit-media-controls-enclosure{display:none!important}',
       'video[data-sg-full]:fullscreen::-webkit-media-controls-overlay-play-button{display:none!important}',
-    ].join('\n');
+    ].concat(FAV_CSS).join('\n');
     (document.head || document.documentElement).appendChild(s);
   }
 
@@ -1494,6 +1552,389 @@
       if (hide(el, 'reels-tab')) stats.dom.reelsTab++;
     }
   }
+
+  /* ------------------------------------------------------------------ *
+   * Favorites in Instagram's bottom bar (R5): a star right after Home, in
+   * the room the hidden Reels tab left. The star is SimpleGram's own
+   * element, one more child of Instagram's flex row (which spaces its
+   * items evenly); Instagram's own items are never moved or changed. An
+   * observer started at document start puts it in during the same
+   * mutation microtask in which React adds the bar, so the bar never
+   * shifts on screen. Taps on it go through homeTab().
+   * Work stays bounded on a long feed: the observer looks only at added
+   * subtrees holding a link to "/", the tidy pass re-checks the stars it
+   * knows and searches the page only when there are none, and no ancestor
+   * that holds the feed is ever searched.
+   * ------------------------------------------------------------------ */
+  // Instagram's own star (IGDSStarPanoFilledIcon), 24 x 24. The outline is the
+  // same shape at 91% with a 2 px line, like Instagram's Search and Messages icons.
+  const STAR_D = 'M18.18 22.51a.99.99 0 0 1-.513-.142L12 18.975l-5.667 3.393a1 1 0 0 1-1.492-1.062l1.37-6.544-4.876-4.347a.999.999 0 0 1 .536-1.737l6.554-.855 2.668-5.755a1 1 0 0 1 1.814 0l2.668 5.755 6.554.855a.999.999 0 0 1 .536 1.737l-4.876 4.347 1.37 6.544a1 1 0 0 1-.978 1.205Z';
+  const FAV_CSS = [
+    // Instagram's phone items: a 24 px icon in a 48 px box (12 px padding), centred.
+    // Flex, not inline: an inline link's line box depends on the phone's fonts.
+    '[data-sg-fav] a{display:flex;justify-content:center;color:rgb(var(--ig-primary-text,0,0,0));text-decoration:none;outline:none}',
+    '[data-sg-fav] .sg-fav-box{box-sizing:border-box;display:flex;justify-content:center;padding:12px;border-radius:8px;transition:transform .1s}',
+    '[data-sg-fav] a:active .sg-fav-box{transform:scale(.97)}',
+    '[data-sg-fav] a:focus-visible .sg-fav-box{box-shadow:0 0 0 2px rgb(var(--ig-primary-text,0,0,0))}',
+    '[data-sg-fav] svg{display:block;width:24px;height:24px}',
+    // Filled on Favorites, an outline elsewhere (Instagram's Home icon is left alone).
+    '[data-sg-fav] .sg-on,html[data-sg-feed="favorites"] [data-sg-fav] .sg-off{display:none}',
+    'html[data-sg-feed="favorites"] [data-sg-fav] .sg-on{display:block}',
+    // Stories and messages never show it (a bar kept under them keeps its star, hidden).
+    'html[data-sg-nostar] [data-sg-fav]{display:none!important}',
+  ];
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  function starSvg(cls, filled) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('class', cls);
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    const p = document.createElementNS(SVG_NS, 'path');
+    p.setAttribute('d', STAR_D);
+    if (filled) svg.setAttribute('fill', 'currentColor');
+    else {
+      svg.setAttribute('fill', 'none');
+      svg.setAttribute('stroke', 'currentColor');
+      svg.setAttribute('stroke-width', '2.2');
+      svg.setAttribute('stroke-linejoin', 'round');
+      p.setAttribute('transform', 'matrix(.909 0 0 .909 1.091 1.091)');
+    }
+    svg.appendChild(p);
+    return svg;
+  }
+  // Own markup, not a copy of Home's: a copy would carry href="/" (and be taken
+  // for Home), aria-selected and Instagram's passing press classes.
+  function starNode() {
+    const slot = document.createElement('div');
+    slot.setAttribute('data-sg-fav', '');
+    const a = document.createElement('a');
+    a.setAttribute('href', FAV_URL);
+    a.setAttribute('role', 'link');
+    a.setAttribute('aria-label', 'Favorites');
+    const box = document.createElement('div');
+    box.className = 'sg-fav-box';
+    box.appendChild(starSvg('sg-off', false));
+    box.appendChild(starSvg('sg-on', true));
+    a.appendChild(box);
+    const inner = document.createElement('div');
+    inner.appendChild(a);
+    slot.appendChild(inner);
+    markStar(slot);
+    return slot;
+  }
+  function markStar(star) {
+    const a = star.querySelector('a');
+    if (!a) return;
+    if (onFavorites()) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  }
+  // Which feed shows (the star's filled state), and whether this page shows no star.
+  function markFeed() {
+    const root = document.documentElement;
+    if (CFG.role !== 'main' || !root) return;
+    root.setAttribute('data-sg-feed', route() === 'home' ? feedVariant() : '');
+    if (noStarHere()) root.setAttribute('data-sg-nostar', '');
+    else root.removeAttribute('data-sg-nostar');
+    for (const s of stars) markStar(s);
+  }
+  function noStarHere() { const r = route(); return r === 'story' || r === 'direct'; }
+
+  const stars = new Set();           // the stars in place (SimpleGram's own nodes)
+  // Bar rows without a star for now: not along the bottom (a side bar),
+  // Instagram's own Favorites item there, or React never took them over.
+  const parked = new Set();
+  const waiting = new Set();         // rows React hasn't taken over yet
+  const waits = new WeakMap();       // row -> { n, at, gaveUp }
+  const notBottomRows = new WeakSet();
+  let bottomSeen = new WeakMap();    // row -> { v, at }; cleared on resize
+  let rowFlagged = false, lastStarScan = 0, waitTimer = 0, geoTimer = 0, geoTries = 0;
+  // A row of Instagram's bar: at least 4 items and a link to Messages (the inbox,
+  // or the last chat: DIRECT_THREADS + key) or Explore. The look inside stops
+  // after 400 elements (a bar has about 100), so an ancestor that holds the
+  // feed is never searched. (Finding the page's <main> to rule it out costs
+  // more: about 2 ms after each change on a long feed.)
+  function barRow(row) {
+    if (row.childElementCount < 4) return false;
+    let n = row.firstElementChild, seen = 0;
+    while (n && n !== row) {
+      if (++seen > 400) return false;
+      if (n.tagName === 'A') {
+        const h = n.getAttribute('href') || '';
+        if (h === '/explore/' || h.startsWith('/direct/')) return true;
+      }
+      if (n.firstElementChild) { n = n.firstElementChild; continue; }
+      while (n && n !== row && !n.nextElementSibling) n = n.parentElement;
+      if (n && n !== row) n = n.nextElementSibling;
+    }
+    return false;
+  }
+  // Home's item (the row's child) for a link to "/", or null for any other link to "/".
+  function homeItem(a) {
+    // Instagram's bar row is marked ignore-dynamic (PolarisNavigationIcons).
+    let el = a;
+    for (let i = 0; i < 6; i++) {
+      const row = el.parentElement;
+      if (!row || row === document.body) break;
+      if (row.getAttribute('data-visualcompletion') === 'ignore-dynamic') {
+        if (barRow(row)) return el;
+        break;
+      }
+      el = row;
+    }
+    // Otherwise a short climb; never from a link in the page or its header
+    // (the "< Favorites" link is one, deep in a long feed).
+    if (a.closest('main,header')) return null;
+    el = a;
+    for (let i = 0; i < 6; i++) {
+      const row = el.parentElement;
+      if (!row || row === document.body || row === document.documentElement) return null;
+      if (barRow(row)) return el;
+      el = row;
+    }
+    return null;
+  }
+  // A row along the bottom of the screen (a phone's bar), not the side bar of
+  // a wide screen or a header. Works while the bar is hidden too. Remembered
+  // per row until the window changes size (a "no" is looked at again after 2 s:
+  // Instagram's styles may not have applied yet).
+  function bottomRow(row) {
+    const seen = bottomSeen.get(row);
+    if (seen && (seen.v || Date.now() - seen.at < 2000)) return seen.v;
+    const v = measureBottom(row);
+    bottomSeen.set(row, { v: v, at: Date.now() });
+    return v;
+  }
+  function measureBottom(row) {
+    const cs = getComputedStyle(row);
+    if (cs.display !== 'flex' || cs.flexDirection !== 'row') return false;
+    let el = row;
+    for (let i = 0; i < 15 && el && el !== document.body; i++, el = el.parentElement) {
+      const s = getComputedStyle(el);
+      if (s.position === 'fixed') return parseFloat(s.bottom) <= 1 || s.bottom === 'auto' && parseFloat(s.top) > innerHeight / 2;
+    }
+    return false;
+  }
+  // React's own key on the nodes it manages. A bar drawn by the server and
+  // not yet taken over by React must not get an extra child: React would
+  // throw the bar away and draw it again.
+  function reactOwned(el) {
+    return Object.keys(el).some(k => k.startsWith('__reactFiber$'));
+  }
+  function reactLike(el) {
+    return Object.keys(el).some(k => k.startsWith('__react'));
+  }
+  function igFavIn(row) {
+    for (const l of row.querySelectorAll('a[href*="variant=favorites"]')) if (!l.closest('[data-sg-fav]')) return true;
+    return false;
+  }
+  function homeChild(row, star) {
+    for (const c of row.children) if (c !== star && c.querySelector('a[href="/"]')) return c;
+    return null;
+  }
+  function dropStar(star) {
+    stars.delete(star);
+    star.remove();
+  }
+  // Puts (or keeps) one star right after Home's item in this row, or none where it doesn't belong.
+  function settleRow(row, item) {
+    let star = null;
+    for (const c of row.children) if (c.hasAttribute('data-sg-fav')) { star = c; break; }
+    if (!reactOwned(row) && !waitForReact(row)) return;
+    watchRow(row);
+    if (!bottomRow(row)) {
+      if (star) dropStar(star);
+      parked.add(row);
+      if (!notBottomRows.has(row)) { notBottomRows.add(row); stats.nav.notBottom++; }
+      return;
+    }
+    // Instagram's own Favorites item (if it ever adds one) wins.
+    if (igFavIn(row)) {
+      if (star) dropStar(star);
+      parked.add(row);
+      stats.nav.igHasFav = 1;
+      return;
+    }
+    parked.delete(row);
+    if (star && item.nextElementSibling === star) { stars.add(star); return; }
+    if (star) stats.nav.moved++;
+    else {
+      addStyle();
+      if (!document.documentElement.hasAttribute('data-sg-feed')) markFeed();
+      star = starNode();
+      stats.nav.inserted++;
+    }
+    row.insertBefore(star, item.nextSibling);
+    stars.add(star);
+    // The empty Reels item goes in the same moment, so the bar never shifts.
+    for (const c of row.children) {
+      if (c !== star && c.querySelector('a[href="/reels/"],a[href="/reels"]') && hide(c, 'reels-tab')) stats.dom.reelsTab++;
+    }
+    if (!stats.nav.geo && !geoTimer && geoTries < 3) geoTimer = setTimeout(() => { geoTimer = 0; geoTries++; safe(sampleNav)(); }, 2000);
+  }
+  // True when the row may take the star now. Otherwise it is looked at again
+  // every 400 ms, for 25 tries or 10 s at most; then only a tidy pass that
+  // finds it React's (or carrying another of React's keys) puts the star in.
+  function waitForReact(row) {
+    let w = waits.get(row);
+    if (!w) waits.set(row, w = { n: 0, at: Date.now(), gaveUp: false });
+    if (w.gaveUp) return reactLike(row);
+    if (w.n >= 25 || Date.now() - w.at > 10000) {
+      w.gaveUp = true;
+      waiting.delete(row);
+      parked.add(row);
+      stats.nav.waitReactGaveUp++;
+      return reactLike(row);
+    }
+    stats.nav.waitReact++;
+    waiting.add(row);
+    if (!waitTimer) waitTimer = setTimeout(retryWaiting, 400);
+    return false;
+  }
+  const retryWaiting = safe(() => {
+    waitTimer = 0;
+    for (const row of Array.from(waiting)) {
+      const w = waits.get(row);
+      if (w) w.n++;
+      if (!row.isConnected) { waiting.delete(row); continue; }
+      const item = homeChild(row, null);
+      if (!item) { waiting.delete(row); continue; }
+      if (reactOwned(row)) waiting.delete(row);
+      settleRow(row, item);
+    }
+  });
+  // The observer: only added subtrees holding a link to "/" are looked at.
+  function starsAdded(records) {
+    if (CFG.role !== 'main') return;
+    if (noStarHere()) { rowFlagged = true; return; }   // Stories, messages: nothing to do
+    const t0 = performance.now();
+    for (const r of records) {
+      for (const n of r.addedNodes) {
+        if (n.nodeType !== 1 || n.hasAttribute('data-sg-fav')) continue;
+        if (n.matches('a[href="/"]')) starFor(n);
+        else if (n.firstElementChild) for (const a of n.querySelectorAll('a[href="/"]')) starFor(a);
+      }
+    }
+    const ms = performance.now() - t0;
+    if (ms > stats.nav.obsMs) stats.nav.obsMs = Math.round(ms * 100) / 100;
+  }
+  function starFor(a) {
+    const item = homeItem(a);
+    if (!item) return;
+    const next = item.nextElementSibling;
+    if (next && next.hasAttribute('data-sg-fav') && stars.has(next)) return;   // already in place
+    settleRow(item.parentElement, item);
+  }
+  // Every Home link on the page (bounded climbs): only when no bar is known
+  // at all, or the observer skipped something (on Stories or in messages).
+  function searchStars() {
+    lastStarScan = Date.now();
+    rowFlagged = false;
+    stats.nav.tidyScans++;
+    for (const a of document.querySelectorAll('a[href="/"]')) {
+      const item = homeItem(a);
+      if (item) settleRow(item.parentElement, item);
+    }
+  }
+  // The tidy pass: the known stars (dropped when gone, put back after Home
+  // when moved) and the parked rows; the whole page only when nothing is known.
+  // force: the layout may have changed (resize), so every star is looked at.
+  function tidyStars(force) {
+    if (CFG.role !== 'main' || !document.body || noStarHere()) return;
+    for (const s of Array.from(stars)) {
+      const row = s.parentElement;
+      if (!s.isConnected || !row) { stars.delete(s); continue; }
+      const prev = s.previousElementSibling;
+      if (!force && prev && prev.querySelector('a[href="/"]') && !igFavIn(row)) continue;
+      const item = homeChild(row, s);
+      if (item) settleRow(row, item); else dropStar(s);
+    }
+    for (const row of Array.from(parked)) {
+      const item = row.isConnected && homeChild(row, null);
+      if (!item) { parked.delete(row); continue; }
+      settleRow(row, item);
+    }
+    if (rowFlagged || !stars.size && !parked.size && !waiting.size && Date.now() - lastStarScan > 1000) searchStars();
+  }
+  // Turning the phone switches Instagram's bar to its side bar, or back: a
+  // class or style change on the row or its container, which the observer of
+  // added nodes doesn't see. Those few elements are watched, so the star
+  // follows in the same moment React makes the change (no frame shows it in
+  // the side bar, or the bar without it).
+  const watchOf = new WeakMap();     // watched element -> the bar rows under it
+  const watchedRows = new WeakSet();
+  let rowWatch = null;
+  function watchRow(row) {
+    if (watchedRows.has(row)) return;
+    watchedRows.add(row);
+    if (!rowWatch) {
+      try { rowWatch = new MutationObserver(safe(rowsChanged)); } catch (e) { return; }
+    }
+    let el = row;
+    for (let i = 0; i < 8 && el && el !== document.body; i++, el = el.parentElement) {
+      let set = watchOf.get(el);
+      if (!set) watchOf.set(el, set = new Set());
+      for (const old of set) if (!old.isConnected) set.delete(old);
+      set.add(row);
+      rowWatch.observe(el, { attributes: true, attributeFilter: ['class', 'style'] });
+    }
+  }
+  function rowsChanged(records) {
+    if (CFG.role !== 'main' || noStarHere()) return;
+    const done = new Set();
+    for (const r of records) {
+      for (const row of watchOf.get(r.target) || []) {
+        if (done.has(row) || !row.isConnected) continue;
+        done.add(row);
+        bottomSeen.delete(row);
+        const item = homeChild(row, null);
+        if (item) settleRow(row, item);
+      }
+    }
+  }
+  // And as a backstop, every star is looked at before each frame for a
+  // second after the window changes size; one search of the page at the end.
+  let resizeUntil = 0, resizeFrame = 0;
+  function resizeFrameCheck() {
+    resizeFrame = 0;
+    bottomSeen = new WeakMap();
+    tidyStars(true);
+    if (Date.now() < resizeUntil) resizeFrame = requestAnimationFrame(safe(resizeFrameCheck));
+    else searchStars();
+  }
+  // Shapes only: does the star line up with Instagram's items on this phone?
+  function sampleNav() {
+    const star = Array.from(stars).find(s => s.isConnected && visibleBox(s));
+    if (!star) return;
+    const row = star.parentElement;
+    const items = Array.from(row.children).filter(c => visibleBox(c));
+    const home = star.previousElementSibling;
+    const homeSvg = home && Array.from(home.querySelectorAll('a[href="/"] svg')).find(s => visibleBox(s));
+    const favSvg = Array.from(star.querySelectorAll('svg')).find(s => visibleBox(s));
+    if (!homeSvg || !favSvg) return;
+    const hb = homeSvg.getBoundingClientRect(), sb = favSvg.getBoundingClientRect();
+    const centres = items.map(c => { const r = c.getBoundingClientRect(); return r.left + r.width / 2; });
+    const gaps = centres.slice(1).map((x, i) => x - centres[i]);
+    const msg = row.querySelector('a[href^="/direct/"]');
+    stats.nav.geo = {
+      items: items.length, rowW: Math.round(row.getBoundingClientRect().width),
+      home: [Math.round(hb.width), Math.round(hb.height)], star: [Math.round(sb.width), Math.round(sb.height)],
+      dy: Math.round((sb.top + sb.height / 2) - (hb.top + hb.height / 2)),
+      gap: gaps.length ? [Math.round(Math.min.apply(null, gaps)), Math.round(Math.max.apply(null, gaps))] : null,
+      sameColour: getComputedStyle(homeSvg).color === getComputedStyle(favSvg).color,
+      // Where Messages points (a shape, never the chat): the inbox or a chat.
+      msg: !msg ? 'none' : /^\/direct\/inbox\/?$/.test(msg.getAttribute('href')) ? 'inbox' : 'thread',
+    };
+  }
+  // Watches from document start: Instagram may draw its bar before
+  // DOMContentLoaded, when the rest of SimpleGram starts.
+  if (CFG.role === 'main') {
+    try { new MutationObserver(safe(starsAdded)).observe(document, { childList: true, subtree: true }); } catch (e) { /* no observer: the tidy pass places it */ }
+    window.addEventListener('resize', safe(() => {
+      resizeUntil = Date.now() + 1000;
+      if (!resizeFrame) resizeFrame = requestAnimationFrame(safe(resizeFrameCheck));
+    }));
+  }
+
   function tidyExplore() {
     if (route() !== 'explore') return;
     const links = Array.from(document.querySelectorAll('main a[href*="/p/"],main a[href*="/reel/"]'))
@@ -1730,6 +2171,7 @@
     if (!document.body) return;
     addStyle();
     safe(tidyReelsTab)();
+    safe(tidyStars)();
     // B19: not in Stories: the scan walks every text on the page (Home's feed
     // stays mounted underneath), and Instagram shows no app banner there.
     if (route() !== 'story' && Date.now() - lastBannerScan > 1000) { lastBannerScan = Date.now(); safe(tidyBanners)(); }
@@ -1922,6 +2364,9 @@
     const previous = route(new URL(lastUrl).pathname);
     lastUrl = location.href;
     post('route', { url: location.href, route: route() });
+    safe(markFeed)();
+    // Back from Stories or messages: the observer skipped the bar there.
+    if (previous === 'story' || previous === 'direct') rowFlagged = true;
     safe(syncSwipeGuard)();
     safe(noteStoryUrl)();
     if (CFG.role === 'main' && route() === 'reels-tab') {
@@ -4526,6 +4971,8 @@
    * ------------------------------------------------------------------ */
   function start() {
     addStyle();
+    safe(markFeed)();
+    safe(tidyStars)();
     queueTidy();
     if (CFG.role === 'main') {
       safe(restoreSearch)();
