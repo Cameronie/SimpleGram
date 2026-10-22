@@ -15,11 +15,11 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 - Back from an opened search result returns to the results.
 - The start of Home: friends only, no ads.
 
-## Batch 3 — open (reported against 1.1), diagnosed
+## Batch 3 — fixed (unconfirmed) in 1.2 (reported against 1.1)
 
 Full diagnosis and build plan: [`notes/batch-3/plan.md`](notes/batch-3/plan.md).
 
-| # | Report | Cause | Planned fix |
+| # | Report | Cause | Fix in 1.2 |
 | --- | --- | --- | --- |
 | B8 | Suggested posts in Home (accounts you don't follow, with a Follow button), even one before "You're all caught up", then Instagram's "Suggested Posts" section after it; maybe posts shown because a friend liked them. Second try: new posts kept loading without end, and nearly all of them were random suggestions. | **Confirmed** (your Filter status: Posts shown 2, Suggested removed 0, Pages read 8 with 7 unrecognised; reproduced exactly). Once you're caught up, Instagram switches Home to an all-suggestions feed. Those pages contain only "suggestion" units, no plain posts. SimpleGram took such a page for an unknown format and left it alone; that safety net is meant to stop an Instagram change from blanking the feed. Leaving those pages alone also skipped the "stop loading" logic, so it never ended. | Recognise suggestion units, so those pages get filtered. End Home at "You're all caught up" and stop loading there. Keep only posts from people you follow on any suggestions page. After the end, never let a page through unfiltered. Also apply Instagram's own "Suggested for you" rule, and block the suggested-accounts list Instagram shows when Home has nothing new. Add a "Copy details" diagnostic (data shapes only, no names). |
 | B9 | Home went black: a long blank scroll, a post flashed a few times, the spinner at the bottom, nothing new loaded. One post's video shrank to a thin strip. Second try: not reproduced (the feed kept loading instead). | Not confirmed on the phone; two candidates, both set off by B8's endless suggestions. (1) SimpleGram's on-screen backup filter hid labelled suggestions after Instagram had drawn them. Instagram's scrolling list keeps their space, which shows black, and each one flashed for about 0.3 s first. (2) The WebView ran out of drawing memory with endless Reels. The thin strip is unexplained. | B8's fix removes the trigger. Hide labelled posts before they're drawn, and stop loading if several hidden posts pile up. Pause videos in hidden posts. Record blank-screen, memory-warning and crash counts in Filter status. |
