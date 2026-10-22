@@ -16,7 +16,9 @@
   if (window.top !== window) return;
   if (window.__sg) return;
 
-  const CFG = Object.assign({ role: 'main', version: 'dev', searchPages: 3, viewerId: null },
+  // continueHome (R7): Home goes on into Following past "caught up" (the app's
+  // switch; off when the app doesn't say).
+  const CFG = Object.assign({ role: 'main', version: 'dev', searchPages: 3, viewerId: null, continueHome: false },
     window.__sgCfg || {});
   const SG = (window.__sg = { cfg: CFG });
   const stats = (SG.stats = {
@@ -213,6 +215,7 @@
   const AD_LIST_KEY = /^(edges|items|feed_items|reels_media|reels|medias|media|stories|clips|tray|story_items|fill_items)$/;
   let streamed = false;
   let ownFetch = false;     // SimpleGram's own search requests
+  let ownFeedRead = false;  // SimpleGram's own Following reads (R7): never Home's pages
   let payloadVia = '', payloadFinal = null; // which hook read the payload, and its is_final (diagnostics)
 
   function nonEmptyId(v) {
@@ -338,11 +341,12 @@
   let lastVariant = 'home';
   // shownAny: this feed has handed Instagram something (a post or an anchor);
   // shownCount: posts handed that show on screen; handed: edges handed;
-  // anchorKind: what anchored the first page (seen, marker, recs).
+  // anchorKind: what anchored the first page (seen, marker, recs);
+  // cont: Home goes on into Following past its marker (R7).
   function freshFeed(key) {
     return { key: key, emptyStreak: 0, seenStreak: 0, ended: false, caughtUp: false, homePages: 0,
       endText: null, endCursor: null, lastCursor: null, lastPageAt: 0,
-      shownAny: false, shownCount: 0, handed: 0, anchorKind: '', resetAt: 0 };
+      shownAny: false, shownCount: 0, handed: 0, anchorKind: '', resetAt: 0, cont: false };
   }
   function feedFor(key) {
     let fs = feedStates.get(key);
@@ -383,6 +387,16 @@
   // Posts Home has shown, so Following can skip them when you continue from
   // the end of Home.
   const homeSeen = new Set();
+  // Posts Home itself showed (Instagram's ranking, not Following's): a page
+  // bringing one back is Home's first page again, never a next page (R7).
+  const homeRanked = new Set();
+  function noteHomeShown(code, ranked) {
+    homeSeen.add(code);
+    if (homeSeen.size > 4000) homeSeen.delete(homeSeen.values().next().value);
+    if (!ranked) return;
+    homeRanked.add(code);
+    if (homeRanked.size > 4000) homeRanked.delete(homeRanked.values().next().value);
+  }
   const SKIP_KEY = 'sg_skip_seen';
   // Used once, by the page the end-of-Home card opens, then forgotten:
   // opening Following any other way shows everything. passed: seen posts
@@ -479,8 +493,9 @@
   // suggestions, so the marker and everything after it go and paging stops;
   // the app's own card marks the end and carries Instagram's line.
   // (Kept with emptied groups, Instagram would still advertise more pages.)
+  // With R7 on, paging stays on and Following follows the marker instead.
   // Returns the marker it cut (the first page's anchor may put it back).
-  function endHome(owner, list, fs, ctx) {
+  function endHome(owner, list, fs, ctx, first) {
     const at = markerAt(list);
     let cut = null;
     if (at >= 0) {
@@ -496,6 +511,10 @@
     } else if (owner.pagination_source === 'feed_recs') {
       // Instagram's all-suggestions feed: only posts from people you follow stay.
       const keep = list.filter(followedPost);
+      // Home's very first page labelled this way, with nothing to keep: never
+      // emptied (Instagram would show its empty-feed screen and stop); the
+      // recs anchor keeps it paging until the marker comes.
+      if (first && !keep.length) { bump(stats.feed, 'recsFirst'); return null; }
       if (ctx) for (const e of list) if (keep.indexOf(e) < 0) noteUnit(e, 'recs', ctx);
       stats.feed.recsPages = (stats.feed.recsPages || 0) + 1;
       stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length - keep.length;
@@ -503,13 +522,15 @@
     } else {
       return null;
     }
-    endHomePaging(owner);
+    if (safe(contArm)(fs, owner)) return cut;   // R7: paging stays on, Following comes next
+    endHomePaging(owner, fs);
     endFeed(fs, true);
     return cut;
   }
   // The one place that stops Home's paging at its end (here and for the
-  // anchored marker). A continuation past "caught up" would leave it on.
-  function endHomePaging(owner) {
+  // anchored marker). The continuation past "caught up" (R7) leaves it on.
+  function endHomePaging(owner, fs) {
+    if (fs && fs.cont) return;
     stopPagination(owner);
   }
 
@@ -542,11 +563,13 @@
   }
   // Instagram's marker, neutralised: no groups, so Instagram neither offers
   // its suggestions nor more pages; the app's card then leaves out its line.
+  // With R7 running, more pages stay on: Following comes after it.
   function keepMarker(fs, owner, cut) {
     const d = unitOf(cut).end_of_feed_demarcator;
     if (d.group_set && typeof d.group_set === 'object') { d.group_set.groups = []; d.group_set.active_group_id = null; }
     if (fs.endText) fs.endText.subtitle = '';
-    endHomePaging(owner);
+    if (fs.cont) cont.anchors++;
+    endHomePaging(owner, fs);
     return { kind: 'marker', edge: cut };
   }
   function recsAnchorAt(list) {
@@ -709,13 +732,15 @@
     if (ring.length > 30) ring.shift();
   }
   let lastHomePageAt = 0;
-  function noteHomePage(owner, list) {
+  // fe: screens from the end when read (how far ahead Instagram pages);
+  // am: read after the marker, while Home goes on into Following (R7).
+  function noteHomePage(owner, list, fs) {
     if (CFG.role !== 'main') return;
     const se = document.scrollingElement || document.documentElement;
     const pi = owner.page_info || owner.pageInfo || {};
     const now = Date.now();
     const e = { pg: stats.feed.pages, dt: lastHomePageAt ? now - lastHomePageAt : -1, y: screens(se.scrollTop),
-      sh0: screens(se.scrollHeight), sh1: null,
+      sh0: screens(se.scrollHeight), sh1: null, fe: screens(Math.max(0, se.scrollHeight - se.scrollTop - innerHeight)), am: !!fs.cont,
       seen: list.filter(x => followedPost(x) && homeSeen.has(edgeCode(x))).length,
       hp: [!!(pi.has_previous_page || pi.hasPreviousPage), !!(pi.start_cursor || pi.startCursor)],
       mk: markerAt(list) >= 0, ps: shapeToken(owner.pagination_source), nx: hasMore(owner) };
@@ -732,6 +757,7 @@
   }
 
   function filterFeedList(owner, list) {
+    if (ownFeedRead) return;   // SimpleGram's own Following read: not one of Home's pages
     if (markerLists.has(list)) { filterMarkerList(list); return; }
     stats.feed.pages++;
     const variant = pageVariant(owner);
@@ -742,7 +768,7 @@
     // The trail entry for this page (shapes and counts only).
     const tr = { ev: 'page', va: addressVariant(), vp: variant, ps: shapeToken(owner.pagination_source),
       in: list.length, mk: markerAt(list), nx0: sentMore };
-    if (home) safe(noteHomePage)(owner, list);
+    if (home) safe(noteHomePage)(owner, list, fs);
     safe(triedHit)();
     fs.lastPageAt = Date.now();
     if (streamed) {
@@ -752,6 +778,25 @@
       return;
     }
     const cursor = cursorOf(owner);
+    // R7: after "caught up", Instagram's next page carries Following, unless
+    // it is Home's first page again (a reload replaces the whole list).
+    const jump = home && cont.on && contJump();
+    const tap = home && cont.on && contTap();
+    if (home && fs.cont) {
+      const why = contHead(owner, list, jump, tap);
+      if (why) {
+        cont.heads++;
+        contReset();
+        feedStates.set(fs.key, fs = freshFeed(fs.key));
+        fs.lastPageAt = fs.resetAt = Date.now();
+        stats.feed.refreshes = (stats.feed.refreshes || 0) + 1;
+        tr.hw = why;
+      } else {
+        fs.lastCursor = cursor;
+        contHandover(owner, list, fs, ctx, tr);
+        return;
+      }
+    }
     if (fs.ended && cursor !== fs.endCursor) {
       if (markerAt(list) >= 0 || list.some(followedPost)) {
         // Instagram refreshed the feed (pull to refresh, the Home tab): start over.
@@ -786,7 +831,7 @@
     const first = !fs.shownAny || (home && Date.now() - fs.resetAt < 2000);
     const prevCursor = fs.lastCursor;
     fs.lastCursor = cursor;
-    const cut = home ? endHome(owner, list, fs, ctx) : null;
+    const cut = home ? endHome(owner, list, fs, ctx, first) : null;
     if (!home) for (const e of list) for (const g of markerGroups(unitOf(e))) markerLists.add(g.feed_items);
     const verdicts = list.map(e => feedVerdict(unitOf(e)));
     if (list.length && !verdicts.some(x => x.known)) {
@@ -841,15 +886,18 @@
           keptMedia++;
           if (code) lastKept = code;
           if (home && x.follow === null) stats.feed.followUnknown = (stats.feed.followUnknown || 0) + 1;
-          if (onHome && code) { homeSeen.add(code); if (homeSeen.size > 4000) homeSeen.delete(homeSeen.values().next().value); }
+          if (onHome && code) { noteHomeShown(code, true); }
         }
       }
       if (ctx) noteUnit(list[i], x.drop ? x.reason : x.reason === 'anchor' ? 'anchor' : 'kept', ctx);
     });
     if (anchor && anchor.kind === 'marker') kept.push(anchor.edge);
-    else if (!anchor && cut && !kept.length) {
+    else if (!anchor && cut && !kept.length && (!fs.cont || jump || tap || Date.now() - fs.resetAt < 10000)) {
       // Home cut to nothing at its marker: this may be a head load that
       // replaces the list, so the neutralised marker stays, never [].
+      // While Home goes on into Following (R7), an ordinary page appended at
+      // the marker stays cut (Following's own line marks the place) unless
+      // it may be a reload's head (just after a reset, a jump to the top, a tap).
       anchor = keepMarker(fs, owner, cut);
       kept.push(cut);
       bump(stats.feed, 'markerKept');
@@ -866,7 +914,10 @@
     if (kept.length !== list.length || kept.some((e, i) => e !== list[i])) list.splice(0, list.length, ...kept);
     if (first && !list.length) emptyFirstAt = Date.now();
     const more = hasMore(owner);
-    if (keptMedia === 0 && more) {
+    if (home && fs.cont) {
+      // Home's last page before Following: Instagram is asked again once posts are ready.
+      if (keptMedia <= 2 && cs) cs.waiting = true;
+    } else if (keptMedia === 0 && more) {
       if (alreadySeen > 0 && seenCodes) {
         // Paging past posts you already saw in Home. Each comes once, so stop
         // when Instagram repeats its cursor, or after more pages than there
@@ -1000,6 +1051,9 @@
 
   const INTEREST = /"(?:edges|items|feed_items|reels|reels_media|image_versions2|video_versions|ad_id|injected|suggested_users|sectional_items|media_grid|users)"|chaining|ayml|explore_grid|injected_/;
   const nativeParse = JSON.parse;
+  // The browser's own fetch, before Instagram's code can wrap it: R7's own
+  // reads never go through Instagram's network layer.
+  const nativeFetch = window.fetch;
   // Diagnostics: Instagram's "please wait" throttling answers, which often
   // come with an ordinary status. Counted once stats.diag exists; never throws.
   function noteThrottle(o) {
@@ -1240,6 +1294,443 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * R7: Home goes on into Following, in Instagram's own list.
+   *
+   * After "You're all caught up" Instagram keeps paging Home with its own
+   * next-page request, as the website does. SimpleGram reads Following
+   * itself (the website's own Following requests, newest first) and puts
+   * those posts in place of the suggestions in each of Instagram's next
+   * Home pages, in the data and before Instagram sees the page. Relay
+   * appends them to Home's list, so Instagram draws them like any Home
+   * post. Posts Home showed are skipped. Anything unexpected ends Home with
+   * the app's card (Following), as without the continuation.
+   * ------------------------------------------------------------------ */
+  const CONT_ROOT = 'PolarisFeedTimelineRootV2Query';
+  const CONT_NEXT = 'PolarisFeedRootPaginationCachedQuery_subscribe';
+  const CONT_CONN = 'xdt_api__v1__feed__timeline__connection';
+  const CONT_READY = 12;        // posts kept ready (one of Instagram's pages) before it asks
+  const CONT_GAP = 500;         // ms between own requests (none while Instagram waits)
+  const CONT_PER_MIN = 20;      // own requests a minute, whatever they brought, across restarts
+  const CONT_STARTS = 4;        // more starts than this in a minute: something is off, the card instead
+  const CONT_MAX_HANDED = 200;  // Following posts handed in one page load, then Home stops
+  const CONT_MAX_OWN = 25;      // own requests in one page load, then Home stops
+  const CONT_NOTE_MS = 3000;    // the app's "Skipping posts you saw in Home…" after this long
+  // Shapes and counts only (Filter status, Copy details). headWhy: why a page
+  // was taken for Home's first page again; igKept: Instagram's own followed
+  // posts kept in a handover; keptBuffer: posts read but not shown, kept at
+  // the last reset; startsMin: starts in the last minute; peakMin: most own
+  // requests in a minute; repeats: handovers holding a post Home already
+  // showed (must stay 0); runs: per start, ms from the marker to the first
+  // posts handed, whether the first one was drawn within 3 s and showed its
+  // line; hand: per handover, posts and the page height in screens before
+  // and 1.5 s after (growth: appended; shrink: replaced).
+  const cont = (stats.cont = { on: CFG.continueHome === true, state: 'off', reason: '', own: 0, ownFail: 0, pages: 0,
+    swaps: 0, handed: 0, empty: 0, skippedSeen: 0, heads: 0, anchors: 0, nudges: 0,
+    headWhy: { marker: 0, seen: 0, jump: 0, tap: 0, ended: 0 }, igKept: 0, resets: 0, keptBuffer: 0,
+    startsMin: 0, peakMin: 0, repeats: 0, notes: 0, modules: null, runs: [], hand: [] });
+  let cs = null;                 // the current run (from one marker on)
+  let contGen = 0;               // one counter for the page load: a reset makes every answer on its way stale
+  let contInFlight = false;      // one own request at a time, across restarts
+  let contAnsweredAt = 0;
+  let contResumeAt = null;       // what a reset kept: where Following had got to, and posts read but not shown
+  let contSeenPassed = 0;        // seen posts passed in this page load
+  const contOwnAt = [], contStarts = [], labelCodes = [];
+  // Instagram's refresh paths call window.scrollTo(0, 0) right before they
+  // reload Home's first page (twice from the Home tab on mobile: b314
+  // usePolarisOnHomeClick, b344 PolarisFeed.react and PolarisFeedWrapper).
+  let topJumpAt = 0, jumpPages = 0, tapAt = 0, tapPages = 0;
+  if (cont.on && CFG.role === 'main') {
+    try {
+      const nativeScrollTo = window.scrollTo;
+      window.scrollTo = function scrollTo(a, b) {
+        try {
+          const y = a && typeof a === 'object' ? a.top : b;
+          if (y === 0) { topJumpAt = Date.now(); jumpPages = 0; }
+        } catch (e) { /* never throw into Instagram */ }
+        return nativeScrollTo.apply(this, arguments);
+      };
+    } catch (e) { /* leave scrollTo alone */ }
+  }
+  // Called once for every Home page: the first two within 6 s of a jump to
+  // the top, with you less than 2 screens down, are Instagram's reloads (in
+  // whichever order they come). Scroll is only read on Home itself.
+  function contJump() {
+    if (!topJumpAt || Date.now() - topJumpAt > 6000 || jumpPages >= 2 || route() !== 'home') return false;
+    const se = document.scrollingElement || document.documentElement;
+    if (se.scrollTop > innerHeight * 2) return false;
+    jumpPages++;
+    return true;
+  }
+  // The first two Home pages within 20 s of a Home-tab tap passed to Instagram.
+  function contTap() {
+    if (!tapAt || Date.now() - tapAt > 20000 || tapPages >= 2) return false;
+    tapPages++;
+    return true;
+  }
+  function contTapped() { if (cont.on) { tapAt = Date.now(); tapPages = 0; } }
+  function contWanted(fs) {
+    return cont.on && CFG.role === 'main' && fs.key === 'home' && !streamed;
+  }
+  // The page's own compiled queries: both Following requests are then built
+  // from exactly what Instagram's own code would send (ids, settings).
+  function contQueryReady(name) {
+    const p = gqlParams(name);
+    return !!p && /^\d+$/.test(String(p.id)) && !!p.providedVariables && typeof p.providedVariables === 'object';
+  }
+  function moduleFn(name) {
+    const m = igModule(name);
+    return typeof m === 'function' ? m : m && typeof m.default === 'function' ? m.default : null;
+  }
+  function feedConstants() {
+    const m = igModule('PolarisFeedQueryConstants');
+    const b = m && (m.FEED_TIMELINE_REQUEST_BODY || (m.default && m.default.FEED_TIMELINE_REQUEST_BODY));
+    return b && typeof b === 'object' ? b : null;
+  }
+  function contPageSize() {
+    const m = igModule('PolarisFeedActionConstants');
+    const n = m && (m.PAGE_SIZE || (m.default && m.default.PAGE_SIZE));
+    return typeof n === 'number' && n > 0 && n <= 50 ? n : 12;
+  }
+  function contModules() {
+    const m = igModule('PolarisFeedActionConstants');
+    return { root: contQueryReady(CONT_ROOT), next: contQueryReady(CONT_NEXT), constants: !!feedConstants(),
+      actions: !!(m && (m.PAGE_SIZE || (m.default && m.default.PAGE_SIZE))), asyncParams: !!moduleFn('getAsyncParams'),
+      asyncHeaders: !!moduleFn('getAsyncHeaders') };
+  }
+  // At the marker, synchronously: Home goes on only when its own paging does
+  // and the page's own query modules are there; otherwise the card, as before.
+  function contArm(fs, owner) {
+    if (!contWanted(fs) || fs.cont) return false;
+    if (cont.state === 'failed' || cont.state === 'limit') return false;   // this page load stays ended
+    if (!hasMore(owner) || !cursorOf(owner)) return false;                 // Instagram itself stops here
+    cont.modules = contModules();
+    if (!cont.modules.root || !cont.modules.next) { cont.state = 'failed'; cont.reason = 'modules'; return false; }
+    fs.cont = true;
+    fs.caughtUp = true;
+    contStart();
+    if (cont.state === 'running') return true;
+    fs.cont = false;
+    return false;
+  }
+  function contAlive() { return !!cs && cont.state === 'running'; }
+  // An own read on its way or just answered: Home is not stalled.
+  function contReading() {
+    return contAlive() && (contInFlight || Date.now() - contAnsweredAt < STALL_MS);
+  }
+  function contStart() {
+    const now = Date.now();
+    while (contStarts.length && now - contStarts[0] > 60000) contStarts.shift();
+    contStarts.push(now);
+    cont.startsMin = contStarts.length;
+    const carry = contResumeAt && now - contResumeAt.at < 30 * 60000 ? contResumeAt : null;
+    contResumeAt = null;
+    cs = { gen: ++contGen, cursor: null, more: true, buffer: [], fetching: false, timer: 0, shown: new Set(),
+      firstCode: null, waiting: false, resume: carry, startedAt: now, firstMs: -1, capped: false, noteTimer: 0, note: false };
+    cont.state = 'running';
+    cont.reason = '';
+    if (contStarts.length > CONT_STARTS) { contFail('restarts'); return; }
+    contFill();
+  }
+  // Home starts over (a reload replaces Instagram's list). Kept for the next
+  // run: the cursor of the page in flight (or the next one), and the posts
+  // read but not shown, so Following has no gaps and nothing repeats.
+  function contReset() {
+    contGen++;
+    contNote(false);
+    if (cs) {
+      clearTimeout(cs.timer);
+      const prev = cs.resume;
+      const own = cs.cursor != null || !prev;
+      const buffer = cs.buffer.concat(prev ? prev.buffer : []);
+      contResumeAt = { cursor: own ? cs.cursor : prev.cursor, more: own ? cs.more : prev.more, buffer: buffer, at: Date.now() };
+      cont.keptBuffer = buffer.length;
+      cont.resets++;
+    }
+    cs = null;
+    if (cont.state === 'running' || cont.state === 'done') cont.state = 'off';
+  }
+  // Following can't go on: Home ends here (once the posts already read are
+  // shown), and the card offers Following as before. No retries.
+  function contFail(reason) {
+    if (cont.state !== 'running') return;
+    cont.state = 'failed';
+    cont.reason = reason;
+    contNote(false);
+    if (cs) { cs.more = false; clearTimeout(cs.timer); cs.timer = 0; }
+    const fs = feedStates.get('home');
+    if (fs && fs.cont && !fs.ended && !(cs && cs.buffer.length)) endFeed(fs, true);
+    setTimeout(safe(checkFeedEnd), 0);
+  }
+  // Nothing more to show (done) or the required stop (limit): Home ends now,
+  // even if Instagram isn't asking for a page.
+  function contEnd(state, reason) {
+    if (cont.state !== 'running') return;
+    cont.state = state;
+    cont.reason = reason;
+    contNote(false);
+    if (cs) { cs.more = false; clearTimeout(cs.timer); cs.timer = 0; }
+    const fs = feedStates.get('home');
+    if (fs && fs.cont && !fs.ended) endFeed(fs, true);
+    setTimeout(safe(checkFeedEnd), 0);
+  }
+  function feedBody(where) {
+    let body = feedConstants();
+    if (!body) {
+      body = {};
+      const c = igModule('PolarisConfig');
+      try { const d = c && typeof c.getDeviceId === 'function' ? c.getDeviceId() : null; if (d) body.device_id = d; } catch (e) { /* none */ }
+      Object.assign(body, { is_async_ads_double_request: '0', is_async_ads_in_headload_enabled: '0', is_async_ads_rti: '0', rti_delivery_backend: '0' });
+    }
+    // The website's order: its first page puts the source first, next pages last.
+    return where === 'first' ? Object.assign({ pagination_source: 'following' }, body)
+      : Object.assign({}, body, { pagination_source: 'following' });
+  }
+  // The website's own Following requests: the feed's first-page query (3
+  // posts, b404 PolarisFeedRoot.entrypoint), then its paging query from the
+  // cursor of the page before (b344 PolarisFeed.react loadNext).
+  function followingQuery(cursor) {
+    return cursor == null
+      ? { name: CONT_ROOT, vars: { data: feedBody('first'), first: 3, variant: 'following' } }
+      : { name: CONT_NEXT, vars: { after: cursor, before: null, data: feedBody('next'), first: contPageSize(), last: null, variant: 'following' } };
+  }
+  function contFill() {
+    if (!cs || cont.state !== 'running' || contInFlight || cs.timer || !cs.more || cs.buffer.length >= CONT_READY) return;
+    if (route() !== 'home' || document.hidden) return;   // picked up again on return
+    if (cont.own >= CONT_MAX_OWN) {
+      // The required stop: what was read is still shown, then Home ends.
+      cs.more = false;
+      cs.capped = true;
+      if (!cs.buffer.length) contEnd('limit', 'requests');
+      return;
+    }
+    const run = cs;
+    const later = ms => { run.timer = setTimeout(safe(() => { run.timer = 0; if (run === cs) contFill(); }), ms); };
+    const now = Date.now();
+    if (now - topJumpAt < 3000) { later(3000 - (now - topJumpAt)); return; }   // Instagram may be reloading Home
+    while (contOwnAt.length && now - contOwnAt[0] > 60000) contOwnAt.shift();
+    const last = contOwnAt.length ? contOwnAt[contOwnAt.length - 1] : 0;
+    let wait = cs.waiting ? 0 : last + CONT_GAP - now;
+    if (contOwnAt.length >= CONT_PER_MIN) wait = Math.max(wait, 60000 - (now - contOwnAt[0]) + 50);
+    if (wait > 0) { later(wait); return; }
+    contFetch();
+  }
+  async function contFetch() {
+    const run = cs, gen = contGen, after = run.cursor;
+    contInFlight = true;
+    run.fetching = true;
+    const t0 = Date.now();
+    contOwnAt.push(t0);
+    cont.peakMin = Math.max(cont.peakMin, contOwnAt.length);
+    cont.own++;
+    const q = followingQuery(after);
+    let c = null;
+    try { c = await igGraphQL(q.name, q.vars, CONT_CONN, { feed: true }); } catch (e) { c = null; }
+    contInFlight = false;
+    run.fetching = false;
+    contAnsweredAt = Date.now();
+    if (run !== cs || gen !== contGen) { if (cs) contFill(); return; }   // Home started over meanwhile: stale
+    if (!c || !Array.isArray(c.edges) || !(c.page_info || c.pageInfo)) { cont.ownFail++; contFail('request'); return; }
+    cont.pages++;
+    let recognised = c.edges.length === 0, fresh = 0;
+    const have = new Set(cs.buffer.map(edgeCode));
+    const take = e => {
+      const code = edgeCode(e);
+      if (!code || homeSeen.has(code) || cs.shown.has(code) || have.has(code)) return false;
+      have.add(code);
+      cs.buffer.push(e);
+      fresh++;
+      return true;
+    };
+    for (const e of c.edges) {
+      const v = feedVerdict(unitOf(e));
+      if (v.known) recognised = true;
+      if (v.drop || !v.media) continue;
+      if (!take(e) && edgeCode(e)) { cont.skippedSeen++; contSeenPassed++; }
+    }
+    if (!recognised) { contFail('format'); return; }
+    let next = cursorOf(c);
+    if (!hasMore(c) || !next || next === after) cs.more = false;
+    // After a reset: Following's newest page (for anything new), then the
+    // posts read but not shown, then on from where Following had got to.
+    if (cs.resume && q.name === CONT_ROOT) {
+      for (const e of cs.resume.buffer) take(e);
+      if (cs.resume.cursor) { next = cs.resume.cursor; cs.more = cs.resume.more !== false; }
+    }
+    cs.resume = null;
+    cs.cursor = next;
+    // Each post comes once in Following: once well past all of Home's, stop looking.
+    if (!fresh && contSeenPassed > homeSeen.size + 36) { cs.more = false; cont.reason = 'seenBound'; }
+    if (!cs.more && !cs.buffer.length) { contEnd('done', cont.reason || 'followingEnd'); return; }
+    if (cs.buffer.length && cs.waiting) { cont.nudges++; scheduleNudge(true); }
+    contFill();
+  }
+  // Back on Home, or the app back in front: a nudge that was due is given again.
+  function contResume() {
+    if (contAlive() && cs.waiting && cs.buffer.length) { cont.nudges++; scheduleNudge(true); }
+    contFill();
+  }
+  // The app's note while Instagram waits at the end of Home and SimpleGram is
+  // still passing posts you saw in Home (the skip chip's mechanism, on Home).
+  function contNote(on) {
+    const run = cs;
+    if (!run) return;
+    if (!on) {
+      clearTimeout(run.noteTimer);
+      run.noteTimer = 0;
+      if (run.note) { run.note = false; post('skipStatus', { on: false, kind: '', n: 0 }); }
+      return;
+    }
+    if (run.note || run.noteTimer) return;
+    run.noteTimer = setTimeout(safe(() => {
+      run.noteTimer = 0;
+      if (run !== cs || !contAlive() || run.buffer.length || !run.waiting || route() !== 'home') return;
+      run.note = true;
+      cont.notes++;
+      post('skipStatus', { on: true, kind: 'homeSkipping', n: 0 });
+    }), CONT_NOTE_MS);
+  }
+  // A page Instagram loads after the marker is either its next page (swap in
+  // Following) or Home's first page again (Home tab, refresh), which replaces
+  // its whole list. Content first: the marker, or a post Home itself showed
+  // (a next page never brings back one the list has). Pages labelled
+  // feed_recs are Instagram's suggestions paging: always a next page. Then
+  // Instagram's own jump to the top, a Home-tab tap passed to it, or (once
+  // Following is over) friends' posts as in 1.2. Returns the reason, or ''.
+  function contHead(owner, list, jump, tap) {
+    let why = '';
+    if (markerAt(list) >= 0) why = 'marker';
+    else if (list.some(e => followedPost(e) && homeRanked.has(edgeCode(e)))) why = 'seen';
+    else if (owner.pagination_source === 'feed_recs') why = '';
+    else if (jump) why = 'jump';
+    else if (tap) why = 'tap';
+    else if (cont.state !== 'running' && !(cs && cs.buffer.length) && list.some(followedPost)) why = 'ended';
+    if (why) bump(cont.headWhy, why);
+    return why;
+  }
+  // Instagram's next page, handed back with Following in place of its
+  // suggestions: first the page's own posts from people you follow (never
+  // dropped, in Instagram's order), then up to one page from the buffer.
+  // page_info and pagination_source stay exactly as Instagram sent them, so
+  // its cursor chain (and its next request) stays its own.
+  function contHandover(owner, list, fs, ctx, tr) {
+    if (ctx) for (const e of list) noteUnit(e, 'cont', ctx);
+    const igMore = hasMore(owner) && !!cursorOf(owner);   // Relay pages on only with a cursor
+    const run = cs;
+    if (run) run.waiting = false;
+    const out = [], codes = new Set();
+    for (const e of list) {
+      const code = followedPost(e) ? edgeCode(e) : null;
+      if (code && !homeSeen.has(code) && !codes.has(code)) { out.push(e); codes.add(code); }
+    }
+    const igKept = out.length;
+    cont.igKept += igKept;
+    if (run && igKept) {
+      run.buffer = run.buffer.filter(e => !codes.has(edgeCode(e)));
+      if (run.resume) run.resume.buffer = run.resume.buffer.filter(e => !codes.has(edgeCode(e)));
+    }
+    let room = cont.handed >= CONT_MAX_HANDED ? 0 : Math.min(contPageSize(), CONT_MAX_HANDED - cont.handed);
+    while (run && room > 0 && run.buffer.length) {
+      const e = run.buffer.shift();
+      const code = edgeCode(e);
+      if (!code || codes.has(code) || homeSeen.has(code)) { cont.skippedSeen++; continue; }   // shown since it was read
+      out.push(e);
+      codes.add(code);
+      room--;
+    }
+    if (out.some(e => homeSeen.has(edgeCode(e)))) cont.repeats++;   // guard: never happens
+    const handed = out.length - igKept;
+    out.forEach((e, i) => {
+      const code = edgeCode(e);
+      noteHomeShown(code, i < igKept);
+      if (i < igKept || !run) return;
+      run.shown.add(code);
+      if (!run.firstCode) { run.firstCode = code; contLabel(code); }
+    });
+    list.splice(0, list.length, ...out);
+    cont.swaps++;
+    cont.handed += handed;
+    if (!out.length) cont.empty++;
+    stats.feed.kept += out.length;
+    stats.feed.lastPageKept = out.length;
+    fs.handed += out.length;
+    fs.shownCount += out.length;
+    if (out.length) { fs.shownAny = true; contNote(false); }
+    if (run && handed && run.firstMs < 0) { run.firstMs = Date.now() - run.startedAt; contFirstDrawn(run); }
+    safe(noteHandover)(out.length, igKept);
+    const drained = !run || (!run.more && !run.fetching && !run.timer && !run.buffer.length && !run.resume);
+    const limit = cont.handed >= CONT_MAX_HANDED || (!!run && run.capped && !run.buffer.length);
+    let ended = false;
+    if (!igMore || drained || limit) {
+      ended = true;
+      stopPagination(owner);
+      endFeed(fs, true);
+      contNote(false);
+      if (cont.state === 'running') {
+        if (limit && igMore) { cont.state = 'limit'; cont.reason = cont.handed >= CONT_MAX_HANDED ? 'posts' : 'requests'; }
+        else { cont.state = 'done'; cont.reason = cont.reason || (igMore ? 'followingEnd' : 'homeEnd'); }
+      }
+    } else if (out.length <= 2) {
+      if (run) run.waiting = true;           // ask Instagram again once posts are ready
+      if (out.length) scheduleNudge(false);
+      else if (run && run.more) contNote(true);
+    }
+    contFill();
+    safe(pushTrail)(Object.assign(tr, { out: out.length, k: out.length, ik: igKept, cf: handed, nx1: !ended, an: '', first: false, ae: false }));
+    setTimeout(safe(checkFeedEnd), 300);
+  }
+  function screensNow() {
+    const se = document.scrollingElement || document.documentElement;
+    return screens(se.scrollHeight);
+  }
+  function noteHandover(n, igKept) {
+    const e = { n: n, ik: igKept, sh0: screensNow(), sh1: null };
+    cont.hand.push(e);
+    if (cont.hand.length > 10) cont.hand.shift();
+    setTimeout(safe(() => { e.sh1 = screensNow(); }), 1500);
+  }
+  function codeSelector(code) {
+    return ['/p/', '/reel/'].map(k => 'article:has(a[href*="' + k + code + '/"])').join(',');
+  }
+  // Whether the first Following post of a run is drawn within 3 s, and its line.
+  function contFirstDrawn(run) {
+    const code = run.firstCode;
+    const r = { ms: run.firstMs, drawn: null, line: null };
+    cont.runs.push(r);
+    if (cont.runs.length > 5) cont.runs.shift();
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(code || '')) return;
+    setTimeout(safe(() => {
+      const el = document.querySelector(codeSelector(code));
+      r.drawn = !!el;
+      if (el) r.line = getComputedStyle(el, '::before').content !== 'none';
+    }), 3000);
+  }
+  // Where Home ends and Following begins: a line above the first post from
+  // Following in each run, drawn by a style rule (nothing is added to
+  // Instagram's page). Only these characters ever reach the style rule.
+  function contLabel(code) {
+    try {
+      if (!/^[A-Za-z0-9_-]{1,40}$/.test(code)) return;
+      if (labelCodes.indexOf(code) < 0) labelCodes.push(code);
+      if (labelCodes.length > 10) labelCodes.shift();
+      let st = document.getElementById('sg-cont-style');
+      if (!st && document.documentElement) {
+        st = document.createElement('style');
+        st.id = 'sg-cont-style';
+        (document.head || document.documentElement).appendChild(st);
+      }
+      if (!st) return;
+      st.textContent = labelCodes.map(c => ['/p/', '/reel/'].map(k => 'article:has(a[href*="' + k + c + '/"])::before').join(',')).join(',') + '{' +
+        'content:"You\\2019re all caught up \\00B7  Following, newest first";display:block;padding:14px 16px 10px;' +
+        'font:600 13px/1.3 system-ui,sans-serif;color:#a8a8a8;border-top:1px solid rgba(128,128,128,.35);text-align:center}';
+    } catch (e) { /* no line */ }
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) safe(contResume)(); });
+  // For tests: the run's state (never part of the status report).
+  SG.cont = () => ({ stats: JSON.parse(JSON.stringify(cont)), buffer: cs ? cs.buffer.length : 0, more: cs ? cs.more : null,
+    cursor: cs ? cs.cursor : null, firstCode: cs ? cs.firstCode : null, inFlight: contInFlight,
+    resume: contResumeAt ? { cursor: contResumeAt.cursor, buffer: contResumeAt.buffer.length } : null });
+
+  /* ------------------------------------------------------------------ *
    * End of Home: offer Following (newest first), skipping what you
    * already saw. Shown by the app, outside Instagram's page.
    * ------------------------------------------------------------------ */
@@ -1275,13 +1766,15 @@
       // The real end: the marker, no more pages, or SimpleGram stopped paging.
       // Never a timer while pages keep arriving; only a stall where nothing does.
       if (fs.ended) show = near;
-      else show = stalled = near && fs.lastPageAt > 0 && now - atBottomSince > STALL_MS && now - fs.lastPageAt > STALL_MS;
+      // Never while SimpleGram is still reading Following for Home (R7).
+      else show = stalled = near && fs.lastPageAt > 0 && now - atBottomSince > STALL_MS && now - fs.lastPageAt > STALL_MS &&
+        !(fs.cont && contReading());
     } else {
       atBottomSince = 0;
     }
     endRoom(onHome && (fs.ended || stalled));
     const end = fs.caughtUp && fs.endText;
-    const msg = { on: show, caughtUp: !!fs.caughtUp, stalled: stalled,
+    const msg = { on: show, caughtUp: !!fs.caughtUp, stalled: stalled, cont: fs.key === 'home' ? cont.state : 'off',
       title: end ? fs.endText.title : '', subtitle: end ? fs.endText.subtitle : '' };
     const key = JSON.stringify(msg);
     if (key !== feedEndSent || force) {
@@ -1360,6 +1853,7 @@
       }
       bump(stats.feed, 'homeTapRefresh');
       homeEvent({ e: 'tap', a: 'passed', y: y });
+      contTapped();
       return false;
     }
     swallow(e);
@@ -1849,6 +2343,7 @@
     // Back on the feed from a Story or post: the room and the nudges that
     // keep trying come back (their timers end while you are away).
     const back = now === 'home' && previous !== 'home';
+    if (back) contResume();
     if (skipping()) {
       const fs = currentFeed();
       syncRoom(fs, !fs.ended);
@@ -2843,8 +3338,58 @@
     for (const k of ['users', 'hashtags', 'places']) if (Array.isArray(out[k])) shape[k] = out[k].length;
     return shape;
   }
+  // R7's own Following reads, built like Instagram's own relay requests
+  // (b385 createRelayFBNetworkFetch): its getAsyncParams('POST') body (b25)
+  // and getAsyncHeaders (b314: X-FB-LSD, X-ASBD-ID), X-Root-Field-Name from
+  // the query's metadata, plus X-CSRFToken and X-IG-App-ID. Whatever the page
+  // can't give falls back to the minimal set the search requests use.
+  // fid / hdr: 'page' when Instagram's own helper built it, 'min' otherwise.
+  function feedRequest(name, id, vars, params, lsd, dtsg, path) {
+    const out = { fid: 'min', hdr: 'min' };
+    let body = null;
+    try {
+      const gap = moduleFn('getAsyncParams');
+      const p = gap ? gap('POST') : null;
+      if (p && typeof p === 'object') {
+        body = {};
+        const av = viewerId();
+        if (av) body.av = av;
+        for (const k in p) if (p[k] != null && typeof p[k] !== 'object') body[k] = String(p[k]);
+        Object.assign(body, { fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: name, server_timestamps: 'true',
+          variables: JSON.stringify(vars), doc_id: id });
+        out.fid = 'page';
+      }
+    } catch (e) { body = null; }
+    if (!body) {
+      body = { doc_id: id, variables: JSON.stringify(vars), fb_dtsg: dtsg, lsd: lsd, fb_api_caller_class: 'RelayModern',
+        fb_api_req_friendly_name: name, server_timestamps: 'true' };
+    }
+    let page = null;
+    try {
+      const gh = moduleFn('getAsyncHeaders');
+      const U = igModule('URI');
+      const Uri = typeof U === 'function' ? U : U && typeof U.default === 'function' ? U.default : null;
+      const h = gh && Uri ? gh(new Uri(path)) : null;
+      if (h && typeof h === 'object') {
+        page = {};
+        for (const k in h) if (typeof h[k] === 'string' && /^[\w-]{1,40}$/.test(k)) page[k] = h[k];
+        out.hdr = 'page';
+      }
+    } catch (e) { page = null; }
+    const headers = Object.assign({ 'Content-Type': 'application/x-www-form-urlencoded', 'X-FB-Friendly-Name': name },
+      page || { 'X-FB-LSD': lsd });
+    const rf = params && params.metadata && Array.isArray(params.metadata.root_field_name) ? params.metadata.root_field_name[0] : null;
+    if (typeof rf === 'string' && /^\w{1,80}$/.test(rf)) headers['X-Root-Field-Name'] = rf;
+    headers['X-CSRFToken'] = csrf();
+    headers['X-IG-App-ID'] = '936619743392459';
+    out.init = { method: 'POST', credentials: 'include', headers: headers, body: new URLSearchParams(body).toString() };
+    return out;
+  }
   // Returns data[root] (the answer's main object), or null. At most 2 POSTs.
-  async function igGraphQL(name, variables, root) {
+  // opts.feed: R7's own Following read (one path, Instagram's own request
+  // shape, the browser's own fetch; its answer never counts as Home's page).
+  async function igGraphQL(name, variables, root, opts) {
+    const feed = !!(opts && opts.feed);
     try {
       const params = gqlParams(name);
       const id = await docIdFor(name, params);
@@ -2859,6 +3404,7 @@
       // The other path is tried only when the first gives no readable answer.
       const paths = params && params.metadata && params.metadata.is_distillery === true
         ? ['/graphql/query', '/api/graphql'] : ['/api/graphql', '/graphql/query'];
+      if (feed) paths.length = 1;           // the website's one path for this query
       let p = 0;
       for (let posts = 0; posts < 2 && p < paths.length; posts++) {
         const path = paths[p];
@@ -2869,17 +3415,24 @@
         const t0 = Date.now();
         let res = null, text = '', data = null;
         try {
-          res = await fetch(path, {
-            method: 'POST', credentials: 'include',
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': csrf(), 'X-IG-App-ID': '936619743392459',
-              'X-FB-LSD': lsd, 'X-FB-Friendly-Name': name,
-            },
-            body: new URLSearchParams({
-              doc_id: id, variables: JSON.stringify(vars), fb_dtsg: dtsg,
-              lsd: lsd, fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: name, server_timestamps: 'true',
-            }).toString(),
-          });
+          if (feed) {
+            const r = feedRequest(name, id, vars, params, lsd, dtsg, path);
+            note.fid = r.fid;
+            note.hdr = r.hdr;
+            res = await nativeFetch.call(window, path, r.init);
+          } else {
+            res = await fetch(path, {
+              method: 'POST', credentials: 'include',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': csrf(), 'X-IG-App-ID': '936619743392459',
+                'X-FB-LSD': lsd, 'X-FB-Friendly-Name': name,
+              },
+              body: new URLSearchParams({
+                doc_id: id, variables: JSON.stringify(vars), fb_dtsg: dtsg,
+                lsd: lsd, fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: name, server_timestamps: 'true',
+              }).toString(),
+            });
+          }
           note.status = res.status;
           if (res.ok) { text = await res.text(); data = parseIg(text); }
         } catch (e) { note.message = 'network error'; }
@@ -2895,7 +3448,8 @@
           p++;
           continue;
         }
-        ownCleanse(data);
+        ownFeedRead = feed;
+        try { ownCleanse(data); } finally { ownFeedRead = false; }
         const out = data.data && data.data[root];
         if (out) { Object.assign(note, answerShape(out)); gqlNote(note); return out; }
         // Instagram read the request and refused it: never resend it elsewhere.

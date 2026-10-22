@@ -24,8 +24,8 @@ function useBrowser() {
   after(async () => { await browser.close(); });
 }
 
-/** Opens `url` (served from `html`) with the page script injected like the app does. */
-async function open(url, html, { role = 'main', api = {} } = {}) {
+/** Opens `url` (served from `html`) with the page script injected like the app does (`cfg` adds to the app's config). */
+async function open(url, html, { role = 'main', api = {}, cfg = {} } = {}) {
   const context = await browser.newContext({
     viewport: { width: 412, height: 915 }, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true,
   });
@@ -49,7 +49,7 @@ async function open(url, html, { role = 'main', api = {} } = {}) {
     window.__sent = [];
     window.SGNative = { postMessage: m => window.__sent.push(JSON.parse(m)) };
   });
-  await page.addInitScript(`window.__sgCfg=${JSON.stringify({ role, version: 'test', searchPages: 3, viewerId: ME })};\n${SCRIPT}`);
+  await page.addInitScript(`window.__sgCfg=${JSON.stringify(Object.assign({ role, version: 'test', searchPages: 3, viewerId: ME }, cfg))};\n${SCRIPT}`);
   await page.goto(url);
   return page;
 }

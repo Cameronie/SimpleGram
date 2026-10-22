@@ -111,6 +111,22 @@ test('anchor: Home\'s first page of suggestions with no marker ([rec, rec, ad]) 
   await pg.waitForFunction(() => !document.getElementById('sg-skip-room'), null, { timeout: 4000 });
 });
 
+test('anchor: Home\'s first page of suggestions labelled feed_recs with no marker is anchored too, never emptied and ended', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  const out = await parse(pg, page([recs('REC0001'), recs('REC0002'), adUnit('AD00001')], { source: 'feed_recs' }));
+  assert.deepEqual(keys(out), ['explore:REC0001']);
+  assert.equal(conn(out).page_info.has_next_page, true, 'has_next as sent');
+  assert.equal((await feedState(pg)).ended, false);
+  assert.equal((await feedStats(pg)).recsFirst, 1);
+  assert.deepEqual((await feedStats(pg)).anchorKind, { seen: 0, marker: 0, recs: 1 });
+  // A later page of the same kind is Instagram's all-suggestions feed: Home ends there, as before.
+  await parse(pg, page([friend('FRIEND1')]));
+  const later = await parse(pg, page([recs('REC0003'), friend('FRIEND2')], { source: 'feed_recs' }));
+  assert.deepEqual(keys(later), ['FRIEND2']);
+  assert.equal(conn(later).page_info.has_next_page, false);
+  assert.equal((await feedState(pg)).ended, true);
+});
+
 test('anchor: an ad is never the anchor', async () => {
   const pg = await open('https://www.instagram.com/', FEED);
   const out = await parse(pg, page([adUnit('AD00001'), edge({ explore_story: { media: media('ADREC01', user('b'), { ad_id: '9' }) } }), adUnit('AD00002')]));
