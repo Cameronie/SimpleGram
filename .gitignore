@@ -10,3 +10,6 @@ tests/output/
 # Release signing key: never commit.
 signing/*.jks
 signing/keystore.properties
+
+# Agent working copies (temporary).
+.claude/worktrees/
