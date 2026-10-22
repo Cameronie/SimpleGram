@@ -9,8 +9,10 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -57,8 +59,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -156,7 +161,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         root.addView(feedBar, barLp);
 
         menuButton = makeMenuButton();
-        root.addView(menuButton, new FrameLayout.LayoutParams(dp(40), dp(40)));
+        root.addView(menuButton, new FrameLayout.LayoutParams(dp(TAB_W), dp(TAB_H)));
 
         setContentView(root);
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> onRootLayout(r - l, b - t));
@@ -307,6 +312,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         @Override
         public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
             // The page's renderer stopped; start over with fresh views rather than crash.
+            // Remembered for Filter status (the page's own counts are lost with it).
+            prefs.edit().putInt("rendererGone", prefs.getInt("rendererGone", 0) + 1)
+                    .putString("rendererGoneLast", (detail.didCrash() ? "crashed" : "stopped by Android")
+                            + ", priority " + detail.rendererPriorityAtExit() + ", " + clock())
+                    .apply();
             ui.post(MainActivity.this::recreate);
             return true;
         }
@@ -472,6 +482,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         searchOpen = false;
                         feedWanted = false;
                         refreshViewer();
+                        if (!prefs.getBoolean("tabTip", false)) {
+                            prefs.edit().putBoolean("tabTip", true).apply();
+                            toast("Tip: drag the ⋮ tab up, down or to the other side");
+                        }
                     }
                     updateFeedBar();
                 } else {
@@ -766,19 +780,20 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
      * Menu
      * ------------------------------------------------------------------ */
 
+    // The menu is a slim tab on the screen edge, clear of Instagram's own
+    // buttons (a post's Save icon sits a little in from the edge).
+    private static final int TAB_W = 16, TAB_H = 48;
+
     @SuppressLint("ClickableViewAccessibility")
     private TextView makeMenuButton() {
         TextView b = new TextView(this);
         b.setText("⋮");
         b.setTextColor(Color.WHITE);
-        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         b.setTypeface(Typeface.DEFAULT_BOLD);
         b.setGravity(Gravity.CENTER);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(0x8C1C1C1C);
-        bg.setStroke(dp(1), 0x40FFFFFF);
-        b.setBackground(bg);
+        b.setIncludeFontPadding(false);
+        b.setBackground(tabBackground(false));
         b.setElevation(dp(6));
         b.setContentDescription("SimpleGram menu");
         b.setOnTouchListener(new View.OnTouchListener() {
@@ -835,12 +850,29 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private void placeMenuButton() {
         int w = root.getWidth(), h = root.getHeight();
         if (w == 0 || h == 0) return;
-        int size = dp(40), margin = dp(6);
+        int tabW = dp(TAB_W), tabH = dp(TAB_H);
         boolean left = prefs.getBoolean("menuLeft", false);
         float y = prefs.getFloat("menuY", 0.58f) * h;
+        menuButton.setBackground(tabBackground(left));
         menuButton.animate().cancel();
-        menuButton.animate().x(left ? margin : w - size - margin)
-                .y(clamp(y, dp(56), h - size - dp(60))).setDuration(120).start();
+        menuButton.animate().x(left ? 0 : w - tabW)
+                .y(clamp(y, dp(56), h - tabH - dp(60))).setDuration(120).start();
+        if (Build.VERSION.SDK_INT >= 29) {
+            // Dragging the tab must not start the system Back gesture.
+            menuButton.setSystemGestureExclusionRects(Collections.singletonList(new Rect(0, 0, tabW, tabH)));
+        }
+    }
+
+    /** Rounded on the side facing the screen, square against the edge. */
+    private GradientDrawable tabBackground(boolean left) {
+        float r = dp(10);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0x8C1C1C1C);
+        bg.setStroke(dp(1), 0x40FFFFFF);
+        bg.setCornerRadii(left
+                ? new float[]{0, 0, r, r, r, r, 0, 0}
+                : new float[]{r, r, 0, 0, 0, 0, r, r});
+        return bg;
     }
 
     private AlertDialog.Builder dialog() {
@@ -1036,8 +1068,49 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     .append("  Reposts: ").append(dom.optInt("reposts")).append('\n')
                     .append("  App banners: ").append(dom.optInt("banners")).append('\n');
         }
+        JSONObject device = deviceDiagnostics();
+        b.append("\nApp\n")
+                .append("  WebView: ").append(device.optString("webView")).append('\n')
+                .append("  Memory warnings: ").append(trimLog.isEmpty() ? "none" : String.join(", ", trimLog)).append('\n')
+                .append("  Page restarts: ").append(device.optInt("rendererGone"));
+        String last = device.optString("rendererGoneLast");
+        if (!last.isEmpty()) b.append(" (last: ").append(last).append(')');
+        b.append('\n');
         b.append("\nCounts since the page last loaded. No account names or post details are kept.");
-        dialog().setTitle("Filter status").setMessage(b.toString()).setPositiveButton("OK", null).show();
+        dialog().setTitle("Filter status").setMessage(b.toString())
+                .setNeutralButton("Copy details", (d, w) -> copyDetails(stats, device))
+                .setPositiveButton("OK", null).show();
+    }
+
+    private JSONObject deviceDiagnostics() {
+        JSONObject n = new JSONObject();
+        try {
+            PackageInfo p = WebViewCompat.getCurrentWebViewPackage(this);
+            n.put("app", BuildConfig.VERSION_NAME);
+            n.put("android", Build.VERSION.SDK_INT);
+            n.put("webView", p != null ? p.versionName : "unknown");
+            n.put("memoryWarnings", new JSONArray(trimLog));
+            n.put("rendererGone", prefs.getInt("rendererGone", 0));
+            n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
+        } catch (JSONException e) {
+            // Partial details are still useful.
+        }
+        return n;
+    }
+
+    /** Counts and data shapes only, for pasting into a bug report. */
+    private void copyDetails(JSONObject stats, JSONObject device) {
+        JSONObject all = new JSONObject();
+        try {
+            all.put("device", device);
+            all.put("page", stats);
+        } catch (JSONException e) {
+            return;
+        }
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm == null) return;
+        cm.setPrimaryClip(ClipData.newPlainText("SimpleGram details", all.toString()));
+        toast("Details copied: paste them into your message");
     }
 
     /* ------------------------------------------------------------------ *
@@ -1233,6 +1306,16 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         comments.web().onResume();
     }
 
+    // Android's memory warnings since the app started, newest last (Filter status).
+    private final ArrayList<String> trimLog = new ArrayList<>();
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        trimLog.add(level + " at " + clock());
+        if (trimLog.size() > 10) trimLog.remove(0);
+    }
+
     @Override
     protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out);
@@ -1254,6 +1337,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     /* ------------------------------------------------------------------ *
      * Utilities
      * ------------------------------------------------------------------ */
+
+    private static String clock() {
+        return new SimpleDateFormat("HH:mm", Locale.US).format(new Date());
+    }
 
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
