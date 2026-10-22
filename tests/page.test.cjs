@@ -536,7 +536,7 @@ test('search: the Search tab opens SimpleGram search with four tabs and account 
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('SAP Center'));
 });
 
-test('search: tags show Top and Most recent grids, with a limited "Show more"', async () => {
+test('search: tags show Top and Most recent grids, with "Show more"', async () => {
   const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
   await openSearchTab(page);
   await page.keyboard.type('sharks');
@@ -544,11 +544,12 @@ test('search: tags show Top and Most recent grids, with a limited "Show more"', 
   await shadowClick(page, 'Tags');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('#sharks'));
   await shadowClick(page, '#sharks');
-  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 3);
+  // Each page here brings fewer than 18 posts, so every tap reads two (R4).
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 4);
   await shadowClick(page, 'Most recent');
-  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 1);
-  await shadowClick(page, 'Show more');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 2);
+  await shadowClick(page, 'Show more');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 4);
   // Back closes the tag page first, then search.
   assert.equal(await page.evaluate(() => window.__sg.back()), true);
   assert.ok((await searchText(page)).includes('Accounts'));
