@@ -622,3 +622,34 @@ test('R5: the star\'s diagnostics are counts, timings and shapes only', async ()
     'closedSearch', 'openCancelled', 'tidyScans', 'obsMs']) assert.equal(typeof n[k], 'number', k);
   assert.doesNotMatch(JSON.stringify(n), /instagram|variant|\/direct|\/me\/|explore|favorites/i);
 });
+
+// Messages keeps Instagram's bar mounted (only Stories, a chat and search
+// results hide it), so the star stays put across the trip and nothing is
+// inserted again on the way back: the sample must still be taken.
+test('R5: the geometry sample survives a trip to Messages within 2 s of the star showing', async () => {
+  const page = await open('https://www.instagram.com/');
+  await page.evaluate(() => history.pushState({}, '', '/direct/inbox/'));   // the bar stays mounted
+  await page.waitForTimeout(2500);
+  let n = await nav(page);
+  assert.equal(n.geo, null, 'not sampled while the star is hidden');
+  await page.evaluate(() => history.back());
+  await page.waitForFunction(() => !!window.__sg.stats.nav.geo, null, { timeout: 4000 });
+  n = await nav(page);
+  assert.equal(n.inserted, 1, 'the same star, never put in again');
+  assert.equal(n.geo.items, 5);
+});
+
+test('R5: in Messages a resize (the keyboard) puts no hidden star in; back on Home the star shows and is sampled', async () => {
+  const page = await open('https://www.instagram.com/direct/inbox/');
+  await page.setViewportSize({ width: 412, height: 600 });
+  await page.waitForTimeout(1300);
+  await page.setViewportSize({ width: 412, height: 915 });
+  await page.waitForTimeout(1500);
+  let n = await nav(page);
+  assert.deepEqual([n.inserted, await starCount(page)], [0, 0]);
+  await page.evaluate(() => history.pushState({}, '', '/'));   // the same bar, now on Home
+  await page.waitForFunction(() => !!window.__sg.stats.nav.geo, null, { timeout: 5000 });
+  n = await nav(page);
+  assert.equal(n.inserted, 1);
+  assert.deepEqual(await rows(page), [{ stars: 1, afterHome: true, hidden: false }]);
+});

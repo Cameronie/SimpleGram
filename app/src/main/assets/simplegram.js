@@ -1780,7 +1780,7 @@
       return;
     }
     parked.delete(row);
-    if (star && item.nextElementSibling === star) { stars.add(star); return; }
+    if (star && item.nextElementSibling === star) { stars.add(star); armGeo(); return; }
     if (star) stats.nav.moved++;
     else {
       addStyle();
@@ -1794,7 +1794,14 @@
     for (const c of row.children) {
       if (c !== star && c.querySelector('a[href="/reels/"],a[href="/reels"]') && hide(c, 'reels-tab')) stats.dom.reelsTab++;
     }
-    if (!stats.nav.geo && !geoTimer && geoTries < 3) geoTimer = setTimeout(() => { geoTimer = 0; geoTries++; safe(sampleNav)(); }, 2000);
+    armGeo();
+  }
+  // The geometry sample, about 2 s after the star shows. Armed again by any
+  // look that finds the star in place, or a route change, until one
+  // measurement is taken (3 tries at most); a star hidden then (Stories,
+  // messages) costs no try.
+  function armGeo() {
+    if (!stats.nav.geo && !geoTimer && geoTries < 3) geoTimer = setTimeout(() => { geoTimer = 0; safe(sampleNav)(); }, 2000);
   }
   // True when the row may take the star now. Otherwise it is looked at again
   // every 400 ms, for 25 tries or 10 s at most; then only a tidy pass that
@@ -1924,12 +1931,14 @@
     bottomSeen = new WeakMap();
     tidyStars(true);
     if (Date.now() < resizeUntil) resizeFrame = requestAnimationFrame(safe(resizeFrameCheck));
-    else searchStars();
+    else if (!noStarHere()) searchStars();   // in Stories or messages the return there looks (rowFlagged)
   }
   // Shapes only: does the star line up with Instagram's items on this phone?
   function sampleNav() {
+    if (noStarHere()) return;
     const star = Array.from(stars).find(s => s.isConnected && visibleBox(s));
     if (!star) return;
+    geoTries++;
     const row = star.parentElement;
     const items = Array.from(row.children).filter(c => visibleBox(c));
     const home = star.previousElementSibling;
@@ -2392,6 +2401,7 @@
     safe(markFeed)();
     // Back from Stories or messages: the observer skipped the bar there.
     if (previous === 'story' || previous === 'direct') rowFlagged = true;
+    if (CFG.role === 'main' && stars.size && !noStarHere()) armGeo();
     safe(syncSwipeGuard)();
     safe(noteStoryUrl)();
     if (CFG.role === 'main' && route() === 'reels-tab') {
