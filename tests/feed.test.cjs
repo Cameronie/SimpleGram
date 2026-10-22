@@ -72,10 +72,13 @@ const feedStats = pg => pg.evaluate(() => window.__sg.stats.feed);
 // Instagram's timers run on a fake clock, so 15 s waits take no time. (The
 // script's own 1.5 s interval starts before the clock does; a scroll event
 // runs the same end-of-Home check at the current fake time.)
+// The clock is paused: time moves only by runFor, never by the machine's own
+// time (under load a flowing fake clock could skip or rewind a long runFor).
 async function openClocked(url, html) {
   const pg = await open(url, html);
   await pg.clock.install();
   await pg.reload();
+  await pg.clock.pauseAt(await pg.evaluate(() => Date.now() + 1000));
   return pg;
 }
 async function check(pg) {
