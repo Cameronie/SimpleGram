@@ -105,6 +105,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private Downloads downloads;
 
     private String route = "other";
+    private String pageUrl = "";
+    private TextView skipChip;
+    private String skipKind = "";
+    private int skipCount;
     private String menuLink;
     private boolean screenshotMode;
     private boolean zoomedStory;
@@ -164,6 +168,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         barLp.bottomMargin = dp(72);
         root.addView(feedBar, barLp);
+
+        skipChip = makeSkipChip();
+        FrameLayout.LayoutParams skipLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        skipLp.bottomMargin = dp(72);
+        root.addView(skipChip, skipLp);
 
         menuButton = makeMenuButton();
         root.addView(menuButton, new FrameLayout.LayoutParams(dp(TAB_W), dp(TAB_H)));
@@ -302,6 +312,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
             injectFallback(view);
+            if ("main".equals(role)) startsAll++;
             // A page outside Instagram (Meta login, Accounts Center) sends no
             // 'ready': forget the last Instagram page's state so Back goes back.
             if ("main".equals(role) && url != null && !Links.isInstagram(Uri.parse(url))) {
@@ -343,7 +354,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             try {
                 Intent intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
                 String target = Links.normalize(intent.getStringExtra("browser_fallback_url"));
-                if (target != null) view.loadUrl(target);
+                if (target != null) load(view, target);
             } catch (Exception ignored) {
                 // "Open in app" prompts have nowhere to go.
             }
@@ -356,11 +367,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 return true;
             }
             if (Links.isReelsTab(uri)) {
-                view.loadUrl(Links.HOME);
+                load(view, Links.HOME);
                 return true;
             }
             if (scheme.equals("http") && Links.normalize(uri.toString()) != null) {
-                view.loadUrl(Links.normalize(uri.toString()));
+                load(view, Links.normalize(uri.toString()));
                 return true;
             }
             if (Links.staysInApp(uri)) return false;
@@ -371,6 +382,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             openExternal(uri);
         }
         return true;
+    }
+
+    // Page loads since the process started, by who started them (Filter status:
+    // a page start the app didn't ask for came from the page itself).
+    private static int startsAll, startsLoadUrl, startsGoBack, startsReload;
+
+    private void load(WebView view, String url) {
+        if (view == web) startsLoadUrl++;
+        view.loadUrl(url);
     }
 
     private void openExternal(Uri uri) {
@@ -476,10 +496,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             case "route":
                 if (main) {
                     route = m.optString("route", "other");
+                    pageUrl = m.optString("url", "");
                     if ("ready".equals(action)) {
                         // A new page: nothing from the old one carries over.
                         searchOpen = false;
                         feedWanted = false;
+                        skipKind = "";
                         setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
                         if (!prefs.getBoolean("tabTip", false)) {
@@ -494,7 +516,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "feedEnd":
                 if (main) {
-                    feedWanted = m.optBoolean("on");
+                    // The end-of-Home card belongs to Home only, whatever the page asks.
+                    feedWanted = m.optBoolean("on") && !onOtherFeed();
                     if (feedWanted) {
                         String subtitle = m.optBoolean("caughtUp") && !m.isNull("subtitle") ? m.optString("subtitle", "").trim() : "";
                         setFeedText(m.optBoolean("stalled"), subtitle.length() > 200 ? subtitle.substring(0, 200) : subtitle);
@@ -507,6 +530,25 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     searchOpen = m.optBoolean("open");
                     updateFeedBar();
                 }
+                break;
+            case "skipStatus":
+                if (main) {
+                    String kind = m.optString("kind", "");
+                    skipKind = m.optBoolean("on") && ("skipping".equals(kind) || "nothingNew".equals(kind)) ? kind : "";
+                    skipCount = Math.max(0, Math.min(99999, m.optInt("n")));
+                    updateFeedBar();
+                }
+                break;
+            case "openFeed":
+                if (main) {
+                    String v = m.optString("variant");
+                    if ("home".equals(v)) loadMain(Links.HOME);
+                    else if ("following".equals(v)) loadMain(FOLLOWING);
+                    else if ("favorites".equals(v)) loadMain(FAVORITES);
+                }
+                break;
+            case "trail":
+                if (main) keepTrail(m.optJSONObject("entry"));
                 break;
             case "awake":
                 if (main) setAwake(m.optBoolean("on"));
@@ -592,8 +634,49 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     /* ------------------------------------------------------------------ *
-     * End of Home: keep going in Following or Favorites
+     * End of Home: keep going in Following
      * ------------------------------------------------------------------ */
+
+    /** Following, Favorites or Older posts (the address's variant), not Home. */
+    private boolean onOtherFeed() {
+        if (pageUrl == null || pageUrl.isEmpty()) return false;
+        String v = Uri.parse(pageUrl).getQueryParameter("variant");
+        return v != null && !v.isEmpty() && !"home".equals(v);
+    }
+
+    /** Following or Favorites: where the skip note may show. */
+    private boolean onFollowingOrFavorites() {
+        if (pageUrl == null || pageUrl.isEmpty()) return false;
+        String v = Uri.parse(pageUrl).getQueryParameter("variant");
+        return "following".equals(v) || "favorites".equals(v);
+    }
+
+    /** The note on Following opened from the end card, never through the card itself. */
+    private TextView makeSkipChip() {
+        TextView chip = new TextView(this);
+        chip.setTextColor(Color.WHITE);
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        chip.setGravity(Gravity.CENTER);
+        chip.setPadding(dp(16), dp(9), dp(16), dp(9));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xD9262626);
+        bg.setCornerRadius(dp(18));
+        chip.setBackground(bg);
+        chip.setElevation(dp(6));
+        chip.setContentDescription("Skip status");
+        chip.setVisibility(View.GONE);
+        return chip;
+    }
+
+    private void updateSkipChip() {
+        boolean show = !skipKind.isEmpty() && "home".equals(route) && onFollowingOrFavorites() && !screenshotMode
+                && !comments.isOpen() && !searchOpen && customView == null;
+        if (show) {
+            skipChip.setText("nothingNew".equals(skipKind) ? "Nothing new since Home"
+                    : skipCount > 0 ? "Skipping " + skipCount + " posts you saw in Home…" : "Skipping posts you saw in Home…");
+        }
+        skipChip.setVisibility(show ? View.VISIBLE : View.GONE);
+    }
 
     private View makeFeedBar() {
         android.widget.LinearLayout bar = new android.widget.LinearLayout(this);
@@ -626,13 +709,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         feedSub = sub;
         setFeedText(false, "");
 
-        android.widget.LinearLayout row = new android.widget.LinearLayout(this);
-        row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
-        row.addView(feedButton("Following", "following"));
-        View gap = new View(this);
-        row.addView(gap, new android.widget.LinearLayout.LayoutParams(dp(10), 1));
-        row.addView(feedButton("Favorites", "favorites"));
-        bar.addView(row);
+        // Following only: Favorites stays in the ⋮ menu.
+        bar.addView(feedButton("Following", "following"));
         bar.setVisibility(View.GONE);
         return bar;
     }
@@ -683,7 +761,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     /** The card shows when the page asks for it and nothing else is in the way. */
     private void updateFeedBar() {
-        boolean show = feedWanted && "home".equals(route) && !screenshotMode && !comments.isOpen()
+        updateSkipChip();
+        boolean show = feedWanted && "home".equals(route) && !onOtherFeed() && !screenshotMode && !comments.isOpen()
                 && !zoom.isZoomed() && !searchOpen && customView == null;
         boolean visible = feedBar.getVisibility() == View.VISIBLE;
         if (show && visible && feedBar.getAlpha() >= 1f) return;
@@ -949,6 +1028,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 case 5:
                     feedWanted = false;
                     updateFeedBar();
+                    startsReload++;
                     web.reload();
                     break;
                 case 6:
@@ -1002,7 +1082,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         updateFeedBar();
         closeComments();
         if (zoom.isZoomed()) zoom.reset(false);
-        web.loadUrl(url);
+        load(web, url);
     }
 
     private String currentLink() {
@@ -1082,6 +1162,27 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     .append(" · follow unknown: ").append(feed.optInt("followUnknown")).append('\n')
                     .append("  Blank screen: ").append(feed.optInt("blank"))
                     .append(" · most posts loaded: ").append(feed.optInt("peakPosts")).append('\n');
+            JSONObject kinds = feed.optJSONObject("anchorKind");
+            JSONObject nav = stats.optJSONObject("nav");
+            JSONObject full = nav == null ? null : nav.optJSONObject("homeFull");
+            b.append("  Home tab: to the top ").append(feed.optInt("homeTapTop"))
+                    .append(" · let through ").append(feed.optInt("homeTapRefresh"))
+                    .append(" · fresh Home ").append(full == null ? 0 : full.optInt("bar") + full.optInt("header"))
+                    .append(full == null ? "" : " (bar " + full.optInt("bar") + ", header " + full.optInt("header") + ")").append('\n')
+                    .append("  First-page anchors: ").append(feed.optInt("anchor"));
+            if (kinds != null) {
+                b.append(" (seen ").append(kinds.optInt("seen")).append(", caught-up line ").append(kinds.optInt("marker"))
+                        .append(", hidden suggestion ").append(kinds.optInt("recs")).append(')');
+            }
+            b.append('\n')
+                    .append("  Following from the card: seen skipped ").append(feed.optInt("alreadySeen"))
+                    .append(" · skip ended ").append(feed.optInt("skipForgotten") + feed.optInt("skipLeft"))
+                    .append(" · repeat stops ").append(feed.optInt("cursorEcho"))
+                    .append(" · slowed ").append(feed.optInt("skipThrottled")).append('\n')
+                    .append("  Feed switches reloaded: ").append(feed.optInt("switchLoads"))
+                    .append(" · blank feeds reloaded: ").append(feed.optInt("recovered"))
+                    .append(" (held ").append(feed.optInt("recoverHeld")).append(")\n")
+                    .append("  Feed trail: ").append(trail().length()).append(" entries, kept across restarts (Copy details)\n");
         }
         JSONObject sd = stats.optJSONObject("searchData");
         JSONObject opens = stats.optJSONObject("searchOpens");
@@ -1144,6 +1245,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         String last = device.optString("rendererGoneLast");
         if (!last.isEmpty()) b.append(" (last: ").append(last).append(')');
         b.append('\n');
+        b.append("  Page loads since the app started: ").append(startsAll)
+                .append(" (app: open ").append(startsLoadUrl).append(", back ").append(startsGoBack)
+                .append(", refresh ").append(startsReload).append(")\n");
         b.append("\nCounts since the page last loaded. No account names or post details are kept.");
         dialog().setTitle("Filter status").setMessage(b.toString())
                 .setNeutralButton("Copy details", (d, w) -> copyDetails(stats, device))
@@ -1162,10 +1266,33 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("fullScreenLast", fullScreenLast);
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
+            n.put("pageStarts", new JSONObject().put("all", startsAll).put("loadUrl", startsLoadUrl)
+                    .put("goBack", startsGoBack).put("reload", startsReload));
         } catch (JSONException e) {
             // Partial details are still useful.
         }
         return n;
+    }
+
+    // The page's feed trail (counts and shapes only), kept across restarts so a
+    // report sent after restarting still shows what happened before.
+    private static final int TRAIL_MAX = 40;
+
+    private JSONArray trail() {
+        try {
+            return new JSONArray(prefs.getString("feedTrail", "[]"));
+        } catch (JSONException e) {
+            return new JSONArray();
+        }
+    }
+
+    private void keepTrail(JSONObject entry) {
+        if (entry == null || entry.toString().length() > 800) return;
+        JSONArray old = trail();
+        JSONArray kept = new JSONArray();
+        for (int i = Math.max(0, old.length() - (TRAIL_MAX - 1)); i < old.length(); i++) kept.put(old.opt(i));
+        kept.put(entry);
+        prefs.edit().putString("feedTrail", kept.toString()).apply();
     }
 
     /** Counts and data shapes only, for pasting into a bug report. */
@@ -1173,7 +1300,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         JSONObject all = new JSONObject();
         try {
             all.put("device", device);
-            all.put("page", stats);
+            // The page's trail is the newest part of the kept one.
+            JSONObject page = new JSONObject(stats.toString());
+            page.remove("trail");
+            all.put("page", page);
+            all.put("trail", trail());
         } catch (JSONException e) {
             return;
         }
@@ -1306,7 +1437,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (target != null) {
             loadMain(target);
         } else if (fresh) {
-            web.loadUrl(Links.HOME);
+            load(web, Links.HOME);
         }
     }
 
@@ -1349,8 +1480,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private void pageBack() {
         String url = web.getUrl();
         boolean feedVariant = url != null && url.contains("variant=") && !url.contains("variant=home");
-        if (web.canGoBack() && (!"home".equals(route) || feedVariant)) web.goBack();
-        else moveTaskToBack(true);
+        if (web.canGoBack() && (!"home".equals(route) || feedVariant)) {
+            startsGoBack++;
+            web.goBack();
+        } else {
+            moveTaskToBack(true);
+        }
     }
 
     private void setAwake(boolean on) {
