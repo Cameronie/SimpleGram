@@ -342,6 +342,15 @@ test('R5: Instagram\'s Home tab and its "< Favorites" link on Favorites load Hom
   const hdr = await open('https://www.instagram.com/?variant=favorites', { bridge: 'none' });
   await Promise.all([hdr.waitForURL('https://www.instagram.com/'), hdr.tap('#variants-back')]);
   assert.deepEqual(await hdr.evaluate(() => [window.__igClicks, window.__goCalls]), [[], []]);
+  // Counted by where they are, though the header link sits in a <nav> like Instagram's.
+  const rec = await open('https://www.instagram.com/?variant=favorites');
+  await rec.tap('#variants-back');
+  await rec.waitForTimeout(150);
+  assert.deepEqual(await rec.evaluate(() => [window.__sent.filter(m => m.action === 'openFeed').map(m => m.variant), window.__sg.stats.nav.homeFull]),
+    [['home'], { bar: 0, header: 1 }]);
+  await rec.tap('a[href="/"]:visible >> nth=0');
+  await rec.waitForTimeout(150);
+  assert.deepEqual(await rec.evaluate(() => window.__sg.stats.nav.homeFull), { bar: 1, header: 1 });
 });
 
 test('R5: with SimpleGram search open on Home, the star closes it and opens Favorites', async () => {
@@ -526,7 +535,49 @@ test('R5: the star while Instagram\'s router is in the middle of opening a resul
   await page.tap('[data-sg-fav] a');
   const r = await landed(page);
   assert.equal(r.where, '/?variant=favorites');
+  assert.equal(r.opens.cancelled, 1, 'the open, mid-way, is called off once');
   assert.deepEqual(page.__docs, ['/?variant=favorites']);
+});
+
+// Tapped while Instagram's router is still fetching the result's route (the
+// URL hasn't moved): the open is called off, then the router pushes the
+// result before the feed's page arrives. The app's loadUrl is modelled by a
+// browser-initiated load (page.goto) or by location.assign.
+async function racedOpen(start, tap, how) {
+  const page = await searchThenOpen({ start, exposeRequire: true, fetchMs: 700, renderMs: 300, docDelay: 2500 });
+  if (how === 'goto') {
+    await page.evaluate(() => { window.SGNative.postMessage = m => { const msg = JSON.parse(m); window.__sent.push(msg); if (msg.action === 'openFeed') window.__wantFeed = msg.variant; }; });
+  }
+  await sleep(300);
+  const before = await page.evaluate(() => location.pathname + location.search);
+  await page.tap(tap);
+  let aborted = null;
+  if (how === 'goto') {
+    const v = await page.evaluate(() => window.__wantFeed);
+    page.goto('https://www.instagram.com/' + (v === 'home' ? '' : '?variant=' + v)).catch(e => { aborted = String(e).slice(0, 80); });
+  }
+  const want = start === '/' ? '?variant=favorites' : '';
+  await page.waitForFunction(w => location.search === w && document.readyState === 'complete' && !!window.__sg, want, { timeout: 12000, polling: 100 });
+  await sleep(2500);
+  const r = await page.evaluate(() => ({ where: location.pathname + location.search, opens: JSON.parse(sessionStorage.getItem('sg_search_opens') || '{}') }));
+  return { before, r, docs: page.__docs, aborted, page };
+}
+for (const how of ['assign', 'goto']) {
+  test(`R5: the star while Instagram's router still fetches the result (${how}): the late push never cancels the Favorites load`, async () => {
+    const { before, r, docs } = await racedOpen('/', '[data-sg-fav] a', how);
+    assert.equal(before, '/', 'tapped before Instagram moved the URL');
+    assert.equal(r.where, '/?variant=favorites');
+    assert.equal(r.opens.cancelled, 1);
+    assert.equal(r.opens.fullLoad || 0, 0);
+    assert.ok(docs.length >= 1 && docs.every(d => d === '/?variant=favorites'), JSON.stringify(docs));
+  });
+}
+test('R5: Home tab on Following while Instagram\'s router still fetches the result: Home loads, the result never does', async () => {
+  const { before, r, docs } = await racedOpen('/?variant=following', 'a[href="/"]', 'goto');
+  assert.equal(before, '/?variant=following');
+  assert.equal(r.where, '/');
+  assert.equal(r.opens.cancelled, 1);
+  assert.ok(docs.length >= 1 && docs.every(d => d === '/'), JSON.stringify(docs));
 });
 
 /* ---------------- Diagnostics ---------------- */

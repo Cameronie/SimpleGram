@@ -1375,7 +1375,9 @@
       return false;
     }
     swallow(e);
-    const where = a.closest('nav') || a.getBoundingClientRect().top > innerHeight / 2 ? 'bar' : 'header';
+    // Not by <nav>: on a phone Instagram's top header (the "< Favorites"
+    // link) sits in a <nav> too (PolarisMobileHeaderWrapper).
+    const where = a.closest('header') ? 'header' : homeItem(a) || a.getBoundingClientRect().top > innerHeight / 2 ? 'bar' : 'header';
     bump(stats.nav.homeFull, where);
     openFeedFresh('home');
     return true;
@@ -1384,6 +1386,9 @@
   // panel and resets zoom); location.assign when the app's bridge is missing.
   function openFeedFresh(variant) {
     cancelOpen();
+    // If Instagram's router still finishes the called-off open, it must not
+    // be stepped back from (that would cancel this load): the feed replaces it.
+    if (calledOff) calledOff.reload = variant === 'home' ? '/' : '/?variant=' + variant;
     if (search.open) { hideSearch(false); search.suspended = false; clearSaved(); }
     if (!post('openFeed', { variant: variant })) location.assign(variant === 'home' ? '/' : '/?variant=' + variant);
   }
@@ -4588,6 +4593,9 @@
     if (here() === c.from) return false;
     calledOff = null;
     if (!sameTarget(here(), c.path)) return false;
+    // A feed was asked for on top of it (already counted as cancelled): a
+    // step back would call that load off too, so the feed replaces the result.
+    if (c.reload) { setTimeout(() => location.replace(c.reload), 0); return true; }
     countOpen('cancelled');
     setTimeout(() => history.back(), 0);
     return true;

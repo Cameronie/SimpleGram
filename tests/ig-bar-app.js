@@ -93,14 +93,16 @@
       h('div', { className: 'xh8yej3 x8vgawa' }, props.children));
   }
   // The feed page. On Following and Favorites, PolarisFeedVariantsHeader's
-  // "< Favorites" link is a PolarisFastLink to "/" (an in-page switch).
+  // "< Favorites" link is a PolarisFastLink to "/" (an in-page switch), in
+  // the mobile header, which on a phone is a <nav> holding a <header>.
   function Feed() {
     const v = new URLSearchParams(location.search).get('variant') || 'home';
     const posts = [];
     for (let i = 0; i < 12; i++) posts.push(h('article', { key: i, style: { height: '420px', margin: '8px 0', background: 'rgba(128,128,128,.25)' } }, v + ' post ' + i));
     return h('section', { id: 'feedcol' },
-      v === 'home' ? null : h('div', { id: 'variants-header' }, h('div', null,
-        h('a', { id: 'variants-back', href: '/', onClick: e => { e.preventDefault(); window.__igClicks.push('header /'); go('/'); } }, '< ' + v))),
+      // PolarisMobileHeaderWrapper's <nav> > PolarisGenericMobileHeader's <header> > IGDSBox > the link.
+      v === 'home' ? null : h('nav', { id: 'variants-header' }, h('header', null, h('div', null,
+        h('a', { id: 'variants-back', href: '/', onClick: e => { e.preventDefault(); window.__igClicks.push('header /'); go('/'); } }, '< ' + v)))),
       h('div', null, 'stories tray'),
       h('main', { 'data-variant': v }, h('div', { id: 'feed' }, posts)));
   }
