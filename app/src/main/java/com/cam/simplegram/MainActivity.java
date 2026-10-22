@@ -21,6 +21,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -312,7 +313,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
             injectFallback(view);
-            if ("main".equals(role)) startsAll++;
+            if ("main".equals(role)) {
+                startsAll++;
+                // Only a Back that starts a new page counts as one: most stay in the page.
+                if (goBackAt != 0 && SystemClock.uptimeMillis() - goBackAt < 1500) startsGoBack++;
+                goBackAt = 0;
+            }
             // A page outside Instagram (Meta login, Accounts Center) sends no
             // 'ready': forget the last Instagram page's state so Back goes back.
             if ("main".equals(role) && url != null && !Links.isInstagram(Uri.parse(url))) {
@@ -386,10 +392,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     // Page loads since the process started, by who started them (Filter status:
     // a page start the app didn't ask for came from the page itself).
-    private static int startsAll, startsLoadUrl, startsGoBack, startsReload;
+    // backPresses: every Back sent to the page, most of which stay in it.
+    private static int startsAll, startsLoadUrl, startsGoBack, startsReload, backPresses;
+    private static long goBackAt;
 
     private void load(WebView view, String url) {
-        if (view == web) startsLoadUrl++;
+        if (view == web) { startsLoadUrl++; goBackAt = 0; }
         view.loadUrl(url);
     }
 
@@ -1029,6 +1037,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     feedWanted = false;
                     updateFeedBar();
                     startsReload++;
+                    goBackAt = 0;
                     web.reload();
                     break;
                 case 6:
@@ -1247,7 +1256,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         b.append('\n');
         b.append("  Page loads since the app started: ").append(startsAll)
                 .append(" (app: open ").append(startsLoadUrl).append(", back ").append(startsGoBack)
-                .append(", refresh ").append(startsReload).append(")\n");
+                .append(", refresh ").append(startsReload).append(")\n")
+                .append("  Back presses in the page: ").append(backPresses).append('\n');
         b.append("\nCounts since the page last loaded. No account names or post details are kept.");
         dialog().setTitle("Filter status").setMessage(b.toString())
                 .setNeutralButton("Copy details", (d, w) -> copyDetails(stats, device))
@@ -1267,7 +1277,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
             n.put("pageStarts", new JSONObject().put("all", startsAll).put("loadUrl", startsLoadUrl)
-                    .put("goBack", startsGoBack).put("reload", startsReload));
+                    .put("goBack", startsGoBack).put("reload", startsReload).put("backPresses", backPresses));
         } catch (JSONException e) {
             // Partial details are still useful.
         }
@@ -1481,7 +1491,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         String url = web.getUrl();
         boolean feedVariant = url != null && url.contains("variant=") && !url.contains("variant=home");
         if (web.canGoBack() && (!"home".equals(route) || feedVariant)) {
-            startsGoBack++;
+            backPresses++;
+            goBackAt = SystemClock.uptimeMillis();
             web.goBack();
         } else {
             moveTaskToBack(true);
