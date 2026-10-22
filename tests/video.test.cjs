@@ -11,6 +11,10 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { SCRIPT, ME, sent, waitSent, user, media, PNG } = require('./helpers.cjs');
 const { chromium } = require('playwright');
+const fs = require('node:fs');
+const path = require('node:path');
+// A one-second clip with sound, served for every video address (a Reel's CDN link).
+const CLIP = fs.readFileSync(path.join(__dirname, 'reel.webm'));
 
 let browser;
 before(async () => {
@@ -19,7 +23,7 @@ before(async () => {
 after(async () => { await browser.close(); });
 
 // Like helpers.open, with `init` run before the page script (to watch its listeners).
-async function openPage(url, html, { api = {}, init = null } = {}) {
+async function openPage(url, html, { api = {}, init = null, video = null } = {}) {
   const context = await browser.newContext({
     viewport: { width: 412, height: 915 }, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true,
   });
@@ -35,6 +39,12 @@ async function openPage(url, html, { api = {}, init = null } = {}) {
       }
     }
     if (u.pathname === new URL(url).pathname) return route.fulfill({ status: 200, contentType: 'text/html', body: html });
+    if (/\.(mp4|webm)$/.test(u.pathname)) {
+      const status = video ? video(u) : 200;
+      page.hits.video = (page.hits.video || 0) + 1;
+      return status === 200 ? route.fulfill({ status: 200, contentType: 'video/webm', body: CLIP })
+        : route.fulfill({ status: status, contentType: 'text/plain', body: '' });
+    }
     if (/\.(jpg|png)/.test(u.pathname)) return route.fulfill({ status: 200, contentType: 'image/png', body: PNG });
     return route.fulfill({ status: 404, contentType: 'text/plain', body: '' });
   });
@@ -244,6 +254,111 @@ test('R8: the browser refusing full screen is counted, and the next swipe tries 
   assert.deepEqual([await page.evaluate(() => window.__tries), s.r8, s.r8Failed], [2, 0, 2]);
 });
 
+test('R8: a sheet or dialog over the video keeps its own swipes (its list scrolls; no full screen)', async () => {
+  const page = await openPage('https://www.instagram.com/p/ABCDEFG/', POST);
+  await stubFullscreen(page);
+  // Instagram's Share sheet: a dialog drawn over the post, its friend list scrolled down.
+  await page.evaluate(() => {
+    const d = document.createElement('div');
+    d.setAttribute('role', 'dialog');
+    d.style.cssText = 'position:fixed;left:0;right:0;top:100px;height:600px;background:#fff';
+    d.innerHTML = '<div id="list" style="height:600px;overflow-y:auto"><div style="height:3000px"></div></div>';
+    document.body.appendChild(d);
+    document.getElementById('list').scrollTop = 662;
+  });
+  await drag(page, [200, 250], [200, 450]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), []);
+  assert.ok(await page.evaluate(() => document.getElementById('list').scrollTop) < 600, 'the list scrolled back up');
+  // At the top of its list, a swipe down there (closing the sheet) is the sheet's too.
+  await page.evaluate(() => { document.getElementById('list').scrollTop = 0; });
+  await drag(page, [200, 250], [200, 450]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), []);
+  // The same over a layer that isn't marked as a dialog.
+  await page.evaluate(() => {
+    const d = document.querySelector('[role="dialog"]');
+    d.removeAttribute('role');
+    document.getElementById('list').scrollTop = 900;
+  });
+  await drag(page, [200, 250], [200, 450]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), []);
+  assert.ok(await page.evaluate(() => document.getElementById('list').scrollTop) < 850);
+  // Gone again, the video's own swipe works.
+  await page.evaluate(() => document.querySelector('#list').parentElement.remove());
+  await drag(page, [200, 250], [200, 450]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.equal((await fv(page)).r8, 1);
+});
+
+test('R8: dragging a Reel\'s comments sheet down by its header closes the sheet only', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0;overflow:hidden">
+    <div id="mount"><main><div style="position:relative;width:412px;height:915px">
+      <video id="v" muted playsinline style="width:412px;height:915px;display:block;background:#222"></video>
+      <div style="position:absolute;inset:0"></div></div></main></div>
+    <div id="sheet" role="dialog" aria-modal="true" style="position:fixed;left:0;right:0;bottom:0;height:500px;background:#fff">
+      <div id="hdr" style="height:40px"></div>
+      <div style="height:460px;overflow-y:auto"><div style="height:2000px"></div></div></div>
+    </body></html>`;
+  const page = await openPage('https://www.instagram.com/reel/ABCDEFG/', html);
+  await stubFullscreen(page);
+  await drag(page, [200, 430], [200, 820]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), []);
+  await drag(page, [200, 600], [200, 820]);          // on its list, at the top
+  assert.deepEqual(await page.evaluate(() => window.__fs), []);
+  // Above the sheet, on the video itself: full screen.
+  await drag(page, [200, 100], [200, 300]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+});
+
+test('R8: Instagram nesting the video deep inside its tap layer\'s box still works', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+    <main><article><header style="height:60px">friend</header>
+      <div style="position:relative;width:412px;height:520px"><div><div><div><div><div><div>
+        <video id="v" muted playsinline style="width:412px;height:500px;display:block;background:#222"></video>
+      </div></div></div></div></div></div>
+      <div role="button" style="position:absolute;left:0;top:0;width:412px;height:500px"><div style="height:500px"></div></div></div>
+      <div style="height:2400px">a long description</div></article></main></body></html>`;
+  const page = await openPage('https://www.instagram.com/p/ABCDEFG/', html);
+  await stubFullscreen(page);
+  await drag(page, [200, 250], [200, 450]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+});
+
+test('R8: a letterboxed video under a full-screen tap layer still works', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0;overflow:hidden">
+    <div id="mount"><main><div style="position:relative;width:412px;height:915px;background:#000">
+      <div style="padding-top:340px"><video id="v" muted playsinline style="width:412px;height:232px;display:block;background:#222"></video></div>
+      <div role="button" style="position:absolute;inset:0"></div></div></main></div></body></html>`;
+  const page = await openPage('https://www.instagram.com/reel/ABCDEFG/', html);
+  await stubFullscreen(page);
+  await drag(page, [200, 400], [200, 560]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+});
+
+test('R8: a landscape video that played muted in the post gets its sound in full screen', async () => {
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+    <main><article><header style="height:60px">friend</header>
+      <div style="position:relative;width:412px;height:232px">
+        <video id="v" muted playsinline style="width:412px;height:232px;display:block;background:#222"></video>
+        <div style="position:absolute;inset:0"></div></div>
+      <div style="height:2400px">a long description</div></article></main></body></html>`;
+  const page = await openPage('https://www.instagram.com/p/ABCDEFG/', html);
+  await stubFullscreen(page);
+  await page.evaluate(() => {
+    const v = document.getElementById('v');
+    Object.defineProperty(v, 'paused', { configurable: true, get: () => false });
+    // The full-screen view fills the screen with the video.
+    const req = HTMLElement.prototype.requestFullscreen;
+    HTMLElement.prototype.requestFullscreen = function () {
+      this.style.cssText = 'position:fixed;inset:0;width:412px;height:915px';
+      return req.call(this);
+    };
+  });
+  assert.equal(await page.evaluate(() => document.getElementById('v').muted), true, 'muted while small');
+  await drag(page, [200, 120], [200, 330]);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  await page.waitForFunction(() => document.getElementById('v').muted === false, null, { timeout: 2000 });
+});
+
 /* ---------------- A12: no blocking touch listeners ---------------- */
 
 // Records the page script's touch listeners on window and document that can hold a scroll.
@@ -321,7 +436,8 @@ const reelInfo = () => ({ body: { status: 'ok', items: [media('REELCODE1', user(
   product_type: 'clips', video_versions: [{ url: 'https://scontent.cdninstagram.com/v/t50/reel-720.mp4', width: 720, height: 1280 }] })] } });
 
 async function openStory(items, opts = {}) {
-  const page = await openPage('https://www.instagram.com/stories/friend/424242/', STORY, { api: { '/api/v1/media/*': opts.info || reelInfo } });
+  const page = await openPage('https://www.instagram.com/stories/friend/424242/', opts.html || STORY,
+    { api: { '/api/v1/media/*': opts.info || reelInfo }, video: opts.video });
   await page.evaluate(p => JSON.parse(JSON.stringify(p)), storyPayload(items));
   await stubFullscreen(page, true);
   return page;
@@ -453,6 +569,107 @@ test('R9: shared Reels are remembered by Story item; diagnostics carry counts on
   await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v && v.getAttribute('src'); });
   const d = await page.evaluate(() => JSON.stringify(window.__sg.stats.diag));
   assert.doesNotMatch(d, /REELCODE1|friend|creator|cdninstagram|424242/);
+});
+
+// Instagram's real layering (PolarisMobileStoryEventZone): the press zone has
+// the touch handlers; the tappable stickers are a sibling layer above it,
+// pointer-events none, each sticker auto. A photo moves on after its timer
+// unless the zone is pressed.
+const STICKER_STORY = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0;background:#000">
+  <div id="mount"><section id="viewer" style="position:fixed;inset:0">
+    <img id="media" src="/story1.jpg" style="position:absolute;inset:0;width:412px;height:915px">
+    <div style="position:absolute;inset:0">
+      <div id="zone" role="button" style="position:absolute;inset:0">
+        <button id="prev" style="position:absolute;left:0;top:0;width:120px;height:915px;opacity:0"></button>
+        <button id="next" style="position:absolute;right:0;top:0;width:292px;height:915px;opacity:0"></button>
+      </div>
+      <div id="tappables" style="position:absolute;inset:0;pointer-events:none">
+        <div><div id="sticker" role="button" style="position:absolute;left:80px;top:450px;width:250px;height:300px;pointer-events:auto;z-index:1;background:#555">
+          <span id="card" style="display:block;height:300px">Watch Reel</span></div></div>
+      </div>
+    </div>
+  </section></div>
+  <script>
+    const S = window.__story = { paused: false, elapsed: 0, item: 1, stickerTouches: 0 };
+    const zone = document.getElementById('zone');
+    zone.addEventListener('touchstart', e => { S.paused = true; S.x = e.touches[0].clientX; });
+    zone.addEventListener('touchend', e => { if (e.touches.length === 0) S.paused = false; });
+    document.getElementById('sticker').addEventListener('touchstart', () => S.stickerTouches++);
+    setInterval(() => {
+      if (S.paused) return;
+      S.elapsed += 100;
+      if (S.elapsed >= 1200) { S.elapsed = 0; S.item++; history.pushState(null, '', '/stories/friend/42424' + (S.item + 1) + '/'); }
+    }, 100);
+  </script></body></html>`;
+
+test('R9: a swipe that starts on the Reel card presses the Story itself, so it waits', async () => {
+  const page = await openStory([sharingItem('424242', REEL_STICKER)], { html: STICKER_STORY });
+  await page.evaluate(() => { window.__story.elapsed = 0; });
+  await drag(page, [200, 600], [205, 250], { steps: 4 });
+  assert.equal(await page.evaluate(() => window.__story.stickerTouches), 1, 'the finger was on the card');
+  await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v && v.getAttribute('src'); });
+  assert.equal(await page.evaluate(() => window.__story.paused), true, 'the Story is pressed at once');
+  await page.waitForTimeout(1600);                   // longer than the photo's own time
+  const mid = await page.evaluate(() => ({ paused: window.__story.paused, item: window.__story.item, path: location.pathname }));
+  assert.deepEqual(mid, { paused: true, item: 1, path: '/stories/friend/424242/' });
+  await drag(page, [200, 300], [200, 650], { steps: 4 });
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), false);
+  assert.equal(await page.evaluate(() => window.__story.paused), false, 'let go: the Story continues');
+  const s = await fv(page);
+  assert.deepEqual([s.r9, s.r9Moved, s.r9Pressed], [1, 0, 1]);
+});
+
+test('R9: a swipe that starts on the Story itself is left to Instagram\'s own press', async () => {
+  const page = await openStory([sharingItem('424242', REEL_STICKER)], { html: STICKER_STORY });
+  await drag(page, [200, 850], [205, 450], { steps: 4 });
+  await page.waitForFunction(() => !!document.getElementById('sg-reel'));
+  assert.equal(await page.evaluate(() => window.__story.paused), true);
+  await page.evaluate(() => window.__sg.onNative({ type: 'fullVideoExit' }));
+  assert.equal(await page.evaluate(() => window.__story.paused), false);
+  assert.equal((await fv(page)).r9Pressed, 0);
+});
+
+test('R9: your own mute in Stories carries over to the Reel', async () => {
+  const page = await openStory([sharingItem('424242', REEL_STICKER)]);
+  await page.evaluate(() => {
+    const v = document.createElement('video');
+    v.id = 'sv';
+    v.style.cssText = 'position:absolute;inset:0;width:412px;height:915px';
+    document.getElementById('viewer').insertBefore(v, document.getElementById('zone'));
+    const b = document.createElement('div');
+    b.setAttribute('role', 'button');
+    b.style.cssText = 'position:absolute;top:20px;right:20px;width:44px;height:44px';
+    b.innerHTML = '<svg aria-label="Audio is playing" width="44" height="44"></svg>';
+    b.addEventListener('click', () => { v.muted = !v.muted; });
+    document.getElementById('viewer').appendChild(b);
+  });
+  await tapAt(page, 390, 40);
+  assert.equal(await page.evaluate(() => document.getElementById('sv').muted), true);
+  await drag(page, [200, 600], [205, 250], { steps: 4 });
+  await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v && v.getAttribute('src'); });
+  assert.equal(await page.evaluate(() => document.querySelector('#sg-reel video').muted), true);
+});
+
+test('R9: a Reel that won\'t load closes with a message; an old link is renewed once', async () => {
+  // The link fails: the layer goes, the Story continues.
+  let page = await openStory([sharingItem('424242', REEL_STICKER)], { video: () => 403 });
+  await drag(page, [200, 600], [205, 250], { steps: 4 });
+  const [t] = await waitSent(page, 'toast');
+  assert.match(t.message, /Reel couldn.t be loaded/);
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), false);
+  assert.equal(await page.evaluate(() => window.__story.paused), false);
+  assert.equal((await fv(page)).r9Missing, 1);
+  assert.equal(page.hits['/api/v1/media/*'], 1, 'a fresh lookup is not repeated');
+  // An expired link from an earlier page: asked for afresh, and it plays.
+  page = await openStory([sharingItem('424242', REEL_STICKER)], { video: u => (/old/.test(u.pathname) ? 403 : 200) });
+  await page.evaluate(p => JSON.parse(JSON.stringify(p)), { items: [media('REELCODE1', user('creator'), {
+    product_type: 'clips', video_versions: [{ url: 'https://scontent.cdninstagram.com/v/t50/reel-old.mp4', width: 720, height: 1280 }] })] });
+  await drag(page, [200, 600], [205, 250], { steps: 4 });
+  await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v && /reel-720/.test(v.getAttribute('src') || ''); });
+  assert.equal(page.hits['/api/v1/media/*'], 1);
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), true);
+  assert.equal((await fv(page)).r9Missing, 0);
+  assert.deepEqual(await sent(page, 'toast'), []);
 });
 
 /* ---------------- B19: Story swipes ---------------- */

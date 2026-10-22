@@ -1165,7 +1165,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         .append(" · didn't open: ").append(fv.optInt("r8Failed")).append('\n')
                         .append("  Reels in Stories (swipe up): ").append(fv.optInt("r9"))
                         .append(" · not found: ").append(fv.optInt("r9Missing"))
-                        .append(" · Story moved on: ").append(fv.optInt("r9Moved")).append('\n')
+                        .append(" · Story moved on: ").append(fv.optInt("r9Moved"))
+                        .append(" · from the card: ").append(fv.optInt("r9Pressed")).append('\n')
                         .append("  Back to the post or Story: ").append(fv.optInt("exits")).append('\n');
             }
         }

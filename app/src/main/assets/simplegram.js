@@ -1422,7 +1422,7 @@
    * when its own full screen ends.
    * ------------------------------------------------------------------ */
   const FV_SWIPE = 60;                 // px of mostly vertical travel
-  const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0 };
+  const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0, r9Pressed: 0 };
   let gesture = null;                  // the current one-finger touch
   let storyPress = null;               // a touch Instagram's Story saw start
   let r8El = null, r8On = false;
@@ -1455,6 +1455,29 @@
     }
     return true;
   }
+  // The touch is on the video's own media box (the video or Instagram's tap
+  // layer beside it), not on a sheet, dialog or other list drawn over it.
+  // The box is the video's ancestors no taller than the video (give or take
+  // its margins) or the screen (a letterboxed Reel), so how deep Instagram
+  // nests it doesn't matter; a sheet drawn elsewhere in the page is outside.
+  function ownTouch(v, target) {
+    if (!target || !target.closest) return false;
+    const dlg = target.closest('[role="dialog"],[aria-modal="true"]');
+    if (dlg && !dlg.contains(v)) return false;
+    const vh = v.getBoundingClientRect().height;
+    const tallest = Math.max(vh + Math.max(96, vh * 0.3), innerHeight + 2);
+    let box = null;
+    for (let el = v.parentElement, i = 0; el && el !== document.body && i < 12; el = el.parentElement, i++) {
+      if (el.getBoundingClientRect().height > tallest) break;
+      if (el.contains(target)) { box = el; break; }
+    }
+    if (!box) return false;
+    // A list inside the box that is scrolled scrolls back first.
+    for (let el = target; el && el !== box; el = el.parentElement) {
+      if (el.scrollTop > 2 && /auto|scroll/.test(getComputedStyle(el).overflowY)) return false;
+    }
+    return true;
+  }
   function togglePlay(v) {
     if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } else v.pause();
   }
@@ -1471,7 +1494,7 @@
     if (r8On && fs && fs === r8El) g.exit = true;
     else if ((r === 'post' || r === 'reel') && !fs && !searchOpen()) {
       const v = videoAt(g.x, g.y);
-      if (v && atTop(v)) { g.video = v; g.r8 = 'pending'; }
+      if (v && ownTouch(v, e.target) && atTop(v)) { g.video = v; g.r8 = 'pending'; }
     } else if (r === 'story' && !reelBox) {
       g.story = true;
       storyPress = { target: e.target, x: g.x, y: g.y };
@@ -1569,7 +1592,16 @@
   document.addEventListener('fullscreenchange', safe(() => {
     const el = document.fullscreenElement;
     if (r8El && el === r8El) {
-      if (!r8On) { r8On = true; fvStats.r8++; }
+      if (!r8On) {
+        r8On = true;
+        fvStats.r8++;
+        // A landscape video small in the post played muted; full screen is
+        // the sound rule's "opened video". Checked once the layout settles.
+        const v = r8El;
+        setTimeout(safe(() => {
+          if (document.fullscreenElement === v && v.muted && !userMuted && !v.paused && wantsSound(v)) unmute(v);
+        }), 150);
+      }
     } else if (r8On || r8El) {
       if (r8On) fvStats.exits++;
       r8On = false;
@@ -1611,6 +1643,8 @@
     box.appendChild(note);
     const rb = { box: box, video: v, note: note, inFull: !!fs, held: [],
       story: { target: g.target, x: g.x, y: g.y, path: location.pathname } };
+    const zone = pressUnderSticker(g);
+    if (zone) rb.story.target = zone;               // its touchend lets go on close
     // The layer's own touches: a swipe up or down returns, a tap pauses or plays.
     // Nothing reaches Instagram's page underneath.
     let start = null;
@@ -1636,26 +1670,64 @@
     reelBox = rb;
     fvStats.r9++;
     post('fullVideo', { on: true });
-    setTimeout(safe(holdStoryUnder), 300);
+    holdStoryUnder();
+    setTimeout(safe(holdStoryUnder), 300);           // a video Instagram started late
     loadStoryReel(reel, rb);
     return true;
   }
+  // Instagram's tappable stickers (a shared Reel's card among them) are a
+  // layer over the Story's press zone: pointer-events none, each sticker auto.
+  // A touch that starts on one never presses the Story, so a photo's timer
+  // would run on under the Reel. Press the zone under the finger instead;
+  // returns it (null when the touch did press the Story, or no zone is found).
+  function pressUnderSticker(g) {
+    let layer = null;
+    for (let el = g.target && g.target.parentElement, i = 0; el && el !== document.body && i < 16; el = el.parentElement, i++) {
+      if (getComputedStyle(el).pointerEvents === 'none') layer = el;
+      else if (layer) break;
+    }
+    if (!layer || typeof Touch !== 'function' || typeof TouchEvent !== 'function') return null;
+    for (const el of document.elementsFromPoint(g.x, g.y)) {
+      if (layer.contains(el) || el.contains(layer) || el.closest('#sg-reel')) continue;
+      try {
+        const t = new Touch({ identifier: 9001, target: el, clientX: g.x, clientY: g.y });
+        el.dispatchEvent(new TouchEvent('touchstart', { touches: [t], targetTouches: [t], changedTouches: [t], bubbles: true, cancelable: true, composed: true }));
+        fvStats.r9Pressed++;
+        return el;
+      } catch (e) { return null; }
+    }
+    return null;
+  }
   async function loadStoryReel(reel, rb) {
     let rec = index.byCode.get(reel.code) || (reel.pk && index.byPk.get(reel.pk)) || null;
-    if (!rec || !rec.video) {
+    let fetched = false;
+    const lookup = async () => {
       // Instagram's media info, as downloads use it (the Story data has only the code).
-      try { rec = await fetchInfo(reel.pk || pkFromCode(reel.code)); } catch (e) { rec = null; }
-    }
-    if (reelBox !== rb) return;
-    if (!rec || !rec.video) {
+      fetched = true;
+      try { return await fetchInfo(reel.pk || pkFromCode(reel.code)); } catch (e) { return null; }
+    };
+    const missing = () => {
       fvStats.r9Missing++;
       closeStoryReel('missing');
       post('toast', { message: 'This Reel couldn’t be loaded.' });
-      return;
-    }
+    };
+    if (!rec || !rec.video) rec = await lookup();
+    if (reelBox !== rb) return;
+    if (!rec || !rec.video) { missing(); return; }
     rb.video.addEventListener('playing', () => { rb.note.remove(); }, { once: true });
+    // An address that fails (an older page's signed link that expired): ask
+    // Instagram once for a fresh one, then say so. Closing empties the video,
+    // which can fire this too; by then the layer is gone.
+    rb.video.addEventListener('error', safe(async () => {
+      if (reelBox !== rb) return;
+      const again = fetched ? null : await lookup();
+      if (reelBox !== rb) return;
+      if (!again || !again.video || again.video === rb.video.getAttribute('src')) { missing(); return; }
+      rb.video.src = again.video;
+      rb.video.play().catch(() => {});
+    }));
     rb.video.src = rec.video;
-    rb.video.muted = false;
+    rb.video.muted = userMuted;                      // your own mute choice wins here too
     const p = rb.video.play();
     // Sound needs the app's setting; muted beats not playing at all.
     if (p && p.catch) p.catch(() => { if (reelBox === rb) { rb.video.muted = true; rb.video.play().catch(() => {}); } });
