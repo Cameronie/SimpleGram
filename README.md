@@ -80,7 +80,7 @@ went and how long Stories took to load. **Copy details** copies the counts and d
 ## Limits
 
 - Tested against fixture data shaped like Instagram's (116 browser tests), checked against
-  the code of Instagram's current website, and on an Android 10 emulator (7 native tests).
+  the code of Instagram's current website, and on an Android 10 emulator (9 native tests).
   It is not tested against a signed-in Instagram account, so your phone is the real test.
 - Instagram's website, not the app: calls, music on Stories, and some posting features
   are as limited as they are on instagram.com in a phone browser.
@@ -113,7 +113,7 @@ node --test tests/*.test.cjs
 ```
 
 On-device tests for the native shell (pinch zoom, comments split view, menu,
-screenshot mode, Back, incoming links, end-of-Home card) run on a phone or emulator:
+screenshot mode, Back, incoming links, end-of-Home card, edge tab) run on a phone or emulator:
 
 ```sh
 ./gradlew connectedDebugAndroidTest

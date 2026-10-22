@@ -222,6 +222,74 @@ public class ShellTest {
         }
     }
 
+    @Test
+    public void endOfHomeCardShowsInstagramsLineOrAStall() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            String caughtUp = new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true)
+                    .put("subtitle", "You've seen all new posts from the past 3 days.").toString();
+            String stalled = new JSONObject().put("action", "feedEnd").put("on", true).put("stalled", true).toString();
+            s.onActivity(x -> {
+                try {
+                    java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+                    route.setAccessible(true);
+                    route.set(x, "home");
+                    call(x, "onMessage", new Class<?>[]{String.class, String.class}, "main", caughtUp);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(400);
+            idle();
+            String text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("You're all caught up") && text.contains("past 3 days") && text.contains("Favorites"));
+            s.onActivity(x -> {
+                try {
+                    call(x, "onMessage", new Class<?>[]{String.class, String.class}, "main", stalled);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("Home isn't loading more") && !text.contains("past 3 days"));
+        }
+    }
+
+    private static ViewGroup feedCard(MainActivity a) {
+        ViewGroup root = (ViewGroup) ((ViewGroup) a.findViewById(android.R.id.content)).getChildAt(0);
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View c = root.getChildAt(i);
+            if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE && textOf((ViewGroup) c).contains("Favorites")) {
+                return (ViewGroup) c;
+            }
+        }
+        throw new AssertionError("end-of-Home card not visible");
+    }
+
+    @Test
+    public void menuIsASlimTabOnTheScreenEdge() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            SystemClock.sleep(600);   // placement animates for 120 ms after layout
+            idle();
+            ViewGroup root = (ViewGroup) ((ViewGroup) act.get().findViewById(android.R.id.content)).getChildAt(0);
+            View tab = null;
+            for (int i = 0; i < root.getChildCount(); i++) {
+                CharSequence d = root.getChildAt(i).getContentDescription();
+                if (d != null && d.toString().equals("SimpleGram menu")) tab = root.getChildAt(i);
+            }
+            assertNotNull(tab);
+            float density = act.get().getResources().getDisplayMetrics().density;
+            assertTrue("slim: " + tab.getWidth(), tab.getWidth() <= Math.round(16 * density));
+            boolean onLeft = tab.getX() < 1;
+            boolean onRight = Math.abs(tab.getX() + tab.getWidth() - root.getWidth()) < 1;
+            assertTrue("flush with an edge: x=" + tab.getX(), onLeft || onRight);
+        }
+    }
+
     private static String textOf(ViewGroup g) {
         StringBuilder b = new StringBuilder();
         for (int i = 0; i < g.getChildCount(); i++) {
