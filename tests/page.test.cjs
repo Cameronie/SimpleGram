@@ -462,17 +462,20 @@ test('downloads: a Story nobody had loaded is fetched through that account\'s St
 
 /* ---------------- 1.1: Search tabs ---------------- */
 
-const SEARCH_API = {
-  '/web/search/topsearch/': {
-    users: [{ position: 0, user: { pk: '1', username: 'sanjosesharks', full_name: 'San Jose Sharks', is_verified: true, profile_pic_url: 'https://scontent.cdninstagram.com/p.jpg' } }],
-    hashtags: [{ position: 1, hashtag: { name: 'sharks', media_count: 1234 } }],
-    places: [{ position: 2, place: { location: { pk: '777', name: 'SAP Center' }, title: 'SAP Center', subtitle: 'San Jose, CA', slug: 'sap-center' } }],
-  },
-  '/api/v1/fbsearch/web/top_serp/': { media_grid: { sections: grid(['KEYW001', 'KEYW002']).sections, has_more: true, next_max_id: 'k2', rank_token: 'r' } },
+// Today's website: the old REST search endpoints answer 404 HTML; accounts,
+// tags, places and posts come from GraphQL (tests/search-mock.cjs).
+const searchMock = require('./search-mock.cjs');
+const SHARKS = {
+  users: [{ pk: '1', username: 'sanjosesharks', full_name: 'San Jose Sharks', is_verified: true, profile_pic_url: 'https://scontent.cdninstagram.com/p.jpg' }],
+  tags: [{ name: 'sharks', media_count: 1234 }],
+  keyword: ['KEYW001', 'KEYW002'], keywordMore: 'k2',
+  place: ['PLCT001'], placeRecent: [],
+};
+const SEARCH_API = Object.assign(searchMock.site(SHARKS).api, {
+  '/api/v1/fbsearch/places/': { items: [{ location: { pk: '777', name: 'SAP Center', address: '525 W Santa Clara St' }, title: 'SAP Center', subtitle: 'San Jose, CA' }], status: 'ok' },
   '/api/v1/tags/web_info/': { data: { name: 'sharks', media_count: 1234, top: grid(['TOPT001', 'TOPT002', 'TOPT003']), recent: grid(['RECT001']) } },
   '/api/v1/tags/sharks/sections/': (() => { let n = 0; return () => ({ body: grid(['MORE00' + (++n)]) }); })(),
-  '/api/v1/locations/web_info/': { native_location_data: { location_info: { name: 'SAP Center', location_address: '525 W Santa Clara St' }, ranked: grid(['PLCT001']), recent: { sections: [], more_available: false } } },
-};
+});
 
 test('search: the Search tab opens SimpleGram search with four tabs and account results', async () => {
   const page = await open('https://www.instagram.com/', NAVPAGE, { api: SEARCH_API });
@@ -482,10 +485,10 @@ test('search: the Search tab opens SimpleGram search with four tabs and account 
   await page.keyboard.type('sharks');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
   await shadowClick(page, 'Tags');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('1,234 posts'));
   assert.ok((await searchText(page)).includes('#sharks'));
-  assert.ok((await searchText(page)).includes('1,234 posts'));
   await shadowClick(page, 'Places');
-  assert.ok((await searchText(page)).includes('SAP Center'));
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('SAP Center'));
 });
 
 test('search: tags show Top and Most recent grids, with a limited "Show more"', async () => {
@@ -494,6 +497,7 @@ test('search: tags show Top and Most recent grids, with a limited "Show more"', 
   await page.keyboard.type('sharks');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
   await shadowClick(page, 'Tags');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('#sharks'));
   await shadowClick(page, '#sharks');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 3);
   await shadowClick(page, 'Most recent');
@@ -514,6 +518,7 @@ test('search: a place without recent posts says so instead of showing nothing', 
   await page.keyboard.type('sap');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('San Jose Sharks'));
   await shadowClick(page, 'Places');
+  await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('SAP Center'));
   await shadowClick(page, 'SAP Center');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.querySelectorAll('.cell').length === 1);
   await shadowClick(page, 'Most recent');
@@ -536,12 +541,14 @@ test('search: Posts & Reels shows a grid; opening one and coming back restores s
 });
 
 test('search: when Instagram returns nothing, offer Instagram\'s own page', async () => {
-  const api = Object.assign({}, SEARCH_API, { '/api/v1/fbsearch/web/top_serp/': () => ({ status: 500, body: {} }) });
+  const failing = searchMock.site(Object.assign({}, SHARKS, { answers: { PolarisKeywordSearchExplorePageRelayQuery: () => null } }));
+  const api = Object.assign({}, SEARCH_API, failing.api);
   const page = await open('https://www.instagram.com/', NAVPAGE, { api });
   await openSearchTab(page);
   await page.keyboard.type('sharks');
   await shadowClick(page, 'Posts & Reels');
   await page.waitForFunction(() => document.getElementById('sg-search').shadowRoot.textContent.includes('Open Instagram'));
+  assert.ok((await searchText(page)).includes('Try again'));
 });
 
 test('search: when the old endpoints fail, the website\'s current requests are used', async () => {
@@ -556,15 +563,15 @@ test('search: when the old endpoints fail, the website\'s current requests are u
     }
     if (name === 'PolarisSearchBoxRefetchableQuery') {
       return { body: { data: { xdt_api__v1__fbsearch__topsearch_connection: {
-        users: [], hashtags: [], places: [{ position: 0, place: { title: 'Oracle Park', subtitle: 'San Francisco', location: { pk: '42', name: 'Oracle Park' } } }] } } } };
+        users: [{ user: { pk: '9', username: 'giants', full_name: 'SF Giants' } }], hashtags: [],
+        places: [{ position: 0, place: { title: 'Oracle Park', subtitle: 'San Francisco', location: { pk: '42', name: 'Oracle Park' } } }] } } } };
     }
     return { body: { data: {} } };
   };
   const api = {
-    '/web/search/topsearch/': (u) => ({ body: u.searchParams.get('context') === 'blended'
-      ? { users: [{ user: { pk: '9', username: 'giants', full_name: 'SF Giants' } }], hashtags: [], places: [] } : { status: 'fail' } }),
+    '/web/search/topsearch/': () => ({ status: 404, body: searchMock.NOT_FOUND }),
     '/api/v1/fbsearch/places/': () => ({ status: 404, body: {} }),
-    '/api/v1/fbsearch/web/top_serp/': () => ({ status: 500, body: {} }),
+    '/api/v1/fbsearch/web/top_serp/': () => ({ status: 404, body: searchMock.NOT_FOUND }),
     '/api/graphql': graphql,
   };
   const page = await open('https://www.instagram.com/', NAVPAGE, { api });
@@ -614,17 +621,18 @@ test('search: typing on Posts & Reels, then switching to Accounts, loads account
 });
 
 test('search: a pause in typing asks Instagram once, not a chain of requests', async () => {
-  let calls = 0;
-  const api = Object.assign({}, SEARCH_API, { '/web/search/topsearch/': () => { calls++; return { body: SEARCH_API['/web/search/topsearch/'] }; } });
+  const counted = searchMock.site(SHARKS);
+  const api = Object.assign({}, SEARCH_API, counted.api);
+  const countCalls = () => counted.log.filter(r => r.name === 'PolarisSearchBoxRefetchableQuery').length;
   const page = await open('https://www.instagram.com/', NAVPAGE, { api });
   await openSearchTab(page);
   for (const ch of 'sha') { await page.keyboard.type(ch); await page.waitForTimeout(600); }
   await page.waitForTimeout(500);
-  assert.ok(calls <= 3, 'calls: ' + calls);
+  assert.ok(countCalls() <= 3, 'calls: ' + countCalls());
   // Coming back to an earlier query uses the answer already received.
   await page.keyboard.press('Backspace');
   await page.waitForTimeout(700);
-  assert.ok(calls <= 3, 'calls after backspace: ' + calls);
+  assert.ok(countCalls() <= 3, 'calls after backspace: ' + countCalls());
 });
 
 test('search: after opening a result, going Home later does not reopen search', async () => {
