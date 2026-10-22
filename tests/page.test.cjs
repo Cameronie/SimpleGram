@@ -20,9 +20,11 @@ useBrowser();
 test('feed: JSON.parse keeps friends and removes ads, suggestions and reposts', async () => {
   const page = await open('https://www.instagram.com/', BLANK);
   const out = await page.evaluate(p => JSON.parse(JSON.stringify(p)), mixedFeed());
-  assert.deepEqual(codes(out), ['FRIEND1', 'MINE001', 'NOINFO1', 'COLLAB1', 'FRIEND2', 'end_of_feed_demarcator']);
-  assert.equal(out.data.xdt_api__v1__feed__timeline__connection.page_info.has_next_page, true);
+  // Home ends at Instagram's "You're all caught up" marker: it goes, and paging stops.
+  assert.deepEqual(codes(out), ['FRIEND1', 'MINE001', 'NOINFO1', 'COLLAB1', 'FRIEND2']);
+  assert.equal(out.data.xdt_api__v1__feed__timeline__connection.page_info.has_next_page, false);
   const stats = await page.evaluate(() => window.__sg.stats.feed);
+  assert.equal(stats.eof, 1);
   assert.equal(stats.ad, 1);
   assert.equal(stats.notFollowed, 1);
   assert.equal(stats.suggested, 2);
@@ -35,7 +37,7 @@ test('feed: preloaded data in the HTML is filtered before Instagram reads it', a
     <script>window.__boot = JSON.parse(document.getElementById('boot').textContent);</script></body></html>`;
   const page = await open('https://www.instagram.com/', html);
   const out = await page.evaluate(() => window.__boot.require[0][3][0].__bbox.result);
-  assert.deepEqual(codes(out), ['FRIEND1', 'MINE001', 'NOINFO1', 'COLLAB1', 'FRIEND2', 'end_of_feed_demarcator']);
+  assert.deepEqual(codes(out), ['FRIEND1', 'MINE001', 'NOINFO1', 'COLLAB1', 'FRIEND2']);
 });
 
 test('feed: fetch().json(), XHR text and XHR json responses are all filtered', async () => {
@@ -52,7 +54,7 @@ test('feed: fetch().json(), XHR text and XHR json responses are all filtered', a
     });
     return [a, b, c];
   });
-  for (const r of results) assert.deepEqual(codes(r), ['FRIEND1', 'MINE001', 'NOINFO1', 'COLLAB1', 'FRIEND2', 'end_of_feed_demarcator']);
+  for (const r of results) assert.deepEqual(codes(r), ['FRIEND1', 'MINE001', 'NOINFO1', 'COLLAB1', 'FRIEND2']);
 });
 
 test('feed: REST feed_items shape is filtered the same way', async () => {
@@ -329,7 +331,7 @@ test('script: injecting twice is harmless', async () => {
   const page = await open('https://www.instagram.com/', BLANK);
   await page.evaluate(s => { (0, eval)(s); }, SCRIPT);
   const out = await page.evaluate(p => JSON.parse(JSON.stringify(p)), mixedFeed());
-  assert.equal(codes(out).length, 6);
+  assert.equal(codes(out).length, 5);
   assert.equal(await page.evaluate(() => window.__sg.stats.feed.pages), 1);
 });
 

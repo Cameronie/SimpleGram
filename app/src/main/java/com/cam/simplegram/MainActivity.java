@@ -92,6 +92,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private TextView menuButton;
     private TextView zoomChip;
     private View feedBar;
+    private TextView feedTitle;
+    private TextView feedSub;
     private boolean feedWanted;
     private boolean searchOpen;
     private View screenshotShield;
@@ -495,6 +497,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             case "feedEnd":
                 if (main) {
                     feedWanted = m.optBoolean("on");
+                    if (feedWanted) {
+                        String subtitle = m.optBoolean("caughtUp") && !m.isNull("subtitle") ? m.optString("subtitle", "").trim() : "";
+                        setFeedText(m.optBoolean("stalled"), subtitle.length() > 200 ? subtitle.substring(0, 200) : subtitle);
+                    }
                     updateFeedBar();
                 }
                 break;
@@ -606,19 +612,20 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bar.setClickable(true);
 
         TextView title = new TextView(this);
-        title.setText("You're all caught up on Home");
         title.setTextColor(dark ? Color.WHITE : Color.BLACK);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setGravity(Gravity.CENTER);
         bar.addView(title);
         TextView sub = new TextView(this);
-        sub.setText("Keep going, newest first, without repeats:");
         sub.setTextColor(dark ? 0xFFA8A8A8 : 0xFF737373);
         sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         sub.setGravity(Gravity.CENTER);
         sub.setPadding(0, dp(2), 0, dp(10));
         bar.addView(sub);
+        feedTitle = title;
+        feedSub = sub;
+        setFeedText(false, "");
 
         android.widget.LinearLayout row = new android.widget.LinearLayout(this);
         row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
@@ -653,6 +660,21 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             }
         });
         return b;
+    }
+
+    /**
+     * At the end of Home, Instagram's own line ("You've seen all new posts from
+     * the past 3 days.") when it sent one; when nothing has loaded for a while, says so.
+     */
+    private void setFeedText(boolean stalled, String subtitle) {
+        String keepGoing = "Keep going, newest first, without repeats:";
+        if (stalled) {
+            feedTitle.setText("Home isn't loading more");
+            feedSub.setText(keepGoing);
+        } else {
+            feedTitle.setText("You're all caught up on Home");
+            feedSub.setText(subtitle.isEmpty() ? keepGoing : subtitle + "\n" + keepGoing);
+        }
     }
 
     private void showFeedBar(boolean on) {
