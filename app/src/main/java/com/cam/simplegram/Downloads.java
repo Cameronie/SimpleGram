@@ -57,18 +57,20 @@ final class Downloads {
         Uri uri = Uri.parse(url);
         if (!Links.isMediaFile(uri)) return false;
         String file = safeName(name, video);
-        DownloadManager.Request r = new DownloadManager.Request(uri)
-                .setTitle(file)
-                .setMimeType(video ? "video/mp4" : "image/jpeg")
-                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "SimpleGram/" + file);
-        if (userAgent != null) r.addRequestHeader("User-Agent", userAgent);
-        r.addRequestHeader("Referer", Links.HOME);
         DownloadManager dm = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);
+        if (dm == null) return false;
         try {
+            DownloadManager.Request r = new DownloadManager.Request(uri)
+                    .setTitle(file)
+                    .setMimeType(video ? "video/mp4" : "image/jpeg")
+                    .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "SimpleGram/" + file);
+            if (userAgent != null) r.addRequestHeader("User-Agent", userAgent);
+            r.addRequestHeader("Referer", Links.HOME);
             pending.add(dm.enqueue(r));
         } catch (RuntimeException e) {
-            // Android's Download Manager is disabled or restricted on this phone.
+            // Android's Download Manager is disabled or restricted on this phone; the
+            // destination call throws too when it is, so the whole request is guarded.
             return false;
         }
         return true;
