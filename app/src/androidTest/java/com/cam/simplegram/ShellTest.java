@@ -3,6 +3,7 @@ package com.cam.simplegram;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import android.content.Intent;
@@ -13,6 +14,7 @@ import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.WebChromeClient;
 import android.webkit.WebView;
 
 import androidx.test.core.app.ActivityScenario;
@@ -458,6 +460,80 @@ public class ShellTest {
             s.onActivity(a -> ref.get().showSplit(new RectF(0, 0, 412, 915), 2.625f, 900, false));
             idle();
             assertTrue(((View) ref.get().getChildAt(0)).getScaleX() < 0.5f);
+        }
+    }
+
+    private static WebChromeClient chromeOf(MainActivity a) throws Exception {
+        java.lang.reflect.Field f = MainActivity.class.getDeclaredField("web");
+        f.setAccessible(true);
+        return ((WebView) f.get(a)).getWebChromeClient();
+    }
+
+    private static View menuTab(MainActivity a) {
+        ViewGroup root = (ViewGroup) ((ViewGroup) a.findViewById(android.R.id.content)).getChildAt(0);
+        for (int i = 0; i < root.getChildCount(); i++) {
+            CharSequence d = root.getChildAt(i).getContentDescription();
+            if (d != null && d.toString().equals("SimpleGram menu")) return root.getChildAt(i);
+        }
+        throw new AssertionError("no menu tab");
+    }
+
+    /** Decision 7: a second full-screen request never cancels the one showing (a Story would close). */
+    @Test
+    public void nestedFullScreenNeverCancelsTheFirst() {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            boolean[] hidden = new boolean[2];
+            View[] views = new View[2];
+            s.onActivity(a -> {
+                try {
+                    WebChromeClient chrome = chromeOf(a);
+                    views[0] = new View(a);
+                    views[1] = new View(a);
+                    chrome.onShowCustomView(views[0], () -> hidden[0] = true);
+                    chrome.onShowCustomView(views[1], () -> hidden[1] = true);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertFalse(hidden[0]);
+            assertFalse(hidden[1]);
+            assertNull(views[0].getParent());
+            assertNotNull(views[1].getParent());
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertTrue(hidden[1]);
+            assertNull(views[1].getParent());
+        }
+    }
+
+    /** R9: Back closes the Reel shown over a Story; the Story's full screen stays. */
+    @Test
+    public void backClosesAStoryReelBeforeTheStory() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            boolean[] hidden = new boolean[1];
+            View story = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            String on = new JSONObject().put("action", "fullVideo").put("on", true).toString();
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onShowCustomView(story, () -> hidden[0] = true);
+                    call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", on);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertEquals(View.GONE, menuTab(act.get()).getVisibility());
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertFalse("the Story's full screen stays", hidden[0]);
+            assertNotNull(story.getParent());
+            assertEquals(View.VISIBLE, menuTab(act.get()).getVisibility());
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertTrue(hidden[0]);
         }
     }
 }
