@@ -910,6 +910,9 @@
     }
     stopPagination(v);
   }
+  // Only Instagram's own search pages (the "Open Instagram's own page"
+  // fallback), which load more by themselves as you scroll. SimpleGram's own
+  // grids have no cap: each of their pages needs a tap.
   const searchPages = new Map();
   let searchCounted = false;
   function limitSearch(v) {
@@ -2280,6 +2283,9 @@
   const searchStats = (stats.searchData = {
     gqlLog: gqlLog, deadRequests: dead.size, hashtags: { blended: null, topsearch: null },
     tagWebInfo: null, tagGrid: { webInfo: 0, keyword: 0 }, tagRecent: { asked: 0, failed: 0 },
+    // SimpleGram's grids: taps, pages read, second pages chained, failed
+    // pages, the place page size asked for, and the last pages' new-post counts.
+    grid: { taps: 0, pages: 0, chained: 0, failed: 0, chainFailed: 0, placeFirst: 24, sizes: [] },
   });
   SG.gqlLog = gqlLog;
   // `meta`, when given, receives the HTTP status.
@@ -2502,6 +2508,9 @@
         // Instagram read the request and refused it: never resend it elsewhere.
         const err = Array.isArray(data.errors) ? data.errors[0] : null;
         if (err && (err.code != null || err.api_error_code != null)) note.code = err.code != null ? err.code : err.api_error_code;
+        // "Please wait" inside an ordinary answer (as noteThrottle counts it).
+        if (err && (/rate limit|please wait/i.test(String(err.message || '') + ' ' + String(err.summary || '')) ||
+            (note.code === 1675004 && /rate/i.test(String(err.summary || ''))))) note.wait = true;
         note.message = String(err ? err.message || err.summary || err.description || 'error' : data.message || 'no ' + root).slice(0, 200);
         gqlNote(note);
         // Retry once only when the answer names a setting that wasn't sent.
@@ -2759,15 +2768,18 @@
   /* ------------------------------------------------------------------ *
    * Search with tabs, like the app: Accounts · Posts & Reels · Tags ·
    * Places. Tags and places offer Top / Most recent when Instagram's
-   * website still serves recent posts. Results stop after a few
-   * "Show more" taps: no endless scrolling.
+   * website still serves recent posts. Every further page needs a
+   * "Show more" tap: nothing loads by itself, so no endless scrolling.
    *
    * It is SimpleGram's own screen, drawn in an isolated layer above
    * Instagram's page; it only reads Instagram's own search data.
    * ------------------------------------------------------------------ */
   const SEARCH_STATE = 'sg_search_state';
   const RECENT_KEY = 'sg_recent_searches';
-  const MAX_MORE = 3;
+  // About 24 posts a tap: when a page brings fewer than CHAIN_BELOW new posts,
+  // the same tap asks for the next page right after it (never more than 2).
+  const CHAIN_BELOW = 18;
+  const PLACE_PAGE = 24;
   const TABS = [['accounts', 'Accounts'], ['posts', 'Posts & Reels'], ['tags', 'Tags'], ['places', 'Places']];
   const search = {
     host: null, root: null, open: false, suspended: false,
@@ -3001,7 +3013,9 @@
       return { media: collectMedia(part.sections || []), more: m };
     }
     // The old tag page, while it still answers with posts in this session.
+    let probed = false;
     if (!cursor && !dead.has('tags/web_info')) {
+      probed = true;
       const meta = {};
       const data = await igGet('/api/v1/tags/web_info/?tag_name=' + encodeURIComponent(name), meta);
       searchStats.tagWebInfo = meta.status || 0;
@@ -3022,7 +3036,10 @@
     }
     // What the website itself shows for a hashtag now.
     if (!cursor) searchStats.tagGrid.keyword++;
-    return loadKeyword('#' + name, cursor);
+    const r = await loadKeyword('#' + name, cursor);
+    // The probe was this tap's first request: no chained page after this one.
+    if (r && probed) r.spent = 2;
+    return r;
   }
   // A place's name and address, when the row it was opened from had none.
   function placeHeader(view) {
@@ -3040,22 +3057,39 @@
     }));
   }
   // The requests Instagram's own place page makes (Top is "ranked").
-  async function loadPlace(view, cursor) {
+  // `first` is the page size (Relay's count; the website sends 12). Ask for
+  // PLACE_PAGE; if Instagram refuses that request, ask again at the website's
+  // 12 in the same tap, and keep 12 only when that answers (the tap then
+  // chains a second page instead). A throttle or a stale id says nothing
+  // about the page size: no second request then.
+  let placeFirst = PLACE_PAGE;
+  function sizeMayBeRefused(name) {
+    const last = gqlLog[gqlLog.length - 1];
+    if (!last || last.query !== name || last.code == null || last.wait) return false;
+    return last.code !== 1675002 && !/PersistedQueryNotFound|missing_required_variable/i.test(last.message || '');
+  }
+  async function loadPlace(view, cursor, left) {
     const tab = view.sub === 'recent' ? 'recent' : 'ranked';
     const id = String(view.id);
     if (!cursor && (!view.name || !view.address) && !view.headerAsked) { view.headerAsked = true; placeHeader(view); }
-    const c = cursor
-      ? await igGraphQL('PolarisLocationPageTabContentQuery_connection',
-        { after: cursor.after, first: 12, location_id: id, page_size_override: null, tab: tab }, 'xdt_location_get_web_info_tab')
-      : await igGraphQL('PolarisLocationPageTabContentQuery',
-        { location_id: id, first: 12, after: null, tab: tab, page_size_override: null }, 'xdt_location_get_web_info_tab');
+    const name = cursor ? 'PolarisLocationPageTabContentQuery_connection' : 'PolarisLocationPageTabContentQuery';
+    const ask = first => (cursor
+      ? igGraphQL(name, { after: cursor.after, first: first, location_id: id, page_size_override: null, tab: tab }, 'xdt_location_get_web_info_tab')
+      : igGraphQL(name, { location_id: id, first: first, after: null, tab: tab, page_size_override: null }, 'xdt_location_get_web_info_tab'));
+    const first = placeFirst;
+    let c = await ask(first), spent = 1;
+    if (!c && first > 12 && (left == null || left >= 2) && sizeMayBeRefused(name)) {
+      spent = 2;
+      c = await ask(12);
+      if (c) searchStats.grid.placeFirst = placeFirst = 12;
+    }
     if (!c) return null;
     const media = collectMedia((c.edges || []).map(e => e && e.node));
     const next = nextCursor(c, cursor);
-    return { media: media, more: next ? { after: next } : null, noRecent: tab === 'recent' && !media.length && !cursor };
+    return { media: media, more: next ? { after: next } : null, noRecent: tab === 'recent' && !media.length && !cursor, spent: spent };
   }
-  async function loadTagOrPlace(view, cursor) {
-    return view.kind === 'tag' ? loadTag(view, cursor) : loadPlace(view, cursor);
+  async function loadTagOrPlace(view, cursor, left) {
+    return view.kind === 'tag' ? loadTag(view, cursor) : loadPlace(view, cursor, left);
   }
 
   /* Recent searches */
@@ -3165,7 +3199,7 @@
         results: search.results, posts: search.posts, grid: search.grid,
         scroll: search.body ? search.body.scrollTop : 0, suspended: search.suspended, at: Date.now(),
       }));
-    } catch (e) { /* storage full or unavailable */ }
+    } catch (e) { clearSaved(); }           // storage full (a very long grid): never restore an older copy
   }
   function clearSaved() { try { sessionStorage.removeItem(SEARCH_STATE); } catch (e) { /* ignore */ } }
 
@@ -3217,6 +3251,8 @@
   function renderBody() {
     const body = search.body;
     if (!body) return;
+    if (body.sgGrid && body.sgGrid.io) body.sgGrid.io.disconnect();
+    body.sgGrid = null;
     body.textContent = '';
     const q = search.query.trim();
     if (!q) {
@@ -3302,7 +3338,66 @@
     w.append(head, seg, body);
     renderGrid(body, search.grid, () => runGrid(true), null);
   }
+  // Thumbnails load as they come within a few screens of the list's view and
+  // are let go once they are further away, so a grid hundreds of posts long
+  // keeps only a screenful or two of pictures in memory. Cells keep their size.
+  function thumbWatcher(body) {
+    if (typeof IntersectionObserver !== 'function') return null;
+    try {
+      return new IntersectionObserver(safe(entries => {
+        for (const e of entries) {
+          const img = e.target.firstChild;
+          if (!img || img.tagName !== 'IMG') continue;
+          if (e.isIntersecting) { if (img.getAttribute('src') !== img.dataset.src) img.src = img.dataset.src; }
+          else if (img.hasAttribute('src')) img.removeAttribute('src');
+        }
+      }), { root: body, rootMargin: '1600px 0px' });
+    } catch (e) { return null; }
+  }
+  function addCells(g, list) {
+    for (let i = g.n; i < list.length; i++) {
+      const m = list[i];
+      const cell = el('button', 'cell');
+      const img = el('img');
+      img.alt = '';
+      img.decoding = 'async';
+      img.dataset.src = m.thumb;
+      if (g.io) g.io.observe(cell);
+      else { img.loading = 'lazy'; img.src = m.thumb; }
+      cell.appendChild(img);
+      if (m.reel || m.multi) cell.appendChild(el('span', 'badge', m.reel ? '▶︎' : '❐'));
+      cell.onclick = () => openPath(m.path);
+      g.grid.appendChild(cell);
+    }
+    g.n = list.length;
+  }
+  // Below the grid: a spinner while a page loads, Show more, or Try again
+  // after a page that failed (the posts already shown stay).
+  function gridFoot(foot, state, more) {
+    foot.textContent = '';
+    if (state.loading) foot.appendChild(el('div', 'spin'));
+    else if (state.more && state.failed) {
+      foot.appendChild(el('div', 'msg', 'Instagram didn’t send the next posts.'));
+      const b = el('button', 'more', 'Try again');
+      b.onclick = more;
+      foot.appendChild(b);
+    } else if (state.more) {
+      const b = el('button', 'more', 'Show more');
+      b.onclick = more;
+      foot.appendChild(b);
+    }
+  }
   function renderGrid(body, state, more, q) {
+    // The same list, longer: add only the new cells, so a long grid isn't
+    // rebuilt on every tap and keeps its scroll position.
+    const g = body.sgGrid;
+    if (g && state && g.state === state && !state.error && state.media.length >= g.n && g.unordered === !!state.unordered) {
+      addCells(g, state.media);
+      gridFoot(g.foot, state, more);
+      return;
+    }
+    if (g && g.io) g.io.disconnect();
+    body.sgGrid = null;
     body.textContent = '';
     if (!state || state.loading && !state.media.length) { body.appendChild(el('div', 'spin')); return; }
     if (state.error) return renderFailure(body, q);
@@ -3316,25 +3411,11 @@
       body.appendChild(el('div', 'msg', 'Instagram\u2019s recent list for hashtags isn\u2019t strictly newest first.'));
     }
     if (!state.media.length) { body.appendChild(el('div', 'msg', 'No posts found.')); return; }
-    const grid = el('div', 'grid');
-    for (const m of state.media) {
-      const cell = el('button', 'cell');
-      const img = el('img');
-      img.alt = '';
-      img.loading = 'lazy';
-      img.src = m.thumb;
-      cell.appendChild(img);
-      if (m.reel || m.multi) cell.appendChild(el('span', 'badge', m.reel ? '▶︎' : '❐'));
-      cell.onclick = () => openPath(m.path);
-      grid.appendChild(cell);
-    }
-    body.appendChild(grid);
-    if (state.loading) body.appendChild(el('div', 'spin'));
-    else if (state.more && state.pages < MAX_MORE + 1) {
-      const b = el('button', 'more', 'Show more');
-      b.onclick = more;
-      body.appendChild(b);
-    }
+    const ng = { state: state, unordered: !!state.unordered, grid: el('div', 'grid'), foot: el('div'), n: 0, io: thumbWatcher(body) };
+    addCells(ng, state.media);
+    body.append(ng.grid, ng.foot);
+    body.sgGrid = ng;
+    gridFoot(ng.foot, state, more);
   }
   function renderFailure(body, q) {
     body.appendChild(el('div', 'msg', 'Instagram didn’t return results here.'));
@@ -3356,9 +3437,12 @@
     b.onclick = () => openPath(fallback);
     body.appendChild(b);
   }
+  // Posts not in the grid yet, each once (pages can overlap, chained or not).
+  // Keyed by the post's code, whether it opens as a post or a Reel.
+  function postKey(m) { return m.path.replace(/^\/(?:p|reel)\//, ''); }
   function addNew(have, more) {
-    const seen = new Set(have.map(m => m.path));
-    return have.concat(more.filter(m => !seen.has(m.path) && seen.add(m.path)));
+    const seen = new Set(have.map(postKey));
+    return have.concat(more.filter(m => !seen.has(postKey(m)) && seen.add(postKey(m))));
   }
   function slim(list) {
     return list.map(m => ({
@@ -3391,25 +3475,57 @@
     if (keys.length > 60) delete search.results[keys[0]];
     if (!search.view && topKey() === key) renderBody();
   }
+  // One tap's worth of a grid (opening it, Show more or Try again): a page,
+  // and when it brought fewer than CHAIN_BELOW new posts and Instagram has
+  // more, the next page right after it. Never more than 2 requests a tap:
+  // `load(cursor, left)` is told how many it may send and reports `spent`
+  // when a page took more than one (a tag's old-page probe, a place's 12
+  // retry). Nothing loads without a tap. `alive()` is false once you have
+  // left this grid; closing search (Cancel, an Instagram tab) stops the chain.
+  // A failed page keeps every post already shown, and its cursor for Try again.
+  async function fillGrid(st, load, alive, draw) {
+    const gs = searchStats.grid;
+    gs.taps++;
+    st.failed = false;
+    let fresh = !st.pages;                                 // opening the grid: its first draw is a full one
+    let spent = 0;
+    for (let n = 0; n < 2; n++) {
+      if (n) gs.chained++;
+      const res = await load(st.pages ? st.more : null, 2 - spent);
+      if (!alive()) return;
+      if (!res) {
+        if (n) gs.chainFailed++; else gs.failed++;
+        if (!st.media.length) st.error = true; else st.failed = true;
+        break;
+      }
+      const had = st.media.length;
+      st.media = addNew(st.media, slim(res.media));
+      const added = st.media.length - had;
+      st.more = added ? res.more : null;                   // a page that adds nothing ends the list
+      st.pages++; st.noRecent = !!res.noRecent; st.unordered = !!res.unordered;
+      gs.pages++;
+      gs.sizes.push(added);
+      if (gs.sizes.length > 10) gs.sizes.shift();
+      spent += res.spent || 1;
+      if (!st.more || added >= CHAIN_BELOW || spent >= 2 || !search.open) break;
+      draw(fresh);                                         // show this page while the next one loads
+      fresh = false;
+    }
+    st.loading = false;
+    draw(fresh);
+  }
   async function runPosts(more) {
     const q = search.query.trim();
     if (!q) return;
     let st = search.posts;
     if (!more || !st || st.q !== q) st = search.posts = { q: q, media: [], more: null, pages: 0, loading: true };
     else { if (!st.more || st.loading) return; st.loading = true; }
-    renderBody();
+    // Later pages refill only the grid, so the list keeps its scroll position.
+    const shown = () => search.tab === 'posts' && !search.view && search.posts === st;
+    const draw = () => { if (!shown()) return; if (search.body && search.body.sgGrid) renderGrid(search.body, st, () => runPosts(true), q); else renderBody(); };
+    if (more) draw(); else renderBody();
     const seq = ++search.seqPosts;
-    const res = await loadPosts(q, more ? st.more : null);
-    if (seq !== search.seqPosts || search.posts !== st) return;
-    st.loading = false;
-    if (!res) { if (!st.media.length) st.error = true; else st.more = null; }   // a failed Show more ends the list
-    else {
-      const had = st.media.length;
-      st.media = addNew(st.media, slim(res.media));
-      st.more = st.media.length > had ? res.more : null;     // a page that adds nothing ends the list
-      st.pages++;
-    }
-    if (search.tab === 'posts' && !search.view) renderBody();
+    await fillGrid(st, cursor => loadPosts(q, cursor), () => seq === search.seqPosts && search.posts === st, draw);
   }
   async function runGrid(more) {
     const v = search.view;
@@ -3417,21 +3533,12 @@
     let st = search.grid;
     if (!more || !st) st = search.grid = { media: [], more: null, pages: 0, loading: true };
     else { if (!st.more || st.loading) return; st.loading = true; }
-    // Show more refills only the grid, so the list keeps its scroll position.
-    const draw = () => { if (more && search.body) renderGrid(search.body, st, () => runGrid(true), null); else render(); };
-    draw();
+    // The first page redraws the whole view (a tag's header learns its post
+    // count); later ones refill only the grid, so the list keeps its scroll.
+    const draw = full => { if (!full && search.body) renderGrid(search.body, st, () => runGrid(true), null); else render(); };
+    draw(!more);
     const seq = ++search.seqGrid;
-    const res = await loadTagOrPlace(v, more ? st.more : null);
-    if (seq !== search.seqGrid || search.grid !== st || search.view !== v) return;
-    st.loading = false;
-    if (!res) { if (!st.media.length) st.error = true; else st.more = null; }   // a failed Show more ends the list
-    else {
-      const had = st.media.length;
-      st.media = addNew(st.media, slim(res.media));
-      st.more = st.media.length > had ? res.more : null;     // a page that adds nothing ends the list
-      st.pages++; st.noRecent = !!res.noRecent; st.unordered = !!res.unordered;
-    }
-    draw();
+    await fillGrid(st, (cursor, left) => loadTagOrPlace(v, cursor, left), () => seq === search.seqGrid && search.grid === st && search.view === v, draw);
   }
 
   // Open a profile/post from search. Try Instagram's in-app navigation;
