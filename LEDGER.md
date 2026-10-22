@@ -9,6 +9,19 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 - Sound on automatically for a Reel opened from DMs.
 - Scrolling (feed, messages, profiles) after an app restart — see B2.
 
+## Confirmed working on the phone (1.2)
+
+- No suggested posts: none slipped through (Suggested removed 48, 0 unrecognised pages, 0 posts with a Follow button). Posts shown because a friend liked them are removed too.
+- Home ends at "You're all caught up" with the Following / Favorites card and Instagram's "You've seen all new posts from the past 3 days."
+- Copy details works.
+
+## Batch 4 — open (reported against 1.2)
+
+| # | Report | Likely cause (tentative, diagnosis in progress) | Planned fix |
+| --- | --- | --- | --- |
+| B16 | Scrolling Home: a friend's post I'd already seen came up, then Home jumped back to the top with only 1 post and the end card. | From Copy details: Home ended at Instagram's "caught up" marker. Then a page of posts already seen arrived, and SimpleGram took it for a refresh and reopened Home. Then a second "caught up" page came with 1 post, so Home ended again with just that one. The jump to the top looks like Instagram replacing its list (its own refresh, or its "older posts" list), not SimpleGram scrolling. | Depends on diagnosis: keep Home ended (and where you were) when Instagram loads after the end, and never let it swap the list for a 1-post one. |
+| B17 | Following from the end card was completely blank. | From Copy details: Following's first page had only 3 posts, all already seen in Home. SimpleGram skipped all 3, leaving an empty list, and Instagram doesn't load more for an empty list (1 nudge, no second page). | Never leave the list empty: show where Home left off (or a "you've seen these" marker) so Instagram keeps loading, and skip the rest as before. |
+
 ## Confirmed working on the phone (1.1)
 
 - Accounts search.
