@@ -5113,10 +5113,13 @@
       const at = drag ? drag.frac * d : video.currentTime || 0;
       const f = d ? Math.min(1, Math.max(0, at / d)) : 0;
       fill.style.transform = 'scaleX(' + f + ')';
-      knob.style.left = f * 100 + '%';
-      el.setAttribute('aria-valuemax', String(Math.round(d)));
-      el.setAttribute('aria-valuenow', String(Math.round(at)));
-      if (el.hasAttribute('data-active')) time.textContent = clockOf(at) + ' / ' + clockOf(d);
+      // Every frame while playing: only what changed, and the handle only while it shows.
+      const active = el.hasAttribute('data-active');
+      if (active) knob.style.left = f * 100 + '%';
+      const max = String(Math.round(d)), now = String(Math.round(at));
+      if (el.getAttribute('aria-valuemax') !== max) el.setAttribute('aria-valuemax', max);
+      if (el.getAttribute('aria-valuenow') !== now) el.setAttribute('aria-valuenow', now);
+      if (active) time.textContent = clockOf(at) + ' / ' + clockOf(d);
     }
     // Smooth while playing (one frame each), still otherwise.
     const loop = safe(() => {
@@ -5271,7 +5274,7 @@
   // The post view and Instagram's DM Reel viewer: one bar, on the video that
   // plays there (the biggest one on screen). Not on Home: one tap (R10) opens
   // a feed video full screen, bar and all.
-  let pageBar = null, pageBarQueued = false;
+  let pageBar = null, pageBarQueued = false, pageBarScrollAt = 0;
   function pageBarVideo() {
     const r = route();
     if (CFG.role !== 'main' || (r !== 'post' && r !== 'reel' && r !== 'direct')) return null;
@@ -5295,6 +5298,14 @@
     // The full-screen video was taken out of the page under it (Instagram drew
     // the feed again): there is nothing left to show, so full screen ends.
     if (fullLayer && fullVideoOn() && !fullLayer.video.isConnected && !fullScreenSettling()) leaveFullScreen('gone');
+    // Mid-swipe (a finger down, or the page or a carousel still moving) the bar
+    // stays on its video: swapping it then strands a snapping carousel halfway.
+    if (pageBar && pageBar.el.isConnected && pageBar.video.isConnected &&
+        (touching || Date.now() - pageBarScrollAt < 250)) {
+      pageBar.place();
+      if (!touching) setTimeout(queuePageBar, 300);
+      return;
+    }
     const v = pageBarVideo();
     if (pageBar && (pageBar.video !== v || !pageBar.el.isConnected)) { pageBar.detach(); pageBar = null; }
     if (!v) return;
@@ -5315,7 +5326,8 @@
   if (CFG.role === 'main') {
     ['loadedmetadata', 'durationchange', 'playing', 'emptied'].forEach(t =>
       document.addEventListener(t, e => { if (e.target instanceof HTMLVideoElement) queuePageBar(); }, true));
-    document.addEventListener('scroll', () => { if (pageBar) queuePageBar(); }, { capture: true, passive: true });
+    document.addEventListener('scroll', () => { if (pageBar) { pageBarScrollAt = Date.now(); queuePageBar(); } }, { capture: true, passive: true });
+    window.addEventListener('touchend', () => { if (pageBar) setTimeout(queuePageBar, 300); }, { capture: true, passive: true });
     window.addEventListener('resize', () => queuePageBar(), { passive: true });
     // Layout moves that fire no event (a caption opening, Instagram's own transitions).
     setInterval(() => { if (pageBar || fullLayer || /^(post|reel|direct)$/.test(route())) queuePageBar(); }, 1000);

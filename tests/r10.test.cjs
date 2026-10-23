@@ -751,14 +751,22 @@ test('R11: the bar in Instagram\'s DM Reel viewer (only there in DMs), and no wi
     <div id="mount"><div id="thread"><video id="small" src="/clip.webm" muted autoplay loop style="width:240px;height:300px"></video></div>
     <div id="viewer" role="dialog" style="position:fixed;inset:0;background:#000">
       <video id="v" src="/clip.webm" muted autoplay loop playsinline style="width:412px;height:915px;display:block"></video></div></div></body></html>`;
+  // Live blocking touchmove listeners on window/document. B24's swipe block is
+  // one, on purpose, while the DM Reel viewer is open; the bar must add none.
   const add = () => {
     const live = new Set();
-    const a = EventTarget.prototype.addEventListener;
+    const a = EventTarget.prototype.addEventListener, r = EventTarget.prototype.removeEventListener;
     window.__blocking = live;
+    const capture = o => !!(o === true || (o && typeof o === 'object' && o.capture));
     EventTarget.prototype.addEventListener = function (type, fn, opts) {
-      if ((this === window || this === document) && type === 'touchmove' && opts && typeof opts === 'object' && opts.passive === false) { live.add(type) }
+      if ((this === window || this === document) && type === 'touchmove' && opts && typeof opts === 'object' && opts.passive === false) live.add(fn);
       return a.apply(this, arguments);
     };
+    EventTarget.prototype.removeEventListener = function (type, fn, opts) {
+      if ((this === window || this === document) && type === 'touchmove') live.delete(fn);
+      return r.apply(this, arguments);
+    };
+    void capture;
   };
   const page = await openPage('https://www.instagram.com/direct/t/1/', html, { init: add });
   await page.waitForFunction(() => document.getElementById('v').readyState >= 1);
@@ -768,7 +776,7 @@ test('R11: the bar in Instagram\'s DM Reel viewer (only there in DMs), and no wi
   assert.equal(b.visible, true);
   assert.ok(Math.abs(b.track.bottom - 915) < 1, 'at the bottom of the viewer: ' + b.track.bottom);
   assert.equal(await page.evaluate(() => document.querySelectorAll('[data-sg-bar]').length), 1, 'none on the small video in the chat');
-  assert.deepEqual(await page.evaluate(() => Array.from(window.__blocking)), []);
+  assert.ok(await page.evaluate(() => window.__blocking.size <= (window.__sg.dmReelOpen && window.__sg.dmReelOpen() ? 1 : 0)), 'the bar adds no window-level blocking listener (only B24\'s swipe block while the viewer is open)');
   await tapAt(page, 206, 913, 150);
   assert.ok(Math.abs((await page.evaluate(() => window.__seeks))[0] - 22.5) < 0.3);
   // The viewer closed: the bar goes.

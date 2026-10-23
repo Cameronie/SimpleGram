@@ -679,6 +679,8 @@ for (const kind of ['carousel', 'pager']) {
       await page.evaluate(() => { document.getElementById('track').style.transform = 'translateX(-412px)'; document.getElementById('s2').dispatchEvent(new Event('playing')); });
     }
     await page.waitForTimeout(900);
+    // A snapping carousel may still be settling on a busy machine: wait for it.
+    await page.waitForFunction(() => Math.abs(document.getElementById('s2').getBoundingClientRect().left) < 1, null, { timeout: 4000 }).catch(() => {});
     const r = await page.evaluate(() => {
       const s2 = document.getElementById('s2');
       return { left: Math.round(s2.getBoundingClientRect().left), hidden: !!s2.closest('[data-sg-dm-hide]'), vis: getComputedStyle(s2).visibility, paused: s2.paused };
