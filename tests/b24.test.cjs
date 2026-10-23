@@ -631,6 +631,33 @@ test('B24 slip: a pager that swapped in a suggested Reel: it is hidden and pause
   assert.equal((await sent(page, 'toast')).length, 1, 'said once per opening');
 });
 
+test('B24 slip x R11: a suggested Reel left hidden (the return failed) gets no progress bar, even once it has loaded', async () => {
+  const page = await openPage(THREAD_URL, CHAT);
+  await openViewer(page, 'pager');
+  // The sent Reel plays and has its bar (R11, the DM Reel viewer).
+  await page.evaluate(() => { const v = document.getElementById('sent'); v.src = '/v/sent.webm'; v.play().catch(() => {}); });
+  await page.waitForFunction(() => document.querySelector('[data-sg-bar="dm"]'), null, { timeout: 3000 });
+  // Instagram's pager swaps in a suggested Reel that has its own clip and loads it.
+  await page.evaluate(() => {
+    const stage = document.getElementById('stage');
+    for (const s of stage.querySelectorAll('.slide')) s.style.display = 'none';
+    const n = document.createElement('div');
+    n.className = 'slide';
+    n.style.cssText = 'position:relative;width:412px;height:915px';
+    n.innerHTML = '<div style="position:absolute;left:12px;top:14px;color:#fff"><span>Suggested</span></div>' +
+      '<video class="sv" src="/v/sugg.webm" muted playsinline loop style="width:412px;height:915px;display:block"></video>';
+    stage.appendChild(n);
+  });
+  await waitSent(page, 'toast');
+  await page.waitForFunction(() => document.querySelector('.sv').readyState >= 1, null, { timeout: 3000 });
+  await page.waitForTimeout(1300);   // the bar's own once-a-second look
+  assert.equal(await page.evaluate(() => getComputedStyle(document.querySelector('.sv')).visibility), 'hidden');
+  assert.equal((await dm(page)).stuck, 1);
+  const bars = await page.evaluate(() => Array.from(document.querySelectorAll('[data-sg-bar]'))
+    .filter(b => getComputedStyle(b).visibility !== 'hidden' && b.getBoundingClientRect().width > 0).length);
+  assert.equal(bars, 0, 'no bar over the blank viewer for a Reel nobody can see');
+});
+
 test('B24 slip: the sent Reel drawn again (a new element for the same Reel) is not taken for a suggestion', async () => {
   const page = await openPage(THREAD_URL, CHAT);
   await openViewer(page, 'pager');
