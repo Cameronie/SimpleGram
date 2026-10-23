@@ -693,7 +693,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             case "skipStatus":
                 if (main) {
                     String kind = m.optString("kind", "");
-                    skipKind = m.optBoolean("on") && ("skipping".equals(kind) || "nothingNew".equals(kind) || "homeSkipping".equals(kind)) ? kind : "";
+                    skipKind = m.optBoolean("on") && ("skipping".equals(kind) || "nothingNew".equals(kind) || "homeSkipping".equals(kind)
+                            || "homeLoading".equals(kind)) ? kind : "";
                     skipCount = Math.max(0, Math.min(99999, m.optInt("n")));
                     updateFeedBar();
                 }
@@ -872,13 +873,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     private void updateSkipChip() {
         // Following or Favorites opened from the card; or Home itself while it goes on
-        // into Following and is still passing posts you saw (R7, homeSkipping).
-        boolean home = "homeSkipping".equals(skipKind);
+        // into Following and is still passing posts you saw (R7, homeSkipping) or
+        // waits at the bottom for the next posts from Following (B22, homeLoading).
+        boolean home = "homeSkipping".equals(skipKind) || "homeLoading".equals(skipKind);
         // Never on top of the end card (they share the bottom of the screen).
         boolean show = !skipKind.isEmpty() && "home".equals(route) && (home ? !onOtherFeed() && !feedWanted : onFollowingOrFavorites())
                 && !screenshotMode && !comments.isOpen() && !searchOpen && customView == null;
         if (show) {
             skipChip.setText("nothingNew".equals(skipKind) ? "Nothing new since Home"
+                    : "homeLoading".equals(skipKind) ? "Loading more from people you follow…"
                     : skipCount > 0 ? "Skipping " + skipCount + " posts you saw in Home…" : "Skipping posts you saw in Home…");
         }
         skipChip.setVisibility(show ? View.VISIBLE : View.GONE);
@@ -1425,7 +1428,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     .append("  Following from the card: seen skipped ").append(feed.optInt("alreadySeen"))
                     .append(" · skip ended ").append(feed.optInt("skipForgotten") + feed.optInt("skipLeft"))
                     .append(" · repeat stops ").append(feed.optInt("cursorEcho"))
-                    .append(" · slowed ").append(feed.optInt("skipThrottled")).append('\n')
+                    .append(" · slowed ").append(feed.optInt("skipThrottled"))
+                    .append(" · start from Home: ").append(feed.optString("carry", "none"))
+                    .append(feed.optInt("carried") > 0 ? " (" + feed.optInt("carried") + " posts)" : "").append('\n')
                     .append("  Feed switches reloaded: ").append(feed.optInt("switchLoads"))
                     .append(" · blank feeds reloaded: ").append(feed.optInt("recovered"))
                     .append(" (held ").append(feed.optInt("recoverHeld")).append(")\n")
@@ -1455,6 +1460,19 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         .append(", ended ").append(why.optInt("ended")).append(')');
             }
             b.append('\n');
+            // B22: how long you waited at the bottom while Home went on, and why (seconds).
+            JSONObject waits = cont.optJSONObject("waits");
+            JSONObject ww = waits == null ? null : waits.optJSONObject("why");
+            if (waits != null && ww != null) {
+                b.append("  Waits at the bottom: ").append(waits.optInt("n"))
+                        .append(" (longest ").append(seconds(waits.optInt("longest")))
+                        .append("; nothing ready ").append(seconds(ww.optInt("empty")))
+                        .append(", reading ").append(seconds(ww.optInt("read")))
+                        .append(", paced ").append(seconds(ww.optInt("pacing")))
+                        .append(", Instagram's page ").append(seconds(ww.optInt("ig")))
+                        .append(")\n  \"Loading more\" notes: ").append(waits.optInt("notes"))
+                        .append(" · stalled cards while going on: ").append(waits.optInt("cards")).append('\n');
+            }
         }
         JSONObject sd = stats.optJSONObject("searchData");
         JSONObject opens = stats.optJSONObject("searchOpens");
@@ -1544,6 +1562,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         dialog().setTitle("Filter status").setMessage(b.toString())
                 .setNeutralButton("Copy details", (d, w) -> copyDetails(stats, device))
                 .setPositiveButton("OK", null).show();
+    }
+
+    /** Milliseconds as "12.3 s". */
+    private static String seconds(int ms) {
+        return String.format(Locale.ROOT, "%.1f s", ms / 1000.0);
     }
 
     /** "back 900 ms (address 120), next 400 ms": timings only. */

@@ -53,10 +53,13 @@ for (const wait of [500, 4000]) {
     const s = await snap(pg);
     assert.deepEqual(d.slice(0, 3), ['NEW01', 'NEW02', 'F02'], 'Instagram\'s reload, as it sent it');
     assert.ok(!d.includes('EOF'), 'Instagram\'s own end-of-feed block is never drawn mid-feed: ' + d.slice(0, 8).join(' '));
-    assert.match(d[3] || '', /^F\d\d$/, 'Following follows Home\'s posts directly');
+    // (Two pages are read ahead since B22, so Following may be past F99 here.)
+    assert.match(d[3] || '', /^F\d+$/, 'Following follows Home\'s posts directly');
     assert.equal(s.feed.markerKept || 0, markerKept0);
     assert.equal(s.cont.stats.anchors, anchors0);
-    assert.equal(s.cont.stats.state, 'running');
+    // Still going, or (since B22 keeps two pages ready, a fast reader never runs dry) at the required 200-post stop.
+    assert.ok(s.cont.stats.state === 'running' || (s.cont.stats.state === 'limit' && s.cont.stats.reason === 'posts'),
+      JSON.stringify([s.cont.stats.state, s.cont.stats.reason, s.cont.stats.handed]));
     const tapAt = S.log.findIndex((e, i) => i > 0 && e.who === 'ig' && e.after == null);
     assert.deepEqual(S.log.slice(tapAt).filter(e => e.who === 'ig' && e.token), [], 'no recs_paging_token counting Following posts');
     await context.close();
@@ -332,13 +335,15 @@ test('final 6: deep in Following, a slow read with nothing being skipped never s
   await readToEnd(pg, 14, 350);
   let s = await snap(pg);
   assert.ok(s.cont.stats.skippedSeen > 0, 'the run passed posts seen in Home at its start');
-  const notes0 = s.skipStatus.filter(m => m.on).length;
+  // Only the "Skipping…" note counts: since B22 the quiet "Loading more…" note may show while the read is slow.
+  const skipping = st => st.skipStatus.filter(m => m.on && m.kind === 'homeSkipping').length;
+  const notes0 = skipping(s);
   const seen0 = s.cont.stats.skippedSeen;
   cfg.delay.following = 8000;   // the network gets slow
   await readToEnd(pg, 40, 300);
   s = await snap(pg);
   assert.equal(s.cont.stats.skippedSeen, seen0, 'no seen post was passed while waiting');
   assert.ok(s.cont.stats.handed > 104, 'Following went on');
-  assert.equal(s.skipStatus.filter(m => m.on).length - notes0, 0);
+  assert.equal(skipping(s) - notes0, 0);
   await context.close();
 });

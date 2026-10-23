@@ -276,6 +276,30 @@ test('skip: paging past seen posts uses its own budget (40 a minute), not Home\'
   assert.equal(f.skipCapped || 0, 0);
 });
 
+test('skip: paging past seen posts asks for the next page after 250 ms (B23; Home waits 600 ms)', async () => {
+  const pg = await fromEndCard(['HOME001', 'HOME002', 'HOME003', 'HOME004', 'HOME005']);
+  await pg.clock.install();
+  await parse(pg, page([friend('HOME005'), friend('HOME004'), friend('HOME003')]));
+  await parse(pg, page([friend('HOME002')], { cursor: 'p1' }));
+  await pg.clock.runFor(200);
+  assert.equal((await feedStats(pg)).nudges || 0, 0);
+  await pg.clock.runFor(100);
+  assert.equal((await feedStats(pg)).nudges, 1, 'at 250 ms');
+  assert.equal((await feedStats(pg)).skipNudges, 1);
+});
+
+test('skip: an HTTP 429 from Instagram stops the faster skip too', async () => {
+  const pg = await fromEndCard(['HOME001', 'HOME002', 'HOME003', 'HOME004']);
+  await pg.clock.install();
+  await parse(pg, page([friend('HOME001')]));
+  await pg.evaluate(() => { window.__sg.stats.diag.s429++; });
+  await parse(pg, page([friend('HOME002')]));
+  await pg.clock.runFor(20000);
+  const f = await feedStats(pg);
+  assert.equal(f.skipThrottled, 1);
+  assert.equal(f.skipNudges || 0, 0, JSON.stringify(f));
+});
+
 test('skip: Instagram\'s "please wait" stops the skip\'s nudges', async () => {
   const pg = await fromEndCard(['HOME001', 'HOME002', 'HOME003', 'HOME004']);
   await pg.clock.install();

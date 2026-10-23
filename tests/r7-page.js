@@ -30,7 +30,7 @@
 //   with params.id, metadata and providedVariables; PolarisFeedQueryConstants,
 //   PolarisFeedActionConstants, getAsyncParams (b25), getAsyncHeaders (b314), URI,
 //   LSD). P.missing lists modules to leave out; P.badAsync makes the request
-//   helpers throw. An unknown name throws, as Instagram's require does.
+//   helpers throw; P.trustedOnly pages on real scroll events only. An unknown name throws, as Instagram's require does.
 (function () {
   const P = window.__igP || {};
   const variant = new URLSearchParams(location.search).get('variant') || 'home';
@@ -183,7 +183,9 @@
     if (fromEnd <= (P.threshold || 1)) loadNext();
   }, 250);
   let measureQueued = false;
-  addEventListener('scroll', () => {
+  // P.trustedOnly: synthetic scroll events (SimpleGram's plain nudge) are ignored, as a list may do.
+  addEventListener('scroll', e => {
+    if (P.trustedOnly && !e.isTrusted) return;
     if (measureQueued) return;
     measureQueued = true;
     requestAnimationFrame(() => { measureQueued = false; onScroll(); });
