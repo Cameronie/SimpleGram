@@ -4333,22 +4333,22 @@
   // Only a shrunk viewport says the keyboard is up: a field keeps its focus
   // after Back hides the keyboard, and drags there still count.
   function keyboardLikely() {
-    noteViewport();
+    noteMaxView();
     const vv = window.visualViewport;
     return !!vv && maxViewH > 0 && vv.height < maxViewH * 0.75;
   }
   // The tallest the viewport has been at this width (a new width starts over).
-  function noteViewport() {
+  function noteMaxView() {
     const vv = window.visualViewport;
     if (!vv) return;
     if (innerWidth !== viewW) { viewW = innerWidth; maxViewH = 0; }
     if (vv.height > maxViewH) maxViewH = vv.height;
   }
   if (CFG.role === 'main' && window.visualViewport) {
-    window.visualViewport.addEventListener('resize', safe(noteViewport), { passive: true });
+    window.visualViewport.addEventListener('resize', safe(noteMaxView), { passive: true });
     // Its full height known before the first touch, read once the page has its
     // viewport (reading it at document start makes the page resize later).
-    document.addEventListener('DOMContentLoaded', safe(noteViewport), { once: true });
+    document.addEventListener('DOMContentLoaded', safe(noteMaxView), { once: true });
   }
   function scrollLocked() {
     const h = document.documentElement, b = document.body;
@@ -4383,7 +4383,7 @@
     const chain = touchChain(e);
     noteTouchActions(chain.ta);
     if (e.touches.length !== 1) { if (dseq) dseq.multi = true; return; }
-    noteViewport();
+    noteMaxView();
     const sc = chain.scroller || document.scrollingElement || document.documentElement;
     const t = e.touches[0];
     // The scroller's real range: [0, max], or [-max, 0] for a reversed one (also
