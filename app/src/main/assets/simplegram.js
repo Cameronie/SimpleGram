@@ -195,11 +195,23 @@
     return !!(o && (o.image_versions2 || o.video_versions || o.carousel_media) &&
       (o.pk || o.id || o.code));
   }
+  // A media's pk, exactly. Instagram's REST answers carry it as a bare JSON
+  // number (19 digits, past what a double holds: JSON.parse rounds it) next to
+  // its exact "pk_user" id string, so the string forms come first (as the
+  // website's own getPostId() reads id). A rounded number is never used.
   function mediaPk(o) {
-    const raw = o.pk != null ? o.pk : o.id;
-    if (raw == null) return null;
-    const s = String(raw).split('_')[0];
-    return /^\d+$/.test(s) ? s : null;
+    return exactId(o.pk, o.id, o.pk_id, o.strong_id__);
+  }
+  // The first exact form among `forms` (digit strings, maybe "_owner" after,
+  // before safe whole numbers), as a digit string; null when there is none.
+  function exactId(...forms) {
+    for (const f of forms) {
+      if (typeof f !== 'string') continue;
+      const s = f.split('_')[0];
+      if (/^\d+$/.test(s)) return s;
+    }
+    for (const f of forms) if (typeof f === 'number' && Number.isSafeInteger(f) && f >= 0) return String(f);
+    return null;
   }
   function itemOf(o) {
     const dims = videoDims(o);
@@ -223,6 +235,11 @@
     rec.code = typeof o.code === 'string' ? o.code : (typeof o.shortcode === 'string' ? o.shortcode : null);
     const user = o.user || o.owner;
     rec.username = user && typeof user.username === 'string' ? user.username : '';
+    // R12: what a Reel's page shows about it (videos only; kept with the record).
+    if (Array.isArray(o.video_versions) && o.video_versions.length) {
+      const old = rec.code ? index.byCode.get(rec.code) : null;
+      rec.about = mergeAbout(old && old.about, aboutOf(o));
+    }
     rec.children = [];
     if (Array.isArray(o.carousel_media)) {
       for (const child of o.carousel_media) {
@@ -258,6 +275,53 @@
     stats.indexed++;
   }
   SG.index = index;
+  // R12: the account, caption and counts of a video, as its media data has
+  // them. Whatever is missing stays null (shown as nothing, never as 0).
+  function aboutOf(o) {
+    const u = (o.user && typeof o.user === 'object' ? o.user : o.owner && typeof o.owner === 'object' ? o.owner : null) || {};
+    const num = v => typeof v === 'number' && isFinite(v) && v >= 0 ? Math.floor(v) : null;
+    const id = exactId(u.pk_id, u.id, u.pk) || '';
+    const fs = u.friendship_status && typeof u.friendship_status === 'object' ? u.friendship_status : null;
+    const me = viewerId();
+    const pic = typeof u.profile_pic_url === 'string' && /^https:\/\//.test(u.profile_pic_url) ? u.profile_pic_url : '';
+    const hidden = o.like_and_view_counts_disabled === true;
+    const shares = num(o.reshare_count) != null ? num(o.reshare_count) : num(o.share_count);
+    return {
+      user: {
+        id: /^\d+$/.test(id) ? id : '',
+        name: typeof u.username === 'string' && /^[A-Za-z0-9._]{1,30}$/.test(u.username) ? u.username : '',
+        pic: pic,
+        verified: u.is_verified === true ? true : u.is_verified === false ? false : null,
+        self: !!(me && id && id === me),
+        following: fs && typeof fs.following === 'boolean' ? fs.following : null,
+        requested: fs && typeof fs.outgoing_request === 'boolean' ? fs.outgoing_request : null,
+      },
+      caption: o.caption && typeof o.caption === 'object' && typeof o.caption.text === 'string' ? o.caption.text.slice(0, 2200) : '',
+      likes: hidden ? null : num(o.like_count),
+      comments: num(o.comment_count),
+      shares: shares,
+      liked: typeof o.has_liked === 'boolean' ? o.has_liked : null,
+      saved: typeof o.has_viewer_saved === 'boolean' ? o.has_viewer_saved : null,
+      // Saved into one of your collections (the website asks before an unsave,
+      // which takes it out of every collection too). null: not known.
+      inCollection: Array.isArray(o.saved_collection_ids) ? o.saved_collection_ids.length > 0
+        : typeof o.viewer_has_saved_to_collection === 'boolean' ? o.viewer_has_saved_to_collection : null,
+      // Only turned off for everyone. Comments limited for you (commenting_
+      // disabled_for_viewer) can still be read; Instagram's page hides the box.
+      commentsOff: o.comments_disabled === true,
+    };
+  }
+  // A later, thinner copy of the same video's data keeps what the earlier one knew.
+  function mergeAbout(old, cur) {
+    if (!old) return cur;
+    const pick = (a, b) => b == null || b === '' ? a : b;
+    const out = {};
+    for (const k in cur) out[k] = k === 'user' ? null : pick(old[k], cur[k]);
+    out.user = {};
+    for (const k in cur.user) out.user[k] = pick(old.user && old.user[k], cur.user[k]);
+    out.commentsOff = cur.commentsOff || false;
+    return out;
+  }
   // R9: a Story item that shares a Reel carries only the Reel's code (its
   // "Watch Reel" sticker, story_feed_media); the Reel's own video is looked
   // up when you swipe up. Story item pk -> { code, pk }.
@@ -1406,8 +1470,8 @@
     }
     if (looksLikeMedia(o)) indexMedia(o);
     else if (typeof o.username === 'string' && o.username && !o.image_versions2) {
-      const id = o.pk != null ? o.pk : (o.pk_id != null ? o.pk_id : o.id);
-      if (id != null && /^\d+$/.test(String(id))) { userIds.set(o.username.toLowerCase(), String(id)); cap(userIds, 5000); }
+      const id = exactId(o.pk_id, o.pk, o.id);
+      if (id) { userIds.set(o.username.toLowerCase(), id); cap(userIds, 5000); }
     }
   }
   function cleanse(root, via) {
@@ -1443,6 +1507,14 @@
   // The browser's own fetch, before Instagram's code can wrap it: R7's own
   // reads never go through Instagram's network layer.
   const nativeFetch = window.fetch;
+  // Instagram's GraphQL action block ("Try again later: we restrict certain
+  // activity"): its own client knows it by these codes alone
+  // (handlePolarisErrorSideEffect), whatever the message says.
+  const IG_BLOCK_CODES = [1404006, 1404078];
+  function isBlockCode(c) { return c != null && IG_BLOCK_CODES.indexOf(Number(c)) >= 0; }
+  // When Instagram last slowed requests down (a 429 or a "please wait"
+  // answer): R12's like, save and follow send nothing for a while after.
+  let slowAt = 0;
   // Diagnostics: Instagram's "please wait" throttling answers, which often
   // come with an ordinary status. Counted once stats.diag exists; never throws.
   function noteThrottle(o) {
@@ -1451,8 +1523,10 @@
       const m = typeof o.message === 'string' ? o.message : '';
       const errs = Array.isArray(o.errors) ? o.errors : null;
       if ((o.status === 'fail' && (/please wait|try again|rate limit/i.test(m) || o.spam === true || m === 'feedback_required')) ||
-          (errs && errs.some(e => e && (/rate limit|please wait/i.test(String(e.message || '')) || e.code === 1675004 && /rate/i.test(String(e.summary || '')))))) {
+          (errs && errs.some(e => e && (/rate limit|please wait/i.test(String(e.message || '')) || e.code === 1675004 && /rate/i.test(String(e.summary || '')) ||
+            isBlockCode(e.code))))) {
         stats.diag.pleaseWait++;
+        slowAt = Date.now();
       }
     } catch (e) { /* never throw into Instagram */ }
   }
@@ -5013,6 +5087,7 @@
       rb.video.play().catch(() => {});
     }));
     rb.video.src = rec.video;
+    safe(showReelInfo)(rb, rec);                     // R12: whose it is, what it says
     rb.video.muted = userMuted;                      // your own mute choice wins here too
     const p = rb.video.play();
     // Sound needs the app's setting; muted beats not playing at all.
@@ -5034,6 +5109,7 @@
     if (!rb) return;
     reelBox = null;
     if (rb.bar) rb.bar.detach();
+    if (rb.info) safe(rb.info.detach)();
     if (why !== 'missing') fvStats.exits++;
     try { rb.video.pause(); rb.video.removeAttribute('src'); rb.video.load(); } catch (e) { /* gone */ }
     rb.box.remove();
@@ -5047,6 +5123,466 @@
         for (const v of rb.held) if (v.isConnected && v.paused && !v.ended && route() === 'story') v.play().catch(() => {});
       }), 350);
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * R12: over R9's Story Reel, what the app's Reel page shows: the
+   * account's picture and name (a tap opens their profile) with Follow
+   * when you don't follow them, the caption (a "more" opens it), and on
+   * the right like, comment, share and save with their counts. All of it
+   * comes from the media data R9 already has for the video; nothing is
+   * asked for to show it, and a count that isn't there isn't shown.
+   * Like, save and follow send the website's own requests (Instagram's
+   * own code when it is loaded, else the same request built here), once
+   * per tap, never retried, and nothing while Instagram is slowing
+   * requests down. The overlay's touches are its own: they neither close
+   * nor pause the Reel and never reach the Story underneath (held still
+   * with holdStill, never touch-action; B25). R10's feed full screen
+   * stays clean: this is only on R9's layer.
+   * ------------------------------------------------------------------ */
+  const reelStats = (stats.reelInfo = { shown: 0, noInfo: 0, fields: {}, expanded: 0, profile: 0, profileVia: {},
+    comments: 0, commentsOff: 0, commentsOver: 0, shares: 0, slowed: 0, busy: 0, followingTaps: 0, via: { page: 0, own: 0 },
+    inCollection: 0, strayTaps: 0, blocked: 0,
+    like: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 }, unlike: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 },
+    save: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 }, unsave: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 },
+    follow: { sent: 0, ok: 0, requested: 0, refused: 0, friction: 0, unconfirmed: 0 } });
+  // Actions on their way, per Reel and per account (not per overlay: a Reel
+  // closed and opened again is the same Reel): 'pk:like', 'pk:save', 'follow:id'.
+  const reelPending = new Set();
+  // Instagram's own code can leave an action unanswered for good (its
+  // restriction dialog, drawn under the Reel): given up on after this long.
+  const ACTION_WAIT_MS = CFG.actionWaitMs > 0 ? +CFG.actionWaitMs : 15000;
+  const TIMED_OUT = {};
+  function inTime(p) {
+    return Promise.race([p, new Promise(res => setTimeout(res, ACTION_WAIT_MS, TIMED_OUT))]);
+  }
+  const SLOW_MS = 3 * 60 * 1000;
+  const SLOW_MSG = 'Instagram is slowing things down. Try again in a few minutes.';
+  function igSlowing() { return !!slowAt && Date.now() - slowAt < SLOW_MS; }
+  // The website's own requests for each action (PolarisAPILikePost and the
+  // rest call commitMutation with { input: { media_id } }; their answers'
+  // root fields are xig_media_like and so on).
+  const MEDIA_ACTIONS = {
+    like: { module: 'PolarisAPILikePost', fn: 'likePost', query: 'PolarisAPILikePostMutation', root: 'xig_media_like' },
+    unlike: { module: 'PolarisAPIUnlikePost', fn: 'unlikePost', query: 'PolarisAPIUnlikePostMutation', root: 'xig_media_unlike' },
+    save: { module: 'PolarisAPISavePost', fn: 'savePost', query: 'PolarisAPISavePostMutation', root: 'xig_media_save' },
+    unsave: { module: 'PolarisAPIUnsavePost', fn: 'unsavePost', query: 'PolarisAPIUnsavePostMutation', root: 'xig_media_unsave' },
+  };
+  // What a refusal says: 'slow' (Instagram slowing requests down), 'friction'
+  // (Instagram wants a follow confirmed on its own screen) or 'refused'.
+  function refusalOf(status, o, text) {
+    const msg = String(text || '') + ' ' + String(o && typeof o === 'object' ? o.message || '' : '');
+    if (o && typeof o === 'object' && o.message === 'growth_friction_dialog') return 'friction';
+    const blocked = !!(o && typeof o === 'object' && isBlockCode(o.code));
+    if (blocked) reelStats.blocked++;
+    if (status === 429 || blocked || /please wait|rate limit|try again later|feedback_required/i.test(msg) ||
+        (o && typeof o === 'object' && o.spam === true)) {
+      slowAt = Date.now();
+      return 'slow';
+    }
+    return 'refused';
+  }
+  // Instagram's own code rejects with its network error (the answer in
+  // responseObject, a GraphQL error in source) or with the GraphQL error itself.
+  function thrownRefusal(err) {
+    try {
+      const o = err && (err.responseObject || err.source || (typeof err.code === 'number' ? err : null));
+      if (err && err.source && typeof err.source === 'object' && isBlockCode(err.source.code) && o !== err.source) {
+        reelStats.blocked++;
+        slowAt = Date.now();
+        return 'slow';
+      }
+      return refusalOf(err && (err.statusCode || err.status), o, err && err.message);
+    } catch (e) { return 'refused'; }
+  }
+  // One POST of the website's mutation, built as its relay network builds it
+  // (feedRequest), to the path it uses. Never sent twice.
+  async function ownMutation(name, input, root) {
+    try {
+      const params = gqlParams(name);
+      const id = await docIdFor(name, params);
+      if (!id) return { ok: false, why: 'refused' };
+      const lsd = await pageToken('LSD', /"LSD",\[\],\{"token":"([^"]+)"/);
+      const dtsg = await pageToken('DTSGInitialData', /"DTSGInitialData",\[\],\{"token":"([^"]+)"/);
+      const r = feedRequest(name, id, { input: input }, params, lsd, dtsg, '/api/graphql');
+      const res = await nativeFetch.call(window, '/api/graphql', r.init);
+      let data = null;
+      try { data = parseIg(await res.text()); } catch (e) { data = null; }
+      const err = data && Array.isArray(data.errors) ? data.errors[0] : null;
+      if (res.ok && data && data.data && data.data[root] != null && !err) return { ok: true };
+      if (data) noteThrottle(data);
+      return { ok: false, why: refusalOf(res.status, err || data, err && (err.message || err.summary)) };
+    } catch (e) { return { ok: false, why: 'refused' }; }
+  }
+  async function mediaAction(kind, pk) {
+    const A = MEDIA_ACTIONS[kind];
+    reelStats[kind].sent++;
+    const m = runningModule(A.module);
+    if (m && typeof m[A.fn] === 'function') {
+      reelStats.via.page++;
+      try {
+        if ((await inTime(m[A.fn](pk))) === TIMED_OUT) { reelStats[kind].unconfirmed++; return { ok: false, why: igSlowing() ? 'slow' : 'unconfirmed' }; }
+        return { ok: true };
+      } catch (err) { return { ok: false, why: thrownRefusal(err) }; }
+    }
+    reelStats.via.own++;
+    return ownMutation(A.query, { media_id: pk }, A.root);
+  }
+  // The website's follow (PolarisSharedAPI.followUser): POST
+  // /api/v1/friendships/create/{id}/ with its container module (a Story's is
+  // reel_feed_timeline), the follow friction check on, and the user id.
+  // Answers 'following' or 'requested' (a private account).
+  async function followAction(id) {
+    reelStats.follow.sent++;
+    const m = runningModule('PolarisSharedAPI');
+    if (m && typeof m.followUser === 'function') {
+      reelStats.via.page++;
+      try {
+        const out = await inTime(m.followUser(id));
+        if (out === TIMED_OUT) { reelStats.follow.unconfirmed++; return { ok: false, why: igSlowing() ? 'slow' : 'unconfirmed' }; }
+        return { ok: true, result: out && out.result === 'requested' ? 'requested' : 'following' };
+      } catch (err) { return { ok: false, why: thrownRefusal(err) }; }
+    }
+    reelStats.via.own++;
+    try {
+      const headers = {
+        'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': csrf(), 'X-IG-App-ID': '936619743392459',
+        'X-Requested-With': 'XMLHttpRequest', 'X-IG-WWW-Claim': '0',
+      };
+      const bd = runningModule('BDHeaderConfig');
+      if (bd && typeof bd.ASBD_ID === 'string' && /^\d{1,12}$/.test(bd.ASBD_ID)) headers['X-ASBD-ID'] = bd.ASBD_ID;
+      const res = await nativeFetch.call(window, '/api/v1/friendships/create/' + id + '/', {
+        method: 'POST', credentials: 'include', headers: headers,
+        body: new URLSearchParams({ container_module: 'reel_feed_timeline', include_follow_friction_check: 'true', user_id: id }).toString(),
+      });
+      let data = null;
+      try { data = parseIg(await res.text()); } catch (e) { data = null; }
+      const fs = data && data.friendship_status;
+      if (res.ok && data && data.status !== 'fail' && fs && typeof fs === 'object') {
+        return { ok: true, result: fs.following === true ? 'following' : 'requested' };
+      }
+      if (data) noteThrottle(data);
+      return { ok: false, why: refusalOf(res.status, data, data && data.message) };
+    } catch (e) { return { ok: false, why: 'refused' }; }
+  }
+
+  function countText(n) {
+    if (n == null) return '';
+    if (n < 10000) return n.toLocaleString('en-US');
+    if (n < 1e6) return String(n < 1e5 ? Math.floor(n / 100) / 10 : Math.floor(n / 1000)) + 'K';
+    return String(n < 1e8 ? Math.floor(n / 1e5) / 10 : Math.floor(n / 1e6)) + 'M';
+  }
+  const R12_ICONS = {
+    heart: '<svg viewBox="0 0 24 24" class="i heart"><path d="M12 20.6s-7.4-4.5-9.4-9C1.2 8.3 3.2 4.5 6.8 4.5c2.1 0 3.9 1.2 5.2 3 1.3-1.8 3.1-3 5.2-3 3.6 0 5.6 3.8 4.2 7.1-2 4.5-9.4 9-9.4 9z"/></svg>',
+    comment: '<svg viewBox="0 0 24 24" class="i"><path d="M20.7 16.8A9.2 9.2 0 1 1 17.2 20.4L21.8 21.9Z"/></svg>',
+    share: '<svg viewBox="0 0 24 24" class="i"><path d="M21.5 2.5 10 13.2M21.5 2.5l-6.9 19-4.6-8.3-8-4.4z"/></svg>',
+    save: '<svg viewBox="0 0 24 24" class="i save"><path d="M19 21.2 12 15.4 5 21.2V2.8h14z"/></svg>',
+    badge: '<svg viewBox="0 0 24 24" class="badge"><circle cx="12" cy="12" r="10" fill="#3897f0"/><path d="m7.5 12.3 3 3 6-6.3" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  };
+  const R12_CSS = ':host{all:initial;position:absolute;left:0;right:0;bottom:calc(58px + env(safe-area-inset-bottom, 0px));' +
+      'z-index:2147483500;pointer-events:none;color:#fff;font:14px/1.3 system-ui,-apple-system,Roboto,sans-serif;' +
+      '-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;transition:opacity .12s}' +
+    '.shade{position:absolute;left:0;right:0;top:-72px;bottom:calc(-58px - env(safe-area-inset-bottom, 0px));' +
+      'background:linear-gradient(to top,rgba(0,0,0,.5),rgba(0,0,0,.18) 60%,rgba(0,0,0,0));pointer-events:none}' +
+    '.t{text-shadow:0 1px 3px rgba(0,0,0,.7)}' +
+    '.left{position:absolute;left:12px;right:76px;bottom:0}' +
+    '.who{display:flex;align-items:center;gap:8px;min-height:40px;max-width:100%}' +
+    '.acct{display:flex;align-items:center;gap:8px;min-width:0;pointer-events:auto;min-height:40px}' +
+    '.pic{width:32px;height:32px;border-radius:50%;object-fit:cover;flex:none;background:rgba(255,255,255,.25);' +
+      'box-shadow:0 0 0 1px rgba(255,255,255,.25),0 1px 3px rgba(0,0,0,.4)}' +
+    '.name{font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}' +
+    '.badge{width:14px;height:14px;flex:none}' +
+    '.follow{pointer-events:auto;flex:none;border:1px solid rgba(255,255,255,.9);border-radius:8px;padding:5px 11px;' +
+      'font-weight:600;font-size:13px;line-height:16px;text-shadow:0 1px 3px rgba(0,0,0,.7);background:rgba(0,0,0,.08)}' +
+    '.follow[data-state="following"],.follow[data-state="requested"]{border-color:rgba(255,255,255,.45);opacity:.85}' +
+    '.cap{pointer-events:auto;margin-top:4px;font-size:14px;line-height:18px;max-height:36px;overflow:hidden;' +
+      'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:pre-wrap;overflow-wrap:anywhere}' +
+    '.cap.open{display:block;-webkit-line-clamp:unset;max-height:40vh;overflow-y:hidden}' +
+    '.more{pointer-events:auto;display:inline-block;margin-top:2px;padding:4px 8px 4px 0;font-weight:600;font-size:13px;opacity:.85}' +
+    '.side{position:absolute;right:6px;bottom:0;width:64px;display:flex;flex-direction:column;align-items:center;gap:10px}' +
+    '.act{pointer-events:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;' +
+      'min-width:52px;min-height:48px;font-weight:600;font-size:12px;line-height:14px}' +
+    '.i{width:28px;height:28px;fill:none;stroke:#fff;stroke-width:1.9;stroke-linejoin:round;stroke-linecap:round;' +
+      'filter:drop-shadow(0 1px 2px rgba(0,0,0,.55))}' +
+    '.act[data-on] .heart{fill:#ff3040;stroke:#ff3040}' +
+    '.act[data-on] .save{fill:#fff}' +
+    '.n:empty{display:none}' +
+    // Faded while the bar is in use: a tap there is the video's (pause, play).
+    ':host([data-faded]) .acct,:host([data-faded]) .follow,:host([data-faded]) .cap,:host([data-faded]) .more,' +
+      ':host([data-faded]) .act{pointer-events:none}' +
+    '[hidden]{display:none!important}';
+
+  // Builds the overlay for R9's layer `rb` from the video's record.
+  function showReelInfo(rb, rec) {
+    if (CFG.role !== 'main' || reelBox !== rb || rb.info) return;
+    const a = rec.about || null;
+    const u = a && a.user;
+    const has = {
+      user: !!(u && u.name), pic: !!(u && u.pic), verified: !!(u && u.verified), followState: !!(u && u.following != null),
+      follow: !!(u && u.following === false && !u.self && u.id),
+      caption: !!(a && a.caption), likes: !!(a && a.likes != null), comments: !!(a && a.comments != null),
+      shares: !!(a && a.shares != null), liked: !!(a && a.liked != null), saved: !!(a && a.saved != null),
+    };
+    for (const k in has) if (has[k]) bump(reelStats.fields, k);
+    if (!a || (!has.user && !rec.code && !rec.pk)) { reelStats.noInfo++; return; }
+    const host = document.createElement('div');
+    host.id = 'sg-reelinfo';
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = '<style>' + R12_CSS + '</style><div class="shade"></div>' +
+      '<div class="left"><div class="who"><div class="acct" role="link"><img class="pic" alt=""><span class="name t"></span></div>' +
+      '<div class="follow" role="button"></div></div><div class="cap t"></div><div class="more t" role="button">more</div></div>' +
+      '<div class="side">' +
+      '<div class="act like" role="button" aria-label="Like">' + R12_ICONS.heart + '<span class="n t"></span></div>' +
+      '<div class="act comment" role="button" aria-label="Comment">' + R12_ICONS.comment + '<span class="n t"></span></div>' +
+      '<div class="act share" role="button" aria-label="Share">' + R12_ICONS.share + '<span class="n t"></span></div>' +
+      '<div class="act save" role="button" aria-label="Save">' + R12_ICONS.save + '<span class="n t"></span></div></div>';
+    const $ = sel => root.querySelector(sel);
+    const acct = $('.acct'), pic = $('.pic'), name = $('.name'), follow = $('.follow'), cap = $('.cap'), more = $('.more');
+    const like = $('.like'), comment = $('.comment'), share = $('.share'), save = $('.save');
+    const info = { host: host, about: a, rec: rec, showFollow: has.follow, open: false, gone: false, obs: null, touchOn: false };
+    // The account: picture, name, the blue tick; Follow only for someone you don't follow.
+    acct.hidden = !has.user;
+    name.textContent = has.user ? u.name : '';
+    if (has.verified) name.insertAdjacentHTML('afterend', R12_ICONS.badge);
+    if (has.pic) pic.src = u.pic;
+    else pic.hidden = true;
+    acct.setAttribute('aria-label', has.user ? u.name : '');
+    cap.textContent = a.caption || '';
+    cap.hidden = !has.caption;
+    more.hidden = true;
+    like.hidden = save.hidden = !rec.pk;
+    comment.hidden = share.hidden = !rec.code;
+    function paint() {
+      if (info.gone) return;
+      // Follow is offered to someone you don't follow, and stays (as Following)
+      // once tapped; a follow still on its way (opened again) keeps it too.
+      if (u && u.id && !u.self && (u.following === false || reelPending.has('follow:' + u.id))) info.showFollow = true;
+      follow.hidden = !info.showFollow;
+      const st = u && u.following === true ? 'following' : u && u.requested === true ? 'requested' : 'follow';
+      follow.dataset.state = st;
+      follow.textContent = st === 'following' ? 'Following' : st === 'requested' ? 'Requested' : 'Follow';
+      like.toggleAttribute('data-on', a.liked === true);
+      save.toggleAttribute('data-on', a.saved === true);
+      like.setAttribute('aria-label', a.liked === true ? 'Unlike' : 'Like');
+      save.setAttribute('aria-label', a.saved === true ? 'Remove from saved' : 'Save');
+      like.querySelector('.n').textContent = countText(a.likes);
+      comment.querySelector('.n').textContent = countText(a.comments);
+      share.querySelector('.n').textContent = countText(a.shares);
+    }
+    info.paint = paint;
+    paint();
+    // Its touches are its own: none reaches the Story under it, and a tap on
+    // it doesn't pause the Reel. A swipe up or down that starts on it still
+    // returns to the Story, as one on the video does (R9's way back), except
+    // on an opened caption, which a finger scrolls (the page is held still).
+    let drag = null, sw = null;
+    // Which gesture a click comes from: one that started on the overlay (set
+    // before its own listeners run), or one that began before it was there.
+    const touchedHere = safe(e => { info.touchOn = e.composedPath().indexOf(host) >= 0; });
+    rb.box.addEventListener('touchstart', touchedHere, { capture: true, passive: true });
+    host.addEventListener('touchstart', e => {
+      e.stopPropagation();
+      safe(() => {
+        const t = e.touches[0];
+        drag = info.open && t && e.touches.length === 1 && e.composedPath().indexOf(cap) >= 0 ? { y: t.clientY, top: cap.scrollTop } : null;
+        sw = t && e.touches.length === 1 ? { x: t.clientX, y: t.clientY } : null;
+      })();
+    }, { passive: true });
+    host.addEventListener('touchmove', safe(e => {
+      const t = e.touches[0];
+      if (drag && t && e.touches.length === 1) cap.scrollTop = drag.top - (t.clientY - drag.y);
+    }), { passive: true });
+    holdStill(host);
+    host.addEventListener('touchend', safe(e => {
+      e.stopPropagation();
+      const s0 = sw, scrolled = !!drag;
+      sw = drag = null;
+      if (!s0 || scrolled || e.touches.length || !e.changedTouches.length || info.gone || reelBox !== rb) return;
+      const dx = e.changedTouches[0].clientX - s0.x, dy = e.changedTouches[0].clientY - s0.y;
+      if (Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6) closeStoryReel('swipe');
+    }), { passive: true });
+    for (const type of ['touchcancel', 'pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'mouseup']) {
+      host.addEventListener(type, e => { e.stopPropagation(); if (type === 'touchcancel') sw = drag = null; }, { passive: true });
+    }
+    for (const type of ['click', 'dblclick', 'contextmenu']) {
+      host.addEventListener(type, e => { e.stopPropagation(); e.preventDefault(); });
+    }
+    // A touch's click acts only when that touch started on the overlay: a tap
+    // begun on the loading Reel that lifts just after the overlay came is the
+    // video's (it pauses or plays), never a follow or a like. Clicks with no
+    // touch (TalkBack) act.
+    const tap = (el, fn) => el.addEventListener('click', safe(e => {
+      const touch = e.sourceCapabilities ? e.sourceCapabilities.firesTouchEvents === true : e.pointerType === 'touch';
+      if (touch && !info.touchOn) {
+        reelStats.strayTaps++;
+        if (reelBox === rb && rb.video.getAttribute('src')) togglePlay(rb.video);
+        return;
+      }
+      fn();
+    }));
+    tap(acct, () => openReelProfile(info));
+    tap(follow, () => reelFollow(info));
+    tap(like, () => reelToggle(info, 'like'));
+    tap(save, () => reelToggle(info, 'save'));
+    tap(comment, () => reelComment(info));
+    tap(share, () => {
+      reelStats.shares++;
+      post('share', { url: 'https://www.instagram.com/reel/' + rec.code + '/' });
+    });
+    const expand = on => {
+      if (on === info.open) return;
+      info.open = on;
+      if (on) reelStats.expanded++;
+      cap.classList.toggle('open', on);
+      cap.scrollTop = 0;
+      more.textContent = on ? 'less' : 'more';
+    };
+    tap(more, () => expand(!info.open));
+    tap(cap, () => { if (!more.hidden) expand(!info.open); });
+    rb.box.appendChild(host);
+    // "more" only for a caption longer than its two lines.
+    if (has.caption && cap.scrollHeight > cap.clientHeight + 1) more.hidden = false;
+    // Out of the way while the bar is being used (its time shows in the middle).
+    // Faded, it takes no taps, and none until it is back (its 120 ms fade).
+    let unfade = 0;
+    if (rb.bar && typeof MutationObserver === 'function') {
+      info.obs = new MutationObserver(safe(() => {
+        const on = rb.bar.el.hasAttribute('data-active');
+        host.style.opacity = on ? '0' : '';
+        clearTimeout(unfade);
+        if (on) host.setAttribute('data-faded', '');
+        else unfade = setTimeout(() => { if (!rb.bar.el.hasAttribute('data-active')) host.removeAttribute('data-faded'); }, 130);
+      }));
+      info.obs.observe(rb.bar.el, { attributes: true, attributeFilter: ['data-active'] });
+    }
+    info.detach = () => {
+      info.gone = true;
+      clearTimeout(unfade);
+      if (info.obs) info.obs.disconnect();
+      rb.box.removeEventListener('touchstart', touchedHere, { capture: true });
+      host.remove();
+    };
+    rb.info = info;
+    reelStats.shown++;
+  }
+  // The overlay showing this Reel now, repainted when an action settles (it
+  // may be a new one: the Reel closed and opened again meanwhile).
+  function repaintReel(pk) {
+    const live = reelBox && reelBox.info;
+    if (live && !live.gone && live.rec && live.rec.pk === pk) live.paint();
+  }
+  // Like/unlike or save/unsave in place: shown at once, put back with a short
+  // message if Instagram says no. One request at a time for each Reel, none
+  // while Instagram is slowing requests down, never retried. A Reel saved
+  // into a collection isn't unsaved from here (that empties its collections
+  // too; the website asks first): a message says where.
+  async function reelToggle(info, what) {
+    const a = info.about, pk = info.rec.pk;
+    if (!pk || info.gone) return;
+    const job = pk + ':' + what;
+    if (reelPending.has(job)) { reelStats.busy++; return; }
+    if (igSlowing()) { reelStats.slowed++; post('toast', { message: SLOW_MSG }); return; }
+    if (what === 'save' && a.saved === true && a.inCollection === true) {
+      reelStats.inCollection++;
+      post('toast', { message: 'This Reel is in one of your collections. Remove it from saved on the Reel’s own page.' });
+      return;
+    }
+    const key = what === 'like' ? 'liked' : 'saved';
+    const was = a[key] === true, count = a.likes;
+    const kind = was ? (what === 'like' ? 'unlike' : 'unsave') : what;
+    a[key] = !was;
+    const shown = what === 'like' && count != null ? Math.max(0, count + (was ? -1 : 1)) : count;
+    if (what === 'like') a.likes = shown;
+    info.paint();
+    reelPending.add(job);
+    let r;
+    try { r = await mediaAction(kind, pk); } finally { reelPending.delete(job); }
+    if (r && r.ok) {
+      reelStats[kind].ok++;
+      if (kind === 'unsave') a.inCollection = false;          // as the website's store does
+      repaintReel(pk);
+      return;
+    }
+    if (!r || r.why !== 'unconfirmed') reelStats[kind].refused++;
+    // Put back, unless something else changed it since.
+    if (a[key] === !was) a[key] = was;
+    if (what === 'like' && a.likes === shown) a.likes = count;
+    repaintReel(pk);
+    post('toast', { message: r && r.why === 'slow' ? SLOW_MSG : r && r.why === 'unconfirmed'
+      ? 'Instagram didn’t answer. Check the Reel later.' : 'Instagram didn’t ' + kind + ' it. Nothing changed.' });
+  }
+  // Follow: one tap follows (Following, or Requested for a private account).
+  // There is no unfollow here: a tap on Following does nothing, so a
+  // stranger is never unfollowed by accident (their profile has Instagram's own).
+  async function reelFollow(info) {
+    const u = info.about.user;
+    if (!info.showFollow || !u.id || info.gone) return;
+    const job = 'follow:' + u.id;
+    if (reelPending.has(job)) { reelStats.busy++; return; }
+    if (u.following === true || u.requested === true) { reelStats.followingTaps++; return; }
+    if (igSlowing()) { reelStats.slowed++; post('toast', { message: SLOW_MSG }); return; }
+    const pk = info.rec.pk;
+    u.following = true;
+    info.paint();
+    reelPending.add(job);
+    let r;
+    try { r = await followAction(u.id); } finally { reelPending.delete(job); }
+    if (r && r.ok) {
+      reelStats.follow.ok++;
+      if (r.result === 'requested') { reelStats.follow.requested++; u.following = false; u.requested = true; }
+      repaintReel(pk);
+      return;
+    }
+    if (!r || r.why !== 'unconfirmed') reelStats.follow[r && r.why === 'friction' ? 'friction' : 'refused']++;
+    if (u.following === true && u.requested !== true) u.following = false;
+    repaintReel(pk);
+    post('toast', { message: r && r.why === 'slow' ? SLOW_MSG : r && r.why === 'friction'
+      ? 'Instagram wants this follow confirmed: open their profile to follow.'
+      : r && r.why === 'unconfirmed' ? 'Couldn’t confirm the follow: check their profile.' : 'Instagram didn’t follow them. Nothing changed.' });
+  }
+  // The comments panel for this Reel, over the Story's full screen (the app
+  // raises it over its full-screen view and says where its top is).
+  function reelComment(info) {
+    const code = info.rec.code;
+    if (!code || info.gone) return;
+    if (info.about.commentsOff) {
+      reelStats.commentsOff++;
+      post('toast', { message: 'Comments are turned off for this Reel.' });
+      return;
+    }
+    reelStats.comments++;
+    openComments(code, null);
+  }
+  // From the app: the comments panel is up over the Story (on) with its top
+  // `top` CSS px down, or gone (off). The Reel plays on above it, fitted into
+  // what shows, as in the app; the Story underneath stays paused.
+  function reelCommentsOver(on, top) {
+    const rb = reelBox;
+    if (!rb) return;
+    const was = !!rb.commentsUp;
+    rb.commentsUp = !!on;
+    if (on && !was) reelStats.commentsOver++;
+    const h = on && typeof top === 'number' && isFinite(top) && top > 0 ? Math.max(80, Math.min(innerHeight, Math.round(top))) : 0;
+    rb.video.style.height = h ? h + 'px' : '100%';
+    rb.box.style.alignItems = h ? 'flex-start' : 'center';
+    if (rb.info) rb.info.host.style.visibility = on ? 'hidden' : '';
+    if (rb.bar) rb.bar.el.style.visibility = on ? 'hidden' : '';
+  }
+  // Their profile: the layer closes first (the Story is let go), then
+  // Instagram's own router opens the profile when its state can be read,
+  // else a full load does. Back then returns to the Story's address.
+  function openReelProfile(info) {
+    const name = info.about.user && info.about.user.name;
+    if (!name || info.gone || !/^[A-Za-z0-9._]{1,30}$/.test(name)) return;
+    reelStats.profile++;
+    closeStoryReel('profile');
+    const path = '/' + name + '/';
+    setTimeout(safe(() => {
+      if (route() !== 'story') { bump(reelStats.profileVia, 'none'); return; }
+      if (igRouterStatus() && igPush(path)) { bump(reelStats.profileVia, 'router'); return; }
+      bump(reelStats.profileVia, 'load');
+      location.assign(location.origin + path);
+    }), 0);
   }
 
   /* ------------------------------------------------------------------ *
@@ -6064,6 +6600,11 @@
     PolarisLocationPageTabContentQuery_connection: '29002281179411948',
     PolarisExploreLocationsContainerQuery: '28572807415659320',
     PolarisAPITopsearchQuery: '29386906664232128',
+    // R12: the website's like, unlike, save and unsave (bundles fetched 2026-10-21).
+    PolarisAPILikePostMutation: '28051398997871885',
+    PolarisAPIUnlikePostMutation: '29100661379564082',
+    PolarisAPISavePostMutation: '27326721586982367',
+    PolarisAPIUnsavePostMutation: '27203919972607144',
   };
   // Settings ("provided variables") a query declares; Instagram refuses the
   // query when one is missing. Same date; false is always a valid value.
@@ -6333,7 +6874,9 @@
     const data = await igGet('/api/v1/media/' + pk + '/info/');
     const item = data && Array.isArray(data.items) ? data.items[0] : null;
     if (item && looksLikeMedia(item)) indexMedia(item);
-    return item ? (index.byPk.get(mediaPk(item)) || null) : null;
+    if (!item) return null;
+    const ipk = mediaPk(item);
+    return (ipk ? index.byPk.get(ipk) : typeof item.code === 'string' ? index.byCode.get(item.code) : null) || null;
   }
   async function userIdFor(username) {
     const key = username.toLowerCase();
@@ -7891,7 +8434,7 @@
         for (const e of list.getEntries()) {
           const st = e.responseStatus;
           if (!st || !/^https:\/\/[^/]*instagram\.com\/(?:api\/|graphql\/|ajax\/)/.test(e.name)) continue;
-          if (st === 429) diag.s429++;
+          if (st === 429) { diag.s429++; slowAt = Date.now(); }
           else if (st >= 500) diag.s5xx++;
         }
       })).observe({ type: 'resource' });
@@ -7956,7 +8499,8 @@
         });
         break;
       }
-      case 'splitClosed': closeSplit(); break;
+      case 'splitClosed': closeSplit(); reelCommentsOver(false); break;
+      case 'commentsOver': reelCommentsOver(!!cmd.on, Number(cmd.top)); break;
       case 'continueFeed':
         // The end card offers Following only (Favorites has its own way in).
         if (cmd.variant === 'following') continueFeed(cmd.variant);

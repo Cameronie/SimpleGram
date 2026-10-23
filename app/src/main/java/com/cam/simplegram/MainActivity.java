@@ -119,6 +119,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // The comments panel was up when a full screen started: it goes for the full
     // screen (it would be drawn over the video and take its touches) and comes back after.
     private boolean fullHidComments;
+    // R12: the comments panel is up for the Reel the page plays over a Story (R9),
+    // in the Story's full screen or not. Raised above the full-screen view (or the
+    // unsplit page) by its Z only: no view is moved in the tree, so no touch that
+    // is down loses its end (B25).
+    private boolean commentsOverFull;
+    private int commentsOverOpens;
     // R10 from the menu: the taps the app made on the page's video for it, and the ones it held back.
     private int videoTaps, videoTapsHeld;
     private Downloads downloads;
@@ -575,7 +581,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 menuButton.setVisibility(View.GONE);
                 zoomChip.setVisibility(View.GONE);
             }
-            if (comments.isOpen() && comments.getVisibility() == View.VISIBLE) {
+            // Comments over R9's Reel are raised above any full-screen view: they stay.
+            if (comments.isOpen() && comments.getVisibility() == View.VISIBLE && !commentsOverFull) {
                 fullHidComments = true;
                 comments.setVisibility(View.GONE);
             }
@@ -607,6 +614,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (customViewCallback != null) customViewCallback.onCustomViewHidden();
             customViewCallback = null;
             if (zoom.isHolding()) cancelHoldTo(web);
+            // R12: comments that were up over the Story's full screen go with it.
+            if (commentsOverFull) closeComments();
             if (split) {
                 cancelTo(web);                           // and after Chromium was told
                 startSwallow(false);
@@ -776,6 +785,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             case "comments":
                 if (main) openComments(m);
                 break;
+            case "share":
+                // R12: the share button over a Story's Reel offers the Reel's link.
+                if (main) shareText(Links.normalize(m.optString("url", "")));
+                break;
             case "commentsLayout":
                 if ("comments".equals(role)) commentsLayout = commentsShape(m);
                 break;
@@ -851,6 +864,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             updateStuckChip();       // the stuck chip stays off the Reel layer too
             setSystemBarsHidden(true);
         } else {
+            // R12: the Reel's comments go with the Reel.
+            if (commentsOverFull) closeComments();
             if (!screenshotMode && !fullHidTab) menuButton.setVisibility(View.VISIBLE);
             if (customView == null && !screenshotMode) setSystemBarsHidden(false);
             onZoomChanged(zoom.scale());
@@ -1055,6 +1070,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private void openComments(JSONObject m) {
         String url = Links.commentsUrl(m.optString("code"));
         if (url == null) return;
+        // R12: R9's Reel layer is up (in the Story's full screen or, for a Story
+        // that isn't full screen, over the page): the comments are the Reel's.
+        if (pageVideo) {
+            openCommentsOverFull(url, (float) m.optDouble("dpr", density));
+            return;
+        }
         JSONObject r = m.optJSONObject("rect");
         RectF css = null;
         if (r != null) {
@@ -1080,6 +1101,50 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         zoomChip.setVisibility(View.GONE);
     }
 
+    /**
+     * R12: comments for the Reel shown over a Story (R9's layer). The Story may
+     * be in Instagram's full screen (the app's full-screen view) or not (a Story
+     * reached by a full load can't ask for one): either way the page isn't
+     * split. The panel comes up over whatever is on top, raised by its Z (drawn
+     * and touched above it), and the page fits the Reel into the part above it.
+     * The Story stays paused under the Reel. Back closes the comments first, and
+     * they go when the Reel does. Nothing switches full screen and no view moves
+     * in the tree, so no touch is split.
+     */
+    private void openCommentsOverFull(String url, float dpr) {
+        if (screenshotMode) exitScreenshot();
+        if (comments.isOpen() && !commentsOverFull) {
+            // An ordinary split from before the Reel: the page goes back to full size.
+            zoom.hideSplit();
+            ViewGroup.LayoutParams lp = zoom.getLayoutParams();
+            lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+            zoom.setLayoutParams(lp);
+        }
+        splitCss = null;
+        splitDpr = dpr > 0 ? dpr : density;
+        fullHidComments = false;
+        commentsOverFull = true;
+        commentsOverOpens++;
+        comments.setTranslationZ(dp(16));
+        int height = root.getHeight();
+        int top = splitTop(height);
+        comments.open(url, height - top);
+        comments.setVisibility(View.VISIBLE);
+        zoomChip.setVisibility(View.GONE);
+        tellCommentsOver(top);
+    }
+
+    /** The page's Reel layer: where the panel's top is (CSS px), or that it has gone (top < 0). */
+    private void tellCommentsOver(int top) {
+        try {
+            JSONObject c = new JSONObject().put("type", "commentsOver").put("on", top >= 0);
+            if (top >= 0) c.put("top", top / splitDpr);
+            js(c);
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
     private int splitTop(int height) {
         boolean keyboard = fullHeight > 0 && height < fullHeight * 0.8f;
         return Math.round(height * (keyboard ? 0.30f : 0.42f));
@@ -1095,6 +1160,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(root.getWindowToken(), 0);
         comments.close();
+        if (commentsOverFull) {
+            commentsOverFull = false;
+            comments.setTranslationZ(0f);
+        }
         zoom.hideSplit();
         ViewGroup.LayoutParams lp = zoom.getLayoutParams();
         lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
@@ -1136,7 +1205,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
         ui.post(() -> {
             placeMenuButton();
-            if (comments.isOpen()) {
+            if (comments.isOpen() && commentsOverFull) {
+                int top = splitTop(height);
+                comments.setHeight(height - top);
+                tellCommentsOver(top);
+            } else if (comments.isOpen()) {
                 int top = splitTop(height);
                 zoom.showSplit(splitCss, splitDpr, top, false);
                 comments.setHeight(height - top);
@@ -1384,7 +1457,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private void shareLink() {
-        Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, currentLink());
+        shareText(currentLink());
+    }
+
+    private void shareText(String link) {
+        if (link == null) return;
+        Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, link);
         try {
             startActivity(Intent.createChooser(send, "Share link"));
         } catch (ActivityNotFoundException e) {
@@ -1579,6 +1657,20 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         .append(" (taps made ").append(videoTaps).append(", held ").append(videoTapsHeld).append(")\n")
                         .append("  Back to the post or Story: ").append(fv.optInt("exits")).append('\n');
             }
+            // R12: what was shown and done over a Story's Reel (counts only).
+            JSONObject ri = stats.optJSONObject("reelInfo");
+            if (ri != null) {
+                b.append("  Story Reel details shown: ").append(ri.optInt("shown"))
+                        .append(" · no details: ").append(ri.optInt("noInfo")).append('\n')
+                        .append("    likes ").append(actionCounts(ri, "like", "unlike"))
+                        .append(" · saves ").append(actionCounts(ri, "save", "unsave"))
+                        .append(" · follows ").append(actionCounts(ri, "follow", null)).append('\n')
+                        .append("    held back while Instagram slowed down: ").append(ri.optInt("slowed"))
+                        .append(" · comments opened: ").append(ri.optInt("comments"))
+                        .append(" (over the Story ").append(commentsOverOpens).append(")")
+                        .append(" · shares: ").append(ri.optInt("shares"))
+                        .append(" · profiles: ").append(ri.optInt("profile")).append('\n');
+            }
         }
         b.append("\nElsewhere\n")
                 .append("  Ads removed (Stories etc.): ").append(stats.optInt("ads")).append('\n')
@@ -1688,6 +1780,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         return b.length() == 0 ? "none yet" : b.toString();
     }
 
+    /** "sent/ok/refused" for an action and its undo (R12; counts only). */
+    private static String actionCounts(JSONObject ri, String a, String undo) {
+        JSONObject x = ri.optJSONObject(a), y = undo == null ? null : ri.optJSONObject(undo);
+        int sent = (x == null ? 0 : x.optInt("sent")) + (y == null ? 0 : y.optInt("sent"));
+        int ok = (x == null ? 0 : x.optInt("ok")) + (y == null ? 0 : y.optInt("ok"));
+        int no = (x == null ? 0 : x.optInt("refused") + x.optInt("friction")) + (y == null ? 0 : y.optInt("refused"));
+        return sent + " sent, " + ok + " ok, " + no + " refused";
+    }
+
     private JSONObject deviceDiagnostics() {
         JSONObject n = new JSONObject();
         try {
@@ -1701,6 +1802,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("fullScreenNested", fullScreenNested);
             n.put("videoTaps", videoTaps);
             n.put("videoTapsHeld", videoTapsHeld);
+            n.put("commentsOverFull", commentsOverOpens);
             n.put("continueHome", continueHome());
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
@@ -1909,6 +2011,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     public void onBackPressed() {
         if (screenshotMode) {
             exitScreenshot();
+        } else if ((commentsOverFull || pageVideo) && comments.isOpen()) {
+            // R12: the comments over a Story's Reel close first; the Reel stays.
+            if (!comments.goBack()) closeComments();
         } else if (pageVideo) {
             // Back to the Story under the Reel; its full screen stays.
             setPageVideo(false);
