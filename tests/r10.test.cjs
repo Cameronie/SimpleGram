@@ -390,6 +390,113 @@ test('R10: if Instagram takes the video out of the page while it is full screen,
   assert.equal(await page.evaluate(() => document.querySelectorAll('#sg-fullbar,[data-sg-bar]').length), 0);
 });
 
+// The browser's own full screen (no stub): Chromium resolves the request's
+// promise before it fires fullscreenchange, as the app's WebView does.
+async function openRealFullscreen(url = HOME, html = FEED) {
+  const page = await openPage(url, html);
+  await page.evaluate(() => {
+    window.__order = [];
+    document.addEventListener('fullscreenchange', () => window.__order.push('change'), true);
+    const ask = Element.prototype.requestFullscreen;
+    Element.prototype.requestFullscreen = function (o) {
+      window.__order.push('request');
+      const p = ask.call(this, o);
+      p.then(() => window.__order.push('resolved'), () => window.__order.push('rejected'));
+      return p;
+    };
+    // The app leaves full screen the Back way when the page asks.
+    const bridge = window.SGNative;
+    window.SGNative = { postMessage: m => {
+      bridge.postMessage(m);
+      if (JSON.parse(m).action === 'fullVideoExitRequest' && document.fullscreenElement) document.exitFullscreen();
+    } };
+  });
+  await page.waitForFunction(() => { const v = document.getElementById('v'); return v && !v.paused && v.readyState >= 2; });
+  return page;
+}
+
+test('R10 with the browser\'s real full screen (promise first, event after): the tap lands, the video is lifted, a swipe leaves', async () => {
+  for (const url of [HOME, POST_URL]) {
+    const page = await openRealFullscreen(url);
+    await page.evaluate(() => window.scrollTo(0, 40));
+    await tapAt(page, 200, 300);
+    await page.waitForFunction(() => window.__order.includes('change'), null, { timeout: 3000 });
+    await page.waitForTimeout(300);
+    const st = await page.evaluate(() => ({ order: window.__order, fs: document.fullscreenElement && document.fullscreenElement.tagName,
+      lifted: (document.querySelector('video:popover-open') || {}).id || null, full: !!document.querySelector('video[data-sg-full]'),
+      bar: !!document.querySelector('[data-sg-bar="full"]') }));
+    assert.deepEqual(st, { order: ['request', 'resolved', 'change'], fs: 'HTML', lifted: 'v', full: true, bar: true }, url);
+    assert.equal((await fv(page)).r10, 1, url);
+    // (Headless Chromium's real full screen never makes a touchmove cancelable,
+    // so whether the feed under it scrolls is checked with the stub above.)
+    await drag(page, [200, 700], [200, 250]);
+    await page.waitForFunction(() => !document.fullscreenElement, null, { timeout: 3000 });
+    await page.waitForTimeout(300);
+    assert.deepEqual((await sent(page, 'fullVideoExitRequest')).map(m => m.why), ['swipe'], url);
+    assert.equal(await page.evaluate(() => document.querySelectorAll('[data-sg-full],:popover-open').length), 0, url);
+    // And again: the next tap opens it once more (back where it was, once the
+    // fling headless Chromium let through, see above, has run out).
+    await page.waitForTimeout(2500);
+    await page.waitForFunction(() => new Promise(done => { const y = scrollY; setTimeout(() => done(scrollY === y), 400); }), null, { timeout: 5000 });
+    const mid = await page.evaluate(() => {
+      const v = document.getElementById('v');
+      v.scrollIntoView({ block: 'center' });
+      const r = v.getBoundingClientRect();
+      return [r.left + r.width / 2, r.top + r.height / 2];
+    });
+    await page.waitForTimeout(300);
+    await tapAt(page, mid[0], mid[1]);
+    await page.waitForFunction(() => document.querySelector('video:popover-open'), null, { timeout: 3000 });
+    assert.equal((await fv(page)).r10, 2, url);
+    await page.context().close();
+  }
+});
+
+test('R10 with the browser\'s real full screen: R8\'s swipe down in the post view lands too', async () => {
+  const page = await openRealFullscreen(POST_URL);
+  await drag(page, [200, 200], [200, 420]);
+  await page.waitForFunction(() => document.querySelector('video:popover-open'), null, { timeout: 3000 });
+  assert.equal((await fv(page)).r8, 1);
+  await page.context().close();
+});
+
+test('R10: a full screen SimpleGram asks for is announced to the app first (it hides its tab only for those)', async () => {
+  const page = await openFeed();
+  await page.evaluate(() => {
+    const ask = HTMLElement.prototype.requestFullscreen;
+    HTMLElement.prototype.requestFullscreen = function () {
+      window.__announced = window.__sent.filter(m => m.action === 'fullVideoStart').length;
+      return ask.apply(this, arguments);
+    };
+  });
+  await tapAt(page, 200, 300, 600);
+  assert.deepEqual([await page.evaluate(() => window.__announced), (await sent(page, 'fullVideoStart')).length], [1, 1]);
+  assert.deepEqual(Object.keys((await sent(page, 'fullVideoStart'))[0]), ['action']);
+});
+
+test('R10: with the comments panel open, a tap on the post\'s video or ⋮ → Full-screen video opens no full screen', async () => {
+  const html = page_(videoPost('v').replace('<section style="height:44px"></section>',
+    `<section style="height:44px"><button class="cmt" style="width:40px;height:40px"><svg aria-label="Comment" width="24" height="24"></svg></button>
+     <a href="/p/ABCDEFG/"><time>1h</time></a></section>`));
+  const page = await openFeed(HOME, html);
+  const b = await page.evaluate(() => { const r = document.querySelector('.cmt').getBoundingClientRect(); return [r.left + 20, r.top + 20]; });
+  await tapAt(page, b[0], b[1], 300);
+  const c = await sent(page, 'comments');
+  assert.equal(c.length, 1, 'the comments panel opened');
+  const r = c[0].rect;
+  await tapAt(page, r.x + r.w / 2, r.y + r.h / 2, 800);
+  assert.deepEqual(await page.evaluate(() => window.__fs), []);
+  assert.equal((await ig(page)).singles, 1, 'Instagram\'s own tap still ran (its sound toggle)');
+  await page.evaluate(() => { window.__sg.onNative({ type: 'menu' }); window.__sg.onNative({ type: 'fullVideoMenu' }); });
+  assert.deepEqual(await sent(page, 'fullVideoTap'), []);
+  assert.deepEqual((await sent(page, 'toast')).map(m => m.message), ['Close the comments first.']);
+  // Closed: the tap opens it again.
+  await page.evaluate(() => window.__sg.onNative({ type: 'splitClosed' }));
+  await page.waitForTimeout(400);
+  await tapAt(page, 200, 300, 700);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
+});
+
 /* ---------------- R10: the ⋮ menu ---------------- */
 
 test('R10: ⋮ → Full-screen video: the page names a spot on the video; the app\'s tap there opens it at once, kept from Instagram', async () => {
@@ -423,12 +530,55 @@ test('R10: ⋮ → Full-screen video: the page names a spot on the video; the ap
 
 test('R10: ⋮ → Full-screen video with no video on the screen says so and asks for no tap', async () => {
   const html = page_(`<article><header style="height:56px">friend</header><img id="photo" src="/p.jpg" style="width:412px;height:515px;display:block"></article>`);
-  for (const url of [HOME, 'https://www.instagram.com/stories/friend/424242/']) {
+  const STORY_URL = 'https://www.instagram.com/stories/friend/424242/';
+  // A Story or DM on the phone is in Instagram's own full screen (on <body>), with the ⋮ tab showing.
+  for (const [url, full] of [[HOME, false], [STORY_URL, false], [STORY_URL, true], ['https://www.instagram.com/direct/t/1/', true], [HOME, true]]) {
     const page = await openPage(url, html);
+    if (full) {
+      await page.evaluate(() => Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => document.body }));
+    }
     await page.evaluate(() => { window.__sg.onNative({ type: 'menu' }); window.__sg.onNative({ type: 'fullVideoMenu' }); });
     assert.deepEqual(await sent(page, 'fullVideoTap'), [], url);
-    assert.equal((await sent(page, 'toast')).length, 1, url);
+    assert.equal((await sent(page, 'toast')).length, 1, url + ' ' + full);
+    await page.context().close();
   }
+});
+
+test('R10: full screen from a tap or the menu has sound even after you muted a video once; your mute is back afterwards', async () => {
+  const muteOnce = async page => {
+    const b = await page.evaluate(() => { const r = document.querySelector('.sound').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; });
+    // Sound on and off again, or (where SimpleGram already turned it on) just off: your choice is mute.
+    for (let i = 0; i < 2 && !(i && await page.evaluate(() => document.getElementById('v').muted)); i++) await tapAt(page, b[0], b[1], 500);
+    assert.equal(await page.evaluate(() => document.getElementById('v').muted), true);
+    await page.waitForTimeout(600);
+    assert.equal(await page.evaluate(() => document.getElementById('v').muted), true, 'and it stays muted');
+  };
+  const state = page => page.evaluate(() => { const v = document.getElementById('v'); return { fs: !!window.__fsEl, muted: v.muted, paused: v.paused }; });
+  // The post view, where Instagram's single tap pauses.
+  let page = await openFeed(POST_URL);
+  await muteOnce(page);
+  await page.evaluate(() => { window.__ig.mode = 'pause'; });
+  await tapAt(page, 200, 300);
+  await page.waitForFunction(() => { const v = document.getElementById('v'); return window.__fsEl && !v.muted && !v.paused; }, null, { timeout: 3000 });
+  await appBack(page);
+  await page.waitForTimeout(600);
+  assert.deepEqual(await state(page), { fs: false, muted: true, paused: false });
+  await page.context().close();
+  // ⋮ → Full-screen video on Home (Instagram never sees that tap).
+  page = await openFeed();
+  await muteOnce(page);
+  await page.evaluate(() => { window.__sg.onNative({ type: 'menu' }); window.__sg.onNative({ type: 'fullVideoMenu' }); });
+  const ask = (await sent(page, 'fullVideoTap'))[0];
+  await tapAt(page, ask.x, ask.y);
+  await page.waitForFunction(() => { const v = document.getElementById('v'); return window.__fsEl && !v.muted && !v.paused; }, null, { timeout: 3000 });
+  await appBack(page);
+  await page.waitForTimeout(600);
+  assert.deepEqual(await state(page), { fs: false, muted: true, paused: false });
+  // Your mute still holds outside full screen: a later play doesn't turn the sound on.
+  await page.evaluate(() => { const v = document.getElementById('v'); v.pause(); return v.play(); });
+  await page.waitForTimeout(500);
+  assert.equal(await page.evaluate(() => document.getElementById('v').muted), true);
+  await page.context().close();
 });
 
 /* ---------------- R11: the progress bar ---------------- */
@@ -532,6 +682,44 @@ test('R11: the bar\'s touches start nothing else: no scroll, no full-screen swip
   // The video itself just above still takes R10's tap.
   await tapAt(page, 200, vb - 60, 600);
   assert.equal(await page.evaluate(() => window.__fs.length), 1);
+});
+
+test('R11: Instagram\'s sound and tag icons under the bar\'s strip keep their taps; the rest of the strip still seeks', async () => {
+  // Icons as Instagram lays them out: a button at the corner whose circle has a
+  // 12 px margin, so the button reaches the video's bottom edge, under the strip.
+  const icon = (side, label) => `<div style="position:absolute;${side === 'sound' ? 'right' : 'left'}:0;bottom:0">
+    <button class="${side}" aria-label="${label}" style="border:0;padding:0;background:none;display:block">
+    <div class="circle" style="margin:12px;padding:8px;border-radius:50%;background:#333"><svg aria-label="${side === 'sound' ? 'Audio is muted' : 'Tags'}" width="12" height="12"></svg></div></button></div>`;
+  const body = videoPost('v').replace(/<button class="sound"[\s\S]*?<\/button>\s*<button class="tags"[\s\S]*?<\/button>/,
+    icon('sound', 'Toggle audio') + icon('tags', 'Tags'));
+  const page = await openFeed(POST_URL, page_(body));
+  await longVideo(page);
+  await page.waitForFunction(() => document.querySelector('[data-sg-bar="post"]'));
+  await page.waitForTimeout(500);
+  await page.evaluate(() => { document.getElementById('v').currentTime = 20; window.__seeks = []; });
+  const s0 = await ig(page), muted0 = await page.evaluate(() => document.getElementById('v').muted);
+  const g = await page.evaluate(() => {
+    const c = s => { const r = document.querySelector(s + ' .circle').getBoundingClientRect(); return (r.left + r.right) / 2; };
+    return { sound: c('.sound'), tags: c('.tags'), vb: document.getElementById('v').getBoundingClientRect().bottom };
+  });
+  for (const dy of [10, 6, 2]) {
+    assert.equal(await page.evaluate(([x, y]) => !!document.elementFromPoint(x, y).dataset.sgBar, [g.sound, g.vb - dy]), true, 'the strip is on top there');
+    await tapAt(page, g.sound, g.vb - dy, 400);
+    await tapAt(page, g.tags, g.vb - dy, 400);
+  }
+  const s1 = await ig(page);
+  assert.deepEqual([s1.soundTaps - s0.soundTaps, s1.tagTaps - s0.tagTaps, s1.clicks, s1.likes], [3, 3, 0, 0]);
+  assert.deepEqual(await page.evaluate(() => window.__seeks), [], 'no jump to the end or the start');
+  assert.equal(await page.evaluate(() => document.getElementById('v').muted), !muted0, 'three taps on the sound icon toggled it three times');
+  assert.deepEqual(await page.evaluate(() => window.__fs), []);
+  // The strip's middle still seeks; a drag that starts on an icon does nothing.
+  await tapAt(page, 206, g.vb - 3, 200);
+  await drag(page, [g.sound, g.vb - 4], [g.sound - 200, g.vb - 4]);
+  const seeks = await page.evaluate(() => window.__seeks);
+  assert.equal(seeks.length, 1);
+  assert.ok(Math.abs(seeks[0] - 22.5) < 0.3, String(seeks));
+  assert.equal((await ig(page)).soundTaps, s1.soundTaps);
+  assert.equal(await page.evaluate(() => window.__sg.stats.seekBar.passed), 6);
 });
 
 test('R11: in full screen the bar is docked over the bottom of the video, above it, and its touches keep full screen', async () => {

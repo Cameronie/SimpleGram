@@ -4142,10 +4142,16 @@
     r8PendingAt = performance.now();
     v.dataset.sgFull = '1';
     syncFullHold();
+    // The app hides its ⋮ tab only for a full screen that is ours (Instagram's
+    // Story asks for one on Home before its route says "story").
+    post('fullVideoStart');
     let p;
     try { p = req.call(target, { navigationUI: 'hide' }); } catch (err) { fail(); return false; }
     if (p && typeof p.then === 'function') {
-      p.then(() => { if (r8El === v && document.fullscreenElement === target) r8Pending = false; },
+      // Chromium resolves the promise before it fires fullscreenchange: in page
+      // mode the event (not the promise) says the request landed, so the
+      // request stays pending until then (the 3 s limit covers an event that never comes).
+      p.then(() => { if (r8El === v && document.fullscreenElement === target && (!page || r8On)) r8Pending = false; },
         () => { if (document.fullscreenElement !== target) fail(); });
     }
     return true;
@@ -4158,7 +4164,8 @@
   document.addEventListener('fullscreenchange', safe(() => {
     const el = document.fullscreenElement;
     let via = 'other';
-    const landed = r8El && el && (r8Mode === 'page' ? el === document.documentElement && (r8Pending || r8On) : el === r8El);
+    const landed = r8El && el && (r8Mode === 'page' ?
+      el === document.documentElement && (r8Pending || r8On || !!r8El.dataset.sgFull) : el === r8El);
     if (landed) {
       via = 'r8';
       r8Pending = false;
@@ -4177,7 +4184,7 @@
         setTimeout(safe(() => {
           if (!fullVideoOn() || r8El !== v) return;
           if (kind !== 'r8' && v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
-          else if (v.muted && !userMuted && !v.paused && wantsSound(v)) unmute(v);
+          else if (v.muted && !soundBlocked(v) && !v.paused && wantsSound(v)) unmute(v);
         }), 150);
       }
     } else if (el && el.tagName === 'VIDEO' && !el.dataset.sgOwn && !r8Pending && CFG.role === 'main' &&
@@ -4264,7 +4271,7 @@
   // The feed or post video a tap at (x, y) on `target` is for, or null.
   function r10Video(target, x, y) {
     const r = route();
-    if (CFG.role !== 'main' || !r10Route(r) || document.fullscreenElement || reelBox || searchOpen()) return null;
+    if (CFG.role !== 'main' || !r10Route(r) || document.fullscreenElement || reelBox || split || searchOpen()) return null;
     if (!(target instanceof Element) || onSeekBar(target) || isField(target)) return null;
     const v = videoAt(x, y);
     if (!v || v.dataset.sgOwn || isOldMedia(v) || !ownTouch(v, target) || videoControl(target, v)) return null;
@@ -4332,7 +4339,7 @@
     const v = w.v;
     // B25: never while a finger is down (the switch would split its touch) or a switch settles.
     if (!v.isConnected || document.fullscreenElement || downIds.size || fullScreenSettling() || !r10Route(route()) ||
-      reelBox || searchOpen()) { fvStats.r10Skipped++; return; }
+      reelBox || split || searchOpen()) { fvStats.r10Skipped++; return; }
     r10Snap = w.snap;
     if (!enterR8(v, 'r10')) r10Snap = null;
   }
@@ -4366,9 +4373,14 @@
   // own input once the menu has gone. That tap is turned straight into R10's
   // full screen; Instagram never sees its click, so nothing is toggled.
   function fullVideoMenu() {
-    if (CFG.role !== 'main' || document.fullscreenElement || reelBox) return;
+    if (CFG.role !== 'main' || reelBox) return;      // R9's layer hides the tab itself
     const none = msg => { fvStats.r10MenuNone++; post('toast', { message: msg }); };
+    // A Story on the phone is in Instagram's own full screen: the route says
+    // why, before the full screen does.
     if (!r10Route(route())) { none('No video to show full screen here.'); return; }
+    if (document.fullscreenElement) { none('No video to show full screen here.'); return; }
+    // The comments panel would cover the lower part of a full-screen video.
+    if (split) { none('Close the comments first.'); return; }
     let v = snapshot && snapshot.el && snapshot.el.tagName === 'VIDEO' && snapshot.el.isConnected &&
       Date.now() - snapshot.at < 10 * 60 * 1000 ? snapshot.el : null;
     if (!v) { const m = pickMedia(null, null); if (m && m.tagName === 'VIDEO') v = m; }
@@ -4401,7 +4413,7 @@
     menuArm = null;
     e.stopImmediatePropagation();
     e.preventDefault();
-    if (!m.v.isConnected || document.fullscreenElement || fullScreenSettling() || staleTouch(e)) { fvStats.r10Skipped++; return true; }
+    if (!m.v.isConnected || document.fullscreenElement || split || fullScreenSettling() || staleTouch(e)) { fvStats.r10Skipped++; return true; }
     fvStats.r10Menu++;
     r10Snap = stillOf(m.v);
     if (!enterR8(m.v, 'menu')) r10Snap = null;
@@ -4573,7 +4585,7 @@
    * swipe, no like and no scroll (held still with a blocking touchmove on
    * the bar itself, never touch-action; B25), and no click comes of them.
    * ------------------------------------------------------------------ */
-  const barStats = (stats.seekBar = { attached: 0, taps: 0, drags: 0, cancels: 0, where: {} });
+  const barStats = (stats.seekBar = { attached: 0, taps: 0, drags: 0, cancels: 0, passed: 0, where: {} });
   const BAR_THIN = 2, BAR_THICK = 6, BAR_KNOB = 14;
   const BAR_CSS = ':host{all:initial;display:block;position:absolute;z-index:2147483600;pointer-events:auto;' +
     'contain:layout style;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}' +
@@ -4646,6 +4658,20 @@
       const r = track.getBoundingClientRect();
       return r.width ? Math.min(1, Math.max(0, (x - r.left) / r.width)) : 0;
     }
+    // Following, the strip reaches 12 px up into the video, over the lower part
+    // of Instagram's small icons there (sound, tags): a touch on one of those is
+    // the icon's, not the bar's. Only the first thing under the strip counts.
+    function iconUnder(x, y) {
+      if (!follow || typeof document.elementsFromPoint !== 'function') return null;
+      for (const u of document.elementsFromPoint(x, y)) {
+        if (u === el || el.contains(u) || (u.closest && u.closest('[data-sg-bar]'))) continue;
+        const b = u.closest && u.closest('button,[role="button"]');
+        if (!b || b.contains(video) || b.closest('a[href]') && b.closest('a[href]').contains(video)) return null;
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.width <= 80 && r.height > 0 && r.height <= 80 ? b : null;
+      }
+      return null;
+    }
     function activate(on) {
       clearTimeout(idle);
       if (on) el.setAttribute('data-active', '');
@@ -4658,6 +4684,8 @@
       e.stopPropagation();
       if (e.touches.length !== 1) { if (drag) { drag = null; barStats.cancels++; activate(false); } return; }
       const t = e.touches[0];
+      const icon = iconUnder(t.clientX, t.clientY);
+      if (icon) { drag = { pass: icon, x0: t.clientX, y0: t.clientY }; return; }
       drag = { x0: t.clientX, frac: fracAt(t.clientX), moved: false };
       activate(true);
     }), { passive: true });
@@ -4667,6 +4695,7 @@
       if (!d) return;
       const t = e.touches[0];
       if (e.touches.length !== 1 || !t) return;
+      if ('pass' in d) { if (Math.hypot(t.clientX - d.x0, t.clientY - d.y0) > 12) d.pass = null; return; }
       if (Math.abs(t.clientX - d.x0) > 4) d.moved = true;
       d.frac = fracAt(t.clientX);
       paint();
@@ -4677,6 +4706,16 @@
       const d = drag;
       if (!d || e.touches.length) return;
       drag = null;
+      if ('pass' in d) {
+        // The icon's tap, given to it as Instagram's own click (a wander off it: nothing).
+        const b = d.pass;
+        if (b && b.isConnected) {
+          barStats.passed++;
+          if (findAudioToggleTarget(b)) lastUserAudioTap = Date.now();
+          try { press(b); } catch (err) { /* ignore */ }
+        }
+        return;
+      }
       const t = e.changedTouches[0];
       if (t) d.frac = fracAt(t.clientX);
       const len = length();
@@ -5123,6 +5162,13 @@
    * ------------------------------------------------------------------ */
   let userMuted = false;
   let lastUserAudioTap = 0;
+  // R10 and ⋮ → Full-screen video open a video with sound (Cam: "once it was
+  // full screened the sound automatically played"), whatever you muted before;
+  // it has no sound control of its own. Your mute is kept outside it, and the
+  // feed video is muted again when it ends. R8's swipe keeps your choice.
+  function soundBlocked(m) {
+    return userMuted && !(m === r8El && fullVideoOn() && fullKind !== 'r8');
+  }
   const unmuteBudget = new WeakMap();
   function wantsSound(v) {
     if (CFG.role !== 'main') return false;
@@ -5213,7 +5259,7 @@
     // with no audio has nothing to turn on (pressing only shows a toast).
     if (toggle && !/playing|is on|^mute$|turn off|no audio|no sound/i.test(label)) {
       try { press(toggle); } catch (e) { /* ignore */ }
-      setTimeout(() => { if (m.muted && !userMuted) m.muted = false; }, 300);
+      setTimeout(() => { if (m.muted && !soundBlocked(m)) m.muted = false; }, 300);
     } else {
       m.muted = false;
     }
@@ -5223,13 +5269,13 @@
     if (!(m instanceof HTMLMediaElement) || m.dataset.sgOwn) return;   // R9's Reel sets its own sound
     if (CFG.role !== 'main') { m.pause(); m.muted = true; return; }
     queueAwake();
-    if (m.muted && !userMuted && wantsSound(m)) unmute(m);
+    if (m.muted && !soundBlocked(m) && wantsSound(m)) unmute(m);
   }), true);
   document.addEventListener('volumechange', safe(e => {
     const m = e.target;
     if (!(m instanceof HTMLMediaElement) || CFG.role !== 'main' || m.dataset.sgOwn) return;
     if (Date.now() - lastUserAudioTap < 800) { userMuted = m.muted; return; }
-    if (m.muted && !userMuted && !m.paused && wantsSound(m)) setTimeout(() => { if (m.muted && !userMuted) unmute(m); }, 150);
+    if (m.muted && !soundBlocked(m) && !m.paused && wantsSound(m)) setTimeout(() => { if (m.muted && !soundBlocked(m)) unmute(m); }, 150);
   }), true);
 
   /* ------------------------------------------------------------------ *

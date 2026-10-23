@@ -111,6 +111,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private boolean pageVideo;
     // A post's video in full screen (R8) hid the menu tab: the whole screen, no icons over it.
     private boolean fullHidTab;
+    // When the page last said it is about to ask for full screen for a video of
+    // its own (R8/R10/menu: fullVideoStart); 0 when not. Instagram's own full
+    // screens (a Story or highlight opened from Home or a profile) never set it.
+    private long ownFullAt;
+    private static final long OWN_FULL_MS = 2500;
+    // The comments panel was up when a full screen started: it goes for the full
+    // screen (it would be drawn over the video and take its touches) and comes back after.
+    private boolean fullHidComments;
     // R10 from the menu: the taps the app made on the page's video for it, and the ones it held back.
     private int videoTaps, videoTapsHeld;
     private Downloads downloads;
@@ -556,11 +564,20 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             // R8/R10: a video takes the whole screen (from a post, a Reel, the feed or
             // a profile). The tab's elevation would draw it (and give it taps) over
             // the video, so it goes. Not in a Story, where the tab is how Stories are
-            // saved (R9's layer hides it itself), nor in DMs (Instagram's own).
-            if (!"story".equals(route) && !"direct".equals(route)) {
+            // saved (R9's layer hides it itself), nor in DMs (Instagram's own). On
+            // Home or a profile only when the page said the full screen is its own:
+            // Instagram asks for a Story's full screen there before the route says "story".
+            boolean own = ownFullAt != 0 && SystemClock.uptimeMillis() - ownFullAt < OWN_FULL_MS;
+            ownFullAt = 0;
+            if (("post".equals(route) || "reel".equals(route) || own)
+                    && !"story".equals(route) && !"direct".equals(route)) {
                 fullHidTab = true;
                 menuButton.setVisibility(View.GONE);
                 zoomChip.setVisibility(View.GONE);
+            }
+            if (comments.isOpen() && comments.getVisibility() == View.VISIBLE) {
+                fullHidComments = true;
+                comments.setVisibility(View.GONE);
             }
             setSystemBarsHidden(true);
             updateFeedBar();     // the skip note and the end card stay off a full screen
@@ -599,6 +616,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 ui.post(() -> {
                     if (touchOpen && touchSwallow && touchSeq == seq) cancelTo(web);
                 });
+            }
+            if (fullHidComments) {
+                fullHidComments = false;
+                if (comments.isOpen()) comments.setVisibility(View.VISIBLE);
             }
             if (fullHidTab) {
                 fullHidTab = false;
@@ -654,6 +675,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 if (main) {
                     route = m.optString("route", "other");
                     pageUrl = m.optString("url", "");
+                    if (fullHidTab && customView != null && ("story".equals(route) || "direct".equals(route))) {
+                        // A full screen that started before its route said Story (or DMs):
+                        // the tab is how Stories are saved, so it comes back.
+                        fullHidTab = false;
+                        if (!screenshotMode && !pageVideo) menuButton.setVisibility(View.VISIBLE);
+                        onZoomChanged(zoom.scale());
+                    }
                     if ("ready".equals(action)) {
                         // A new page: nothing from the old one carries over.
                         searchOpen = false;
@@ -721,6 +749,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "fullVideo":
                 if (main) setPageVideo(m.optBoolean("on"));
+                break;
+            case "fullVideoStart":
+                // The page is about to ask for full screen for a video of its own.
+                if (main) ownFullAt = SystemClock.uptimeMillis();
                 break;
             case "fullVideoTap":
                 // R10 from the menu: the page names a spot on its video; the app taps it.
@@ -2125,6 +2157,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 return;
             }
             if (customView != null || touchOpen || zoom.isHolding() || zoom.isOwned() || zoom.isPinching()
+                    || comments.isOpen() || zoom.isSplit()
                     || screenshotMode || pageVideo || rebuilding || web.getWidth() <= 0) {
                 videoTapsHeld++;
                 return;

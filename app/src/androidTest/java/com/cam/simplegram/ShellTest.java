@@ -923,9 +923,14 @@ public class ShellTest {
         }
     }
 
-    /** R8/R10: a video in full screen (a post's, a Reel's, the feed's) has the whole screen; the tab (elevated) is not drawn or touchable over it. */
+    /**
+     * R8/R10: a video in full screen (a post's, a Reel's, the feed's) has the whole
+     * screen; the tab (elevated) is not drawn or touchable over it. On Home and
+     * other pages only for the page's own full screen (it says fullVideoStart first).
+     */
     @Test
     public void postVideoFullScreenHidesTheMenuTab() throws Exception {
+        String start = new JSONObject().put("action", "fullVideoStart").toString();
         for (String r : new String[]{"post", "reel", "home", "other"}) {
             try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
                 AtomicReference<MainActivity> act = new AtomicReference<>();
@@ -937,6 +942,9 @@ public class ShellTest {
                 s.onActivity(a -> {
                     try {
                         route.set(a, r);
+                        if ("home".equals(r) || "other".equals(r)) {
+                            call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", start);
+                        }
                         chromeOf(a).onShowCustomView(video, () -> hidden[0] = true);
                     } catch (Exception e) {
                         throw new RuntimeException(e);
@@ -994,6 +1002,123 @@ public class ShellTest {
             idle();
             assertEquals(1, taps.getInt(act.get()));
             assertEquals(1, held.getInt(act.get()));
+        }
+    }
+
+    /**
+     * Instagram opens a Story (from Home's tray) or a highlight (from a profile)
+     * by asking for full screen before its route says "story": that full screen
+     * isn't the page's own, so the tab (how Stories are saved) stays. And if a
+     * tab was hidden for a full screen whose route then says "story", it comes back.
+     */
+    @Test
+    public void storyFullScreenStartedBeforeItsRouteKeepsTheMenuTab() throws Exception {
+        String story = new JSONObject().put("action", "route").put("route", "story")
+                .put("url", "https://www.instagram.com/stories/friend/1/").toString();
+        String start = new JSONObject().put("action", "fullVideoStart").toString();
+        for (String r : new String[]{"home", "other"}) {
+            for (boolean own : new boolean[]{false, true}) {
+                try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+                    AtomicReference<MainActivity> act = new AtomicReference<>();
+                    s.onActivity(act::set);
+                    View view = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+                    java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+                    route.setAccessible(true);
+                    s.onActivity(a -> {
+                        try {
+                            route.set(a, r);
+                            if (own) call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", start);
+                            chromeOf(a).onShowCustomView(view, () -> { });
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+                    idle();
+                    assertEquals(r + " " + own, own ? View.GONE : View.VISIBLE, menuTab(act.get()).getVisibility());
+                    message(s, story);
+                    idle();
+                    assertEquals(r + " " + own, View.VISIBLE, menuTab(act.get()).getVisibility());
+                    // Nothing still hides the tab or the zoom chip (onZoomChanged reads this).
+                    java.lang.reflect.Field hid = MainActivity.class.getDeclaredField("fullHidTab");
+                    hid.setAccessible(true);
+                    assertFalse(hid.getBoolean(act.get()));
+                }
+            }
+        }
+        // A start message long before a full screen of Instagram's doesn't count.
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, start);
+            SystemClock.sleep(3000);
+            View view = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onShowCustomView(view, () -> { });
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertEquals(View.VISIBLE, menuTab(act.get()).getVisibility());
+        }
+    }
+
+    /**
+     * R10 with the comments panel up: the app makes no tap for the menu item, and
+     * any full screen that starts anyway (Instagram's own player) has the panel
+     * out of its way until it ends.
+     */
+    @Test
+    public void fullScreenOverTheCommentsPanelPutsThePanelAside() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            CommentsPanel panel = panelOf(act.get());
+            JSONObject msg = new JSONObject()
+                    .put("code", "ABCDEFG")
+                    .put("rect", new JSONObject().put("x", 0).put("y", 120).put("w", 412).put("h", 515))
+                    .put("dpr", 2.625);
+            s.onActivity(x -> {
+                try {
+                    call(x, "openComments", new Class<?>[]{JSONObject.class}, msg);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(500);
+            idle();
+            assertTrue(panel.isOpen());
+            java.lang.reflect.Field taps = MainActivity.class.getDeclaredField("videoTaps");
+            java.lang.reflect.Field held = MainActivity.class.getDeclaredField("videoTapsHeld");
+            taps.setAccessible(true);
+            held.setAccessible(true);
+            message(s, new JSONObject().put("action", "fullVideoTap").put("x", 200).put("y", 300).put("w", 412).toString());
+            SystemClock.sleep(600);
+            idle();
+            assertEquals(0, taps.getInt(act.get()));
+            assertEquals(1, held.getInt(act.get()));
+            boolean[] hidden = new boolean[1];
+            View video = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onShowCustomView(video, () -> hidden[0] = true);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertTrue(panel.isOpen());
+            assertEquals(View.GONE, panel.getVisibility());
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertTrue(hidden[0]);
+            assertTrue("Back left full screen, not the comments", panel.isOpen());
+            assertEquals(View.VISIBLE, panel.getVisibility());
+            s.onActivity(MainActivity::onBackPressed);
+            SystemClock.sleep(600);
+            idle();
+            assertFalse(panel.isOpen());
         }
     }
 
