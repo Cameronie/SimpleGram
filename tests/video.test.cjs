@@ -88,7 +88,7 @@ async function stubFullscreen(page, already) {
     window.__fsEl = on ? document.body : null;
     Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => window.__fsEl });
     HTMLElement.prototype.requestFullscreen = function () {
-      window.__fs.push(this.id || this.tagName);
+      window.__fs.push((this === document.documentElement ? 'page:' + ((document.querySelector('video[data-sg-full]') || {}).id || '?') : (this.id || this.tagName)));
       window.__fsActive.push(!!(navigator.userActivation && navigator.userActivation.isActive));
       window.__fsEl = this;
       document.dispatchEvent(new Event('fullscreenchange'));
@@ -144,7 +144,7 @@ test('R8: a swipe down on the video at the top of the page shows that video full
   await stubFullscreen(page);
   await watchMoves(page);
   await drag(page, [200, 200], [210, 420]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
   assert.ok(await page.evaluate(() => window.__held >= 7), 'the armed swipe is held still');
   // The swipe was held still (no scroll), so its lift counts as your tap for the browser.
   assert.deepEqual(await page.evaluate(() => window.__fsActive), [true]);
@@ -160,7 +160,7 @@ test('R8: a Reel page works the same way', async () => {
   const page = await openPage('https://www.instagram.com/reel/ABCDEFG/', POST);
   await stubFullscreen(page);
   await drag(page, [200, 300], [200, 450]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
 });
 
 test('R8: scrolled down, the swipe scrolls back up; the next one goes full screen', async () => {
@@ -171,7 +171,7 @@ test('R8: scrolled down, the swipe scrolls back up; the next one goes full scree
   assert.deepEqual(await page.evaluate(() => window.__fs), []);
   assert.equal(await page.evaluate(() => window.scrollY), 0, 'the page scrolled back to the top');
   await drag(page, [200, 200], [200, 400]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
 });
 
 test('R8: a swipe up never goes full screen (reading the description scrolls as usual)', async () => {
@@ -222,7 +222,8 @@ test('R8: in full screen a swipe up or down returns; a tap pauses or plays', asy
     v.pause = () => { window.__pauses++; window.__paused = true; };
   });
   await drag(page, [200, 200], [200, 400]);
-  assert.equal(await page.evaluate(() => window.__fsEl && window.__fsEl.id), 'v');
+  // The page is full screen with the video lifted over it (R11's bar can go over it).
+  assert.deepEqual(await page.evaluate(() => [window.__fsEl === document.documentElement, (document.querySelector('video:popover-open') || {}).id]), [true, 'v']);
   await tapAt(page, 200, 400);
   await tapAt(page, 200, 400);
   assert.deepEqual(await page.evaluate(() => [window.__plays, window.__pauses, window.__igTaps]), [1, 1, 0]);
@@ -300,7 +301,7 @@ test('R8: a sheet or dialog over the video keeps its own swipes (its list scroll
   // Gone again, the video's own swipe works.
   await page.evaluate(() => document.querySelector('#list').parentElement.remove());
   await drag(page, [200, 250], [200, 450]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
   assert.equal((await fv(page)).r8, 1);
 });
 
@@ -321,7 +322,7 @@ test('R8: dragging a Reel\'s comments sheet down by its header closes the sheet 
   assert.deepEqual(await page.evaluate(() => window.__fs), []);
   // Above the sheet, on the video itself: full screen.
   await drag(page, [200, 100], [200, 300]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
 });
 
 test('R8: Instagram nesting the video deep inside its tap layer\'s box still works', async () => {
@@ -335,7 +336,7 @@ test('R8: Instagram nesting the video deep inside its tap layer\'s box still wor
   const page = await openPage('https://www.instagram.com/p/ABCDEFG/', html);
   await stubFullscreen(page);
   await drag(page, [200, 250], [200, 450]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
 });
 
 test('R8: a letterboxed video under a full-screen tap layer still works', async () => {
@@ -346,7 +347,7 @@ test('R8: a letterboxed video under a full-screen tap layer still works', async 
   const page = await openPage('https://www.instagram.com/reel/ABCDEFG/', html);
   await stubFullscreen(page);
   await drag(page, [200, 400], [200, 560]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
 });
 
 test('R8: a landscape video that played muted in the post gets its sound in full screen', async () => {
@@ -370,7 +371,7 @@ test('R8: a landscape video that played muted in the post gets its sound in full
   });
   assert.equal(await page.evaluate(() => document.getElementById('v').muted), true, 'muted while small');
   await drag(page, [200, 120], [200, 330]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
   await page.waitForFunction(() => document.getElementById('v').muted === false, null, { timeout: 2000 });
 });
 

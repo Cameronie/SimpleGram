@@ -392,7 +392,7 @@ test('B25: the app\'s quiet reset drops a half-done R8 swipe', async () => {
   assert.deepEqual(await page.evaluate(() => window.__fs), []);
   // The next swipe works as ever.
   await drag(page, [200, 200], [200, 420]);
-  assert.deepEqual(await page.evaluate(() => window.__fs), ['v']);
+  assert.deepEqual(await page.evaluate(() => window.__fs), ['page:v']);
 });
 
 /* ---------------- R8: the safe exit and the bookkeeping race ---------------- */
@@ -414,7 +414,7 @@ async function stubSync(page) {
     window.__fs = []; window.__fsExit = 0; window.__fsEl = null;
     Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => window.__fsEl });
     HTMLElement.prototype.requestFullscreen = function () {
-      window.__fs.push(this.id || this.tagName);
+      window.__fs.push((this === document.documentElement ? 'page:' + ((document.querySelector('video[data-sg-full]') || {}).id || '?') : (this.id || this.tagName)));
       window.__fsEl = this;
       document.dispatchEvent(new Event('fullscreenchange'));
       return Promise.resolve();
@@ -436,7 +436,7 @@ async function stubAsync(page, { grantMs = 150, exitEventMs = 300, appExitMs = 1
     Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => window.__fsEl });
     HTMLElement.prototype.requestFullscreen = function () {
       const el = this;
-      window.__fs.push(el.id || el.tagName);
+      window.__fs.push((el === document.documentElement ? 'page:' + ((document.querySelector('video[data-sg-full]') || {}).id || '?') : (el.id || el.tagName)));
       return new Promise(res => setTimeout(() => { window.__fsEl = el; document.dispatchEvent(new Event('fullscreenchange')); res(); }, grantMs));
     };
     const leave = () => { window.__fsEl = null; setTimeout(() => document.dispatchEvent(new Event('fullscreenchange')), exitEventMs); };
@@ -449,7 +449,8 @@ async function stubAsync(page, { grantMs = 150, exitEventMs = 300, appExitMs = 1
   }, { grantMs, exitEventMs, appExitMs });
 }
 const state = page => page.evaluate(() => ({
-  fv: window.__sg.stats.diag.fullVideo, fs: window.__sg.stats.b25.fs, el: window.__fsEl ? window.__fsEl.id : null,
+  fv: window.__sg.stats.diag.fullVideo, fs: window.__sg.stats.b25.fs, el: !window.__fsEl ? null : window.__fsEl === document.documentElement
+    ? 'page:' + ((document.querySelector('video[data-sg-full]:popover-open') || {}).id || '?') : window.__fsEl.id,
   sgFull: document.getElementById('v').dataset.sgFull || null, requests: window.__fs.length,
   appExits: window.__appExits, pageExits: window.__fsExit }));
 
@@ -459,7 +460,7 @@ test('B25 R8: a quick swipe down right after an exit swipe starts nothing until 
   await drag(page, [200, 200], [200, 400]);
   await page.waitForTimeout(300);
   let s = await state(page);
-  assert.deepEqual([s.el, s.fv.r8, s.sgFull], ['v', 1, '1']);
+  assert.deepEqual([s.el, s.fv.r8, s.sgFull], ['page:v', 1, '1']);
   await drag(page, [200, 300], [200, 700]);              // the exit swipe: the app is asked
   await drag(page, [200, 200], [200, 420]);              // at once: a swipe down, before the exit lands
   await page.waitForTimeout(900);
@@ -471,14 +472,14 @@ test('B25 R8: a quick swipe down right after an exit swipe starts nothing until 
   await drag(page, [200, 200], [200, 400]);
   await page.waitForTimeout(300);
   s = await state(page);
-  assert.deepEqual([s.el, s.fv.r8, s.sgFull], ['v', 2, '1']);
+  assert.deepEqual([s.el, s.fv.r8, s.sgFull], ['page:v', 2, '1']);
   await drag(page, [200, 300], [200, 700]);
   await page.waitForTimeout(600);
   s = await state(page);
   assert.deepEqual([s.el, s.fv.exits, s.appExits], [null, 2, 2]);
   // The page's own log of full-screen changes: shapes only.
   const log = (await b25(page)).fsPage;
-  assert.deepEqual(log.map(e => [e.tag, e.via, e.on]), [['video', 'r8', true], [null, 'r8', false], ['video', 'r8', true], [null, 'r8', false]]);
+  assert.deepEqual(log.map(e => [e.tag, e.via, e.on]), [['html', 'r8', true], [null, 'r8', false], ['html', 'r8', true], [null, 'r8', false]]);
   assert.ok(log.every(e => e.route === 'reel' && typeof e.msSinceTouchEnd === 'number' && typeof e.touchActive === 'boolean'));
 });
 
@@ -502,7 +503,7 @@ test('B25 R8: a late exit event while the next request is on its way keeps that 
   await page.evaluate(() => document.dispatchEvent(new Event('fullscreenchange')));   // an earlier exit's event, late
   await page.waitForTimeout(600);
   let s = await state(page);
-  assert.deepEqual([s.el, s.fv.r8, s.sgFull, s.fs.r8Race], ['v', 1, '1', 1]);
+  assert.deepEqual([s.el, s.fv.r8, s.sgFull, s.fs.r8Race], ['page:v', 1, '1', 1]);
   await drag(page, [200, 300], [200, 700]);
   await page.waitForTimeout(600);
   s = await state(page);
@@ -547,7 +548,7 @@ test('B25 R8: a swipe whose lift is handled long after it happened switches noth
   assert.deepEqual([s.requests, s.fs.r8Stale], [0, 1]);
   await drag(page, [200, 200], [200, 420]);
   s = await state(page);
-  assert.deepEqual([s.requests, s.el], [1, 'v']);
+  assert.deepEqual([s.requests, s.el], [1, 'page:v']);
 });
 
 /* ---------------- Diagnostics ---------------- */
