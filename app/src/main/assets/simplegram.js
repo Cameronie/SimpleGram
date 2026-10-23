@@ -3371,7 +3371,13 @@
       const reel = sharedReelHere();
       // Instagram's own swipe up opens the reply box; it never sees this one,
       // so its Story stays pressed (paused) under the Reel.
-      if (reel && openStoryReel(reel, g)) { e.stopImmediatePropagation(); return; }
+      if (reel && openStoryReel(reel, g)) {
+        // B25's own listener never sees this lift: count it here, or the next touch reads as a lost end.
+        noteTouchLift(e, false);
+        dseq = null;
+        e.stopImmediatePropagation();
+        return;
+      }
     }
     // Instagram's own thresholds for a swipe to the next or previous person.
     if (Math.abs(dx) > 50 && Math.abs(dy) < 100 && ms <= 500) storySwitchStart(dx > 0 ? 'back' : 'next');
@@ -3734,7 +3740,7 @@
   // values, whether they all allow vertical panning, the nearest vertical
   // scroller, and whether it is SimpleGram's search screen.
   function touchChain(e) {
-    const out = { ta: [], panY: true, scroller: null, overlay: false };
+    const out = { ta: [], panY: true, scroller: null, reverse: false, overlay: false };
     const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
     for (const n of path) {
       if (!(n instanceof Element)) continue;
@@ -3744,7 +3750,11 @@
       if (v && v !== 'auto' && out.ta.indexOf(v) < 0 && out.ta.length < 6) out.ta.push(v.slice(0, 40));
       if (!allowsPanY(v)) out.panY = false;
       if (!out.scroller && n !== document.documentElement && n !== document.body &&
-        /^(auto|scroll|overlay)$/.test(cs.overflowY) && n.scrollHeight > n.clientHeight + 1) out.scroller = n;
+        /^(auto|scroll|overlay)$/.test(cs.overflowY) && n.scrollHeight > n.clientHeight + 1) {
+        out.scroller = n;
+        // A chat-style list: scrollTop runs from -max up to 0 at the newest item.
+        out.reverse = /flex/.test(cs.display) && /-reverse$/.test(cs.flexDirection);
+      }
     }
     return out;
   }
@@ -3769,10 +3779,25 @@
     for (let i = 0; a && a.shadowRoot && a.shadowRoot.activeElement && i < 5; i++) a = a.shadowRoot.activeElement;
     return a;
   }
+  // Only a shrunk viewport says the keyboard is up: a field keeps its focus
+  // after Back hides the keyboard, and drags there still count.
   function keyboardLikely() {
-    if (isField(deepActive())) return true;
+    noteViewport();
     const vv = window.visualViewport;
     return !!vv && maxViewH > 0 && vv.height < maxViewH * 0.75;
+  }
+  // The tallest the viewport has been at this width (a new width starts over).
+  function noteViewport() {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    if (innerWidth !== viewW) { viewW = innerWidth; maxViewH = 0; }
+    if (vv.height > maxViewH) maxViewH = vv.height;
+  }
+  if (CFG.role === 'main' && window.visualViewport) {
+    window.visualViewport.addEventListener('resize', safe(noteViewport), { passive: true });
+    // Its full height known before the first touch, read once the page has its
+    // viewport (reading it at document start makes the page resize later).
+    document.addEventListener('DOMContentLoaded', safe(noteViewport), { once: true });
   }
   function scrollLocked() {
     const h = document.documentElement, b = document.body;
@@ -3807,16 +3832,16 @@
     const chain = touchChain(e);
     noteTouchActions(chain.ta);
     if (e.touches.length !== 1) { if (dseq) dseq.multi = true; return; }
-    const vv = window.visualViewport;
-    if (vv) {
-      if (innerWidth !== viewW) { viewW = innerWidth; maxViewH = 0; }
-      if (vv.height > maxViewH) maxViewH = vv.height;
-    }
+    noteViewport();
     const sc = chain.scroller || document.scrollingElement || document.documentElement;
     const t = e.touches[0];
+    // The scroller's real range: [0, max], or [-max, 0] for a reversed one (also
+    // when it rests below 0 and its style didn't say so).
+    const max = sc.scrollHeight - sc.clientHeight, top0 = sc.scrollTop;
+    const rev = (chain.scroller === sc && chain.reverse) || top0 < -1;
     dseq = { t0: now, t1: 0, x: t.clientX, y: t.clientY, ex: t.clientX, ey: t.clientY, moves: 0, firstMove: 0,
-      multi: false, last: null, prevented: 0, sg: false, chain: chain, sc: sc, top0: sc.scrollTop,
-      max: sc.scrollHeight - sc.clientHeight };
+      multi: false, last: null, prevented: 0, sg: false, chain: chain, sc: sc, top0: top0,
+      lo: rev ? -max : 0, hi: rev ? 0 : max };
   }), { capture: true, passive: true });
   window.addEventListener('touchmove', safe(e => {
     const d = dseq;
@@ -3829,10 +3854,17 @@
     const t = e.touches[0];
     if (t) { d.ex = t.clientX; d.ey = t.clientY; }
   }), { capture: true, passive: true });
+  // A finger (or the whole touch) lifted or cancelled, as far as the page's bookkeeping goes.
+  function noteTouchLift(e, cancel) {
+    for (let i = 0; i < e.changedTouches.length; i++) downIds.delete(e.changedTouches[i].identifier);
+    if (e.touches.length) return;
+    downIds.clear();
+    if (cancel) touchSeq.cancels++;
+    else { touchSeq.ends++; lastTouchEndAt = performance.now(); }
+  }
   window.addEventListener('touchend', safe(e => {
     if (!e.isTrusted) return;
-    for (let i = 0; i < e.changedTouches.length; i++) downIds.delete(e.changedTouches[i].identifier);
-    if (!e.touches.length) { downIds.clear(); touchSeq.ends++; lastTouchEndAt = performance.now(); }
+    noteTouchLift(e, false);
     const d = dseq;
     if (!d) return;
     if (e.touches.length) { d.multi = true; return; }
@@ -3844,8 +3876,7 @@
   }), { capture: true, passive: true });
   window.addEventListener('touchcancel', safe(e => {
     if (!e.isTrusted) return;
-    for (let i = 0; i < e.changedTouches.length; i++) downIds.delete(e.changedTouches[i].identifier);
-    if (!e.touches.length) { downIds.clear(); touchSeq.cancels++; }
+    noteTouchLift(e, true);
     dseq = null;                     // a cancelled touch never counts
   }), { capture: true, passive: true });
   if (CFG.role === 'main') {
@@ -3881,7 +3912,7 @@
     if (dialogShown()) return skipDrag('dialog');
     if (d.sc === (document.scrollingElement || document.documentElement) && scrollLocked()) return skipDrag('locked');
     // The list is at its end in the drag's direction: nothing to scroll.
-    if (dy < 0 ? d.top0 >= d.max - 2 : d.top0 <= 2) return skipDrag('end');
+    if (dy < 0 ? d.top0 >= d.hi - 2 : d.top0 <= d.lo + 2) return skipDrag('end');
     setTimeout(safe(() => settleDrag(d)), DEAD_WAIT);
   }
   // A while after the lift: did anything scroll?
@@ -6192,6 +6223,8 @@
       case 'fullVideoExit': exitFullVideo('back'); break;
       case 'gestureReset': gestureReset(); break;
       case 'scrollStuckAck': stuckAck(cmd); break;
+      // The app's chip is still up from an earlier page: the first drag here that scrolls clears it.
+      case 'stuckChipUp': report.open = true; report.at = Date.now(); break;
       case 'searchRestore': searchRestore(cmd.state); break;
       case 'viewer': if (cmd.id) CFG.viewerId = String(cmd.id); break;
       case 'status':

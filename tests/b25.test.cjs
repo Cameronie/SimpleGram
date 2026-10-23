@@ -199,13 +199,14 @@ test('B25: no strike where scrolling isn\'t expected: list ends, scroll locks, S
   await page.evaluate(() => Object.defineProperty(window.visualViewport, 'scale', { configurable: true, get: () => 2 }));
   await deadDrag(page);
   await page.evaluate(() => { delete window.visualViewport.scale; });
-  // The keyboard (a field has focus).
+  // The keyboard up (the viewport shrinks under it).
   await page.evaluate(() => {
     document.body.insertAdjacentHTML('beforeend', '<input id="field" style="position:fixed;left:0;top:20px;z-index:6">');
     document.getElementById('field').focus();
+    Object.defineProperty(window.visualViewport, 'height', { configurable: true, get: () => 500 });
   });
   await deadDrag(page);
-  await page.evaluate(() => { const f = document.getElementById('field'); f.blur(); f.remove(); });
+  await page.evaluate(() => { delete window.visualViewport.height; const f = document.getElementById('field'); f.blur(); f.remove(); });
   // The app holding a finger on the page (its menu in a Story).
   await page.evaluate(() => window.__sg.onNative({ type: 'appHold', on: true }));
   await deadDrag(page);
@@ -216,6 +217,56 @@ test('B25: no strike where scrolling isn\'t expected: list ends, scroll locks, S
   assert.deepEqual(s.drag.skipped, { end: 2, locked: 1, story: 1, fullScreen: 1, dialog: 1, zoom: 1, keyboard: 1, held: 1 });
   for (let i = 0; i < 3; i++) await deadDrag(page);
   assert.equal((await stuckPosts(page)).length, 1);
+});
+
+test('B25: a field that kept its focus after the keyboard went away doesn\'t hide dead drags', async () => {
+  const page = await openPage(DEAD_URL, DEAD);
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<input id="field" type="search" style="position:fixed;left:0;top:20px;z-index:6">');
+    document.getElementById('field').focus();
+  });
+  for (let i = 0; i < 3; i++) await deadDrag(page);
+  const s = await b25(page);
+  assert.equal(s.drag.skipped.keyboard, undefined, JSON.stringify(s.drag.skipped));
+  assert.equal(s.drag.dead, 3);
+  assert.equal((await stuckPosts(page)).length, 1);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'field');
+  // The keyboard up from the first touch on (the viewport's full height is known from the start).
+  const kb = await openPage(DEAD_URL, DEAD);
+  await kb.evaluate(() => Object.defineProperty(window.visualViewport, 'height', { configurable: true, get: () => 500 }));
+  await deadDrag(kb);
+  assert.deepEqual([(await b25(kb)).drag.skipped.keyboard, (await b25(kb)).drag.dead], [1, 0]);
+});
+
+// A chat thread: newest message at the bottom, the list in reverse (scrollTop
+// 0 at the newest, negative above it).
+const THREAD = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+  <div id="thread" style="position:fixed;left:0;top:60px;width:412px;height:795px;overflow-y:auto;display:flex;flex-direction:column-reverse">
+    ${Array.from({ length: 60 }, (_, i) => `<div style="height:19px;flex:none">message ${i}</div>`).join('')}
+  </div></body></html>`;
+
+test('B25: a reversed (chat-style) list at its newest message is at its end; drags toward older messages are judged', async () => {
+  const page = await openPage('https://www.instagram.com/direct/t/1234567890/', THREAD);
+  assert.equal(await page.evaluate(() => document.getElementById('thread').scrollTop), 0);
+  for (let i = 0; i < 3; i++) await deadDrag(page, [200, 700], [200, 400]);
+  let s = await b25(page);
+  assert.deepEqual([s.drag.dead, s.drag.skipped.end], [0, 3], JSON.stringify(s.drag));
+  assert.deepEqual(await stuckPosts(page), []);
+  // Toward older messages: it scrolls, and is counted as a drag that scrolled.
+  await deadDrag(page, [200, 300], [200, 650]);
+  s = await b25(page);
+  assert.ok(await page.evaluate(() => document.getElementById('thread').scrollTop) < -50);
+  assert.deepEqual([s.drag.scrolled, s.drag.skipped.end], [1, 3], JSON.stringify(s.drag));
+  // The same list the usual way round, at its end: still 'end'.
+  await page.evaluate(() => {
+    const t = document.getElementById('thread');
+    t.style.flexDirection = 'column';
+    t.scrollTop = 1e6;
+  });
+  await page.waitForTimeout(100);
+  await deadDrag(page, [200, 700], [200, 400]);
+  s = await b25(page);
+  assert.deepEqual([s.drag.dead, s.drag.skipped.end], [0, 4], JSON.stringify(s.drag));
 });
 
 test('B25: no strike for a drag something held still, or one on a page too busy to tell', async () => {
@@ -267,6 +318,32 @@ test('B25: the app\'s answers: a quiet reset first, then two more strikes bring 
   assert.equal((await stuckPosts(page)).length, 2);
   s = await b25(page);
   assert.equal(s.stuck.refused, 1);
+});
+
+test('B25: a chip still up from an earlier page goes once a drag scrolls on the new one', async () => {
+  const page = await openPage(DEAD_URL, DEAD);
+  for (let i = 0; i < 3; i++) await deadDrag(page);
+  await page.evaluate(() => window.__sg.onNative({ type: 'scrollStuckAck', accepted: true, stage: 'soft' }));
+  for (let i = 0; i < 2; i++) await deadDrag(page);
+  await page.evaluate(() => window.__sg.onNative({ type: 'scrollStuckAck', accepted: true, stage: 'chip' }));
+  // Refresh: a new page that scrolls. Without word from the app it says nothing.
+  await page.reload();
+  await page.evaluate(() => window.__dead(false));
+  await deadDrag(page);
+  assert.ok(await page.evaluate(() => window.scrollY) > 50);
+  assert.equal((await sent(page, 'scrollOk')).length, 0);
+  // With the app's word on 'ready', the first drag that scrolls clears the chip.
+  await page.reload();
+  await page.evaluate(() => { window.__dead(false); window.__sg.onNative({ type: 'stuckChipUp' }); });
+  await deadDrag(page);
+  assert.equal((await sent(page, 'scrollOk')).length, 1);
+  await deadDrag(page);
+  assert.equal((await sent(page, 'scrollOk')).length, 1, 'once');
+  // Still dead on the new page: it doesn't report again at once (the chip is up).
+  await page.reload();
+  await page.evaluate(() => window.__sg.onNative({ type: 'stuckChipUp' }));
+  for (let i = 0; i < 3; i++) await deadDrag(page);
+  assert.deepEqual([(await stuckPosts(page)).length, (await sent(page, 'scrollOk')).length], [0, 0]);
 });
 
 test('B25: a drag on SimpleGram\'s search list counts there, and the list\'s own scroll is seen', async () => {

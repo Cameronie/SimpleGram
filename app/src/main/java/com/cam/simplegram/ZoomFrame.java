@@ -289,26 +289,30 @@ final class ZoomFrame extends FrameLayout {
             return;
         }
         final float s0 = scale, x0 = tx, y0 = ty;
-        animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.setDuration(180);
-        animator.setInterpolator(new DecelerateInterpolator());
-        animator.addUpdateListener(a -> {
+        final ValueAnimator anim = ValueAnimator.ofFloat(0f, 1f);
+        animator = anim;
+        anim.setDuration(180);
+        anim.setInterpolator(new DecelerateInterpolator());
+        anim.addUpdateListener(a -> {
             float f = (float) a.getAnimatedValue();
             scale = s0 + (1f - s0) * f;
             tx = x0 * (1f - f);
             ty = y0 * (1f - f);
             apply();
         });
-        animator.addListener(new android.animation.AnimatorListenerAdapter() {
+        anim.addListener(new android.animation.AnimatorListenerAdapter() {
             @Override
             public void onAnimationEnd(android.animation.Animator a) {
+                // A finished animator must not linger: B25's repair gate reads
+                // isAnimating(). Only this one, never a newer one.
+                if (animator == anim) animator = null;
                 scale = 1f;
                 tx = ty = 0f;
                 apply();
                 releaseHold();
             }
         });
-        animator.start();
+        anim.start();
     }
 
     /**
@@ -367,7 +371,7 @@ final class ZoomFrame extends FrameLayout {
     }
 
     boolean isAnimating() {
-        return animator != null;
+        return animator != null && animator.isRunning();
     }
 
     /**

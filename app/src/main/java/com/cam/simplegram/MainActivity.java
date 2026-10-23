@@ -160,6 +160,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private int stuckPosts, softResets, strikesAfterSoft, chipShown, rebuilds, strikesAfterRebuild, manualFix;
     private final JSONObject stuckIgnored = new JSONObject();
     private boolean rebuilding;
+    private Runnable pendingRebuild;     // the rebuild's delayed swap, dropped in onDestroy
     // The page's search screen, read before a rebuild and handed to the new page once.
     private JSONObject searchHandBack;
 
@@ -656,6 +657,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
                         handBackSearch();
+                        // The chip is still up: the new page says scrollOk on its first drag that scrolls.
+                        if (stuckChipWanted) js("stuckChipUp");
                         if (!prefs.getBoolean("tabTip", false)) {
                             prefs.edit().putBoolean("tabTip", true).apply();
                             toast("Tip: drag the ⋮ tab up, down or to the other side");
@@ -799,6 +802,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (on) {
             menuButton.setVisibility(View.GONE);
             zoomChip.setVisibility(View.GONE);
+            updateStuckChip();       // the stuck chip stays off the Reel layer too
             setSystemBarsHidden(true);
         } else {
             if (!screenshotMode && !fullHidTab) menuButton.setVisibility(View.VISIBLE);
@@ -1881,6 +1885,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     @Override
     protected void onDestroy() {
+        if (pendingRebuild != null) {
+            ui.removeCallbacks(pendingRebuild);
+            pendingRebuild = null;
+        }
+        rebuilding = false;
         downloads.release();
         if (touchLast != null) {
             touchLast.recycle();
@@ -2149,16 +2158,18 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         Runnable go = () -> {
             if (done[0]) return;
             done[0] = true;
+            pendingRebuild = null;
             swapWebView();
         };
         web.evaluateJavascript("(function(){try{return window.__sg&&window.__sg.searchState?window.__sg.searchState():null}catch(e){return null}})()",
                 v -> {
-                    if (done[0]) return;
+                    if (done[0] || isDestroyed()) return;
                     searchHandBack = parseSearchState(v);
                     searchHandBackUntil = SystemClock.uptimeMillis() + 30_000L;
                     ui.post(go);         // not from inside the old WebView's own callback
                 });
         // A page too busy to answer is rebuilt without its search screen.
+        pendingRebuild = go;
         ui.postDelayed(go, 700);
     }
 
@@ -2189,6 +2200,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private void swapWebView() {
+        // A swap queued before the Activity went away would leave a WebView nobody destroys.
+        if (isFinishing() || isDestroyed()) {
+            rebuilding = false;
+            return;
+        }
         // Nothing that belongs to the old page view stays up.
         if (screenshotMode) exitScreenshot();
         if (customView != null) hideCustomView("rebuild");
@@ -2241,7 +2257,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
         boolean restored = saved && fresh.restoreState(state) != null;
         if (restored) {
-            startsAll++;      // counted like any other page load the app started
+            // The restore's own onPageStarted adds it to startsAll: credit it to the app.
+            startsLoadUrl++;
+            goBackAt = 0;
         } else {
             load(fresh, url != null && Links.isInstagram(Uri.parse(url)) ? url : Links.HOME);
         }

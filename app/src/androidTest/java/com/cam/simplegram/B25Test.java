@@ -807,10 +807,16 @@ public class B25Test {
         CommentsPanel panel = (CommentsPanel) field("comments");
         WebView commentsWeb = panel.web();
         ZoomFrame z = zoom();
+        int allBefore = intField("startsAll"), appBefore = intField("startsLoadUrl");
         call("fixScrolling");
         assertTrue("rebuilt", waitFor(() -> web() != old, 5000, "rebuild"));
         SystemClock.sleep(800);
         WebView fresh = web();
+        // The restored (or reloaded) page counts once, as a load the app started.
+        assertTrue(waitFor(() -> intField("startsAll") > allBefore, 5000, "the new page's start"));
+        SystemClock.sleep(500);
+        assertEquals("page loads: one more", allBefore + 1, intField("startsAll"));
+        assertEquals("and the app started it", appBefore + 1, intField("startsLoadUrl"));
         assertNotSame(old, fresh);
         AtomicReference<Object[]> r = new AtomicReference<>();
         inst.runOnMainSync(() -> r.set(new Object[]{z.getChildAt(0), old.getParent(), commentsWeb.getParent() != null, panel.web()}));
@@ -838,5 +844,82 @@ public class B25Test {
         enterNow();
         inst.runOnMainSync(act::onBackPressed);
         assertTrue(waitFor(() -> !fullScreen(), 8000, "Back"));
+    }
+
+    /**
+     * After a zoom that ended with its animated reset (the chip, Back, a double
+     * tap, a pinch let go near 1x), the zoom isn't "animating" for good: a
+     * report is trusted. Then the chip: off R9's Reel layer, and gone when the
+     * next page's first drag scrolls.
+     */
+    @Test
+    public void repair_gateAfterAnimatedZoomResetAndTheChipsPlaces() throws Exception {
+        name = "repair_gateAfterZoom";
+        loadPage(PLAIN_BASE);
+        ZoomFrame z = zoom();
+        inst.runOnMainSync(() -> {
+            try {
+                Field f = ZoomFrame.class.getDeclaredField("scale");
+                f.setAccessible(true);
+                f.setFloat(z, 2f);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            z.reset(true);
+        });
+        AtomicReference<Boolean> anim = new AtomicReference<>();
+        inst.runOnMainSync(() -> anim.set(z.isAnimating()));
+        log("animating right after the reset: " + anim.get());   // false on a device with animations off
+        SystemClock.sleep(500);
+        inst.runOnMainSync(() -> anim.set(z.isAnimating()));
+        assertFalse("not animating once it has ended", anim.get());
+        assertEquals(1f, z.scale(), 0.0001f);
+
+        scrollCheck("moves for the gate");
+        message("{\"action\":\"scrollStuck\",\"strikes\":3,\"where\":\"other\",\"moves\":5}");
+        assertEquals("trusted: the quiet reset", 1, intField("softResets"));
+        assertFalse(((JSONObject) field("stuckIgnored")).has("zoomGesture"));
+        message("{\"action\":\"scrollStuck\",\"strikes\":2,\"where\":\"other\",\"moves\":5}");
+        assertTrue(waitFor(this::chipShowing, 2000, "chip"));
+        // R9's Reel layer (no WebView full screen): never under the chip.
+        message("{\"action\":\"fullVideo\",\"on\":true}");
+        assertFalse("no chip over the Reel layer", chipShowing());
+        message("{\"action\":\"fullVideo\",\"on\":false}");
+        assertTrue(waitFor(this::chipShowing, 2000, "chip back"));
+        // A new page (Refresh, Following) where drags scroll: its first one clears the chip.
+        loadPage(SCRIPT_BASE);
+        assertTrue("still up on the new page", chipShowing());
+        assertTrue(scrollCheck("scrolls on the new page") > 20);
+        assertTrue("gone once a drag scrolled", waitFor(() -> !chipShowing(), 3000, "chip gone"));
+        assertEquals(0, intField("rebuilds"));
+    }
+
+    /** A rebuild asked for just before the Activity goes leaves nothing behind. */
+    @Test
+    public void repair_rebuildThenDestroyLeavesNoWebView() throws Exception {
+        name = "repair_rebuildThenDestroy";
+        loadPage(PLAIN_BASE);
+        js("setTimeout(function(){spin(3000)},0)");    // too busy to answer: only the delayed swap is left
+        SystemClock.sleep(100);
+        MainActivity first = act;
+        WebView old = web();
+        inst.runOnMainSync(() -> {
+            try {
+                Method m = MainActivity.class.getDeclaredMethod("rebuildWebView");
+                m.setAccessible(true);
+                m.invoke(first);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            first.recreate();
+        });
+        SystemClock.sleep(3500);
+        AtomicReference<Boolean> destroyed = new AtomicReference<>();
+        inst.runOnMainSync(() -> destroyed.set(first.isDestroyed()));
+        assertTrue("the first Activity is gone", destroyed.get());
+        assertEquals("no swap on the destroyed Activity", 0, intField("rebuilds"));
+        assertSame(old, web());
+        assertNull(field("pendingRebuild"));
+        assertTrue("no WebView left registered", ((List<?>) field("scripts")).isEmpty());
     }
 }

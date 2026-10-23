@@ -507,6 +507,19 @@ test('B25: R9\'s Reel layer holds the page still with a blocking touchmove, neve
   assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), true);
 });
 
+test('B25: the lift that opens R9\'s Reel still counts in the page\'s touch bookkeeping (no false lost end)', async () => {
+  const page = await openStory([sharingItem('424242', REEL_STICKER)]);
+  const seq = () => page.evaluate(() => JSON.parse(JSON.stringify(window.__sg.stats.b25.touchSeq)));
+  for (let i = 0; i < 2; i++) {
+    await drag(page, [200, 600], [205, 250], { steps: 4 });        // opens the Reel
+    await page.waitForFunction(() => document.getElementById('sg-reel'));
+    await drag(page, [200, 300], [200, 650], { steps: 4 });        // back to the Story
+    assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), false);
+  }
+  const s = await seq();
+  assert.deepEqual([s.starts, s.ends, s.orphans, s.orphanLast], [4, 4, 0, null], JSON.stringify(s));
+});
+
 test('R9: Back (from the app) and a swipe up also return; a tap pauses the Reel', async () => {
   const page = await openStory([sharingItem('424242', REEL_STICKER)]);
   await drag(page, [200, 600], [200, 300], { steps: 4 });
