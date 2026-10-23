@@ -2876,12 +2876,16 @@
     return null;
   }
   // The row holding the box (avatar, field, Post): the highest ancestor still about its size.
+  // Stops at a fixed or absolute row: its wrapper is an empty box elsewhere on the page.
   function composerBar(field) {
-    const limit = Math.max(160, field.getBoundingClientRect().height + 120);
+    const fr = field.getBoundingClientRect();
+    const limit = Math.max(160, fr.height + 120);
     let bar = field.closest('form') || field.parentElement || field;
     for (let el = bar.parentElement; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      const pos = getComputedStyle(bar).position;
+      if (pos === 'fixed' || pos === 'absolute') break;
       const r = el.getBoundingClientRect();
-      if (r.height > limit || el.querySelectorAll('textarea').length > 1) break;
+      if (r.bottom < fr.bottom - 1 || r.top > fr.top + 1 || r.height > limit || el.querySelectorAll('textarea').length > 1) break;
       bar = el;
     }
     return bar;
@@ -2894,8 +2898,19 @@
     fitWas.set(el, was);
     el.dataset.sgFit = Object.keys(was).join(' ');
     el.style.setProperty(prop, value, 'important');
-    bump(stats.comments.fixes, kind);
+    if (kind) bump(stats.comments.fixes, kind);
   }
+  // Puts back one property setStyle changed.
+  function unsetStyle(el, prop) {
+    const was = fitWas.get(el);
+    if (!was || !(prop in was)) return;
+    if (was[prop][0]) el.style.setProperty(prop, was[prop][0], was[prop][1]);
+    else el.style.removeProperty(prop);
+    delete was[prop];
+    if (Object.keys(was).length) el.dataset.sgFit = Object.keys(was).join(' ');
+    else { fitWas.delete(el); delete el.dataset.sgFit; }
+  }
+  const fitRefused = new WeakSet();
   // Puts back everything fitComposer changed (the box ended up covered).
   function unfitComposer() {
     for (const el of document.querySelectorAll('[data-sg-fit]')) {
@@ -2910,12 +2925,26 @@
     for (const el of document.querySelectorAll('[data-sg-hidden="spacer"]')) unhide(el);
   }
   // The box must stay where a finger can reach it: the middle of the field hits the box.
-  function composerReachable(field, bar) {
+  // null: scrolled off screen, so it cannot be told this time.
+  function composerPoint(field) {
     const r = field.getBoundingClientRect();
     const x = r.left + r.width / 2, y = r.top + Math.min(r.height / 2, 12);
-    if (y < 0 || y > innerHeight || x < 0 || x > innerWidth) return true;   // scrolled away: nothing to check
-    const hit = document.elementFromPoint(x, y);
+    return y < 0 || y > innerHeight || x < 0 || x > innerWidth ? null : { x, y };
+  }
+  function composerReachable(field, bar) {
+    const p = composerPoint(field);
+    if (!p) return null;
+    const hit = document.elementFromPoint(p.x, p.y);
     return !!hit && (hit === field || bar.contains(hit) || field.contains(hit));
+  }
+  // What covers the box is a fixed bar along the bottom (not a full-screen loading layer).
+  function coveredByBottomBar(field) {
+    const p = composerPoint(field);
+    for (let el = p && document.elementFromPoint(p.x, p.y); el && el !== document.body; el = el.parentElement) {
+      const pos = getComputedStyle(el).position;
+      if (pos === 'fixed' || pos === 'sticky') return el.getBoundingClientRect().top > innerHeight * 0.5;
+    }
+    return false;
   }
   function px(v) { const n = parseFloat(v); return isFinite(n) ? n : 0; }
   // Where the element's content ends on screen (its own padding and border excluded).
@@ -2940,9 +2969,13 @@
     if (field !== composer.field) {
       composer.field = field;
       composer.blocked = false;
+      composer.retries = 0;
+      composer.kbSeen = false;
       field.dataset.sgComposer = '1';
       field.addEventListener('focus', safe(composerFocus));
       field.addEventListener('blur', safe(composerBlur));
+      // A tap on the box while it has focus (keyboard put away with Back) opens it again.
+      field.addEventListener('click', safe(() => { if (document.activeElement === field) field.dataset.sgOpen = '1'; }));
       if (document.activeElement === field) field.dataset.sgOpen = '1';
       c.boxes++;
     }
@@ -2953,47 +2986,78 @@
     const extra = fcs.boxSizing === 'border-box'
       ? px(fcs.paddingTop) + px(fcs.paddingBottom) + px(fcs.borderTopWidth) + px(fcs.borderBottomWidth) : 0;
     field.style.setProperty('--sg-one-line', Math.ceil(lh + extra) + 'px');
+    noteViewport();
     if (c.gapBefore == null) c.gapBefore = composerGap(bar);
     if (composer.blocked) { c.gapAfter = composerGap(bar); reportComposer(); return; }
-    const reachable = composerReachable(field, bar);
-    for (let el = field.parentElement; el; el = el.parentElement) {
-      const cs = getComputedStyle(el);
-      const inBar = el === bar || bar.contains(el);
-      // A bottom offset that lifted the box above Instagram's bar.
-      if ((cs.position === 'fixed' || cs.position === 'sticky') && px(cs.bottom) > 0.5 && px(cs.bottom) <= 200) {
-        setStyle(el, 'bottom', '0px', 'offset');
-      }
-      const pb = px(cs.paddingBottom), pt = px(cs.paddingTop);
-      if (inBar) {
-        // The row's own padding stays; only room added under it (safe area, the bar's height) goes.
-        if (pb - pt > 6) setStyle(el, 'padding-bottom', pt + 'px', 'padding');
-      } else if (pb > 0.5 && Math.abs(contentEnd(el, cs) - bar.getBoundingClientRect().bottom) <= 2) {
-        setStyle(el, 'padding-bottom', '0px', 'padding');
-      }
-      // A margin under something that ends with the box is only empty space.
-      if ((el === bar || !inBar) && px(cs.marginBottom) > 0.5 &&
-          Math.abs(el.getBoundingClientRect().bottom - bar.getBoundingClientRect().bottom) <= 2) {
-        setStyle(el, 'margin-bottom', '0px', 'margin');
-      }
-      // An empty block kept below the box (a stand-in for the bar).
-      if (el === bar || !inBar) {
-        for (let s = el.nextElementSibling; s; s = s.nextElementSibling) {
-          if (s.dataset.sgHidden || !isSpacer(s, bar)) continue;
-          if (hide(s, 'spacer')) bump(c.fixes, 'spacer');
-        }
-      }
-      if (el === document.documentElement) break;
-    }
-    // Something covered it only after the change (not a passing overlay): put everything back.
-    if (reachable && document.querySelector('[data-sg-fit],[data-sg-hidden="spacer"]') && !composerReachable(field, bar)) {
+    applyFit(field, bar, true);
+    // Checked on every pass, so a cover at load, a bar that comes later or a box
+    // scrolled into view later is still caught. Under a bottom bar, or covered
+    // with the fit but not without it: the fit did it, so put everything back
+    // for good (a page that scrolls has its room back to scroll the box clear).
+    // Covered both ways by a full-screen layer (loading): keep the fit and look
+    // again shortly.
+    if (document.querySelector('[data-sg-fit],[data-sg-hidden="spacer"]') && composerReachable(field, bar) === false) {
+      const underBar = coveredByBottomBar(field);
       unfitComposer();
-      composer.blocked = true;
-      c.reverted++;
+      if (underBar || composerReachable(field, bar) === true) {
+        composer.blocked = true;
+        c.reverted++;
+      } else {
+        applyFit(field, bar, false);
+        if ((composer.retries = (composer.retries || 0) + 1) <= 40) setTimeout(queueTidy, 500);
+      }
     }
     c.gapAfter = composerGap(bar);
     c.barH = Math.round(bar.getBoundingClientRect().height);
     c.fieldH = Math.round(field.getBoundingClientRect().height);
     reportComposer();
+  }
+  // Takes away the room under the box. count: false when re-applying (the stats count each change once).
+  function applyFit(field, bar, count) {
+    const c = stats.comments;
+    const k = kind => (count ? kind : '');
+    for (let el = field.parentElement; el; el = el.parentElement) {
+      const cs = getComputedStyle(el);
+      const inBar = el === bar || bar.contains(el);
+      // A bottom offset that lifted the box above Instagram's bar.
+      if ((cs.position === 'fixed' || cs.position === 'sticky') && px(cs.bottom) > 0.5 && px(cs.bottom) <= 200) {
+        setStyle(el, 'bottom', '0px', k('offset'));
+      }
+      const pb = px(cs.paddingBottom), pt = px(cs.paddingTop);
+      if (inBar) {
+        // The row's own padding stays; only room added under it (safe area, the bar's height) goes.
+        if (pb - pt > 6) setStyle(el, 'padding-bottom', pt + 'px', k('padding'));
+      } else if (pb > 0.5 && Math.abs(contentEnd(el, cs) - bar.getBoundingClientRect().bottom) <= 2) {
+        setStyle(el, 'padding-bottom', '0px', k('padding'));
+      }
+      // A margin under something that ends with the box is only empty space.
+      if ((el === bar || !inBar) && px(cs.marginBottom) > 0.5 &&
+          Math.abs(el.getBoundingClientRect().bottom - bar.getBoundingClientRect().bottom) <= 2) {
+        setStyle(el, 'margin-bottom', '0px', k('margin'));
+      }
+      // Instagram's main column is capped at the page less its bar
+      // (max-height: calc(100% - bar height)) even with the bar hidden. Lift the
+      // cap only if the box then ends lower and still on screen (a column that
+      // scrolls with the page would grow to its content and push the box away).
+      if (!inBar && !fitRefused.has(el) && cs.maxHeight !== 'none' && !('max-height' in (fitWas.get(el) || {})) &&
+          Math.abs(el.getBoundingClientRect().bottom - bar.getBoundingClientRect().bottom) <= 2) {
+        const was = bar.getBoundingClientRect().bottom;
+        // 100%, not none: still capped, so a column that would grow to its content stays put.
+        setStyle(el, 'max-height', '100%', '');
+        const now = bar.getBoundingClientRect().bottom;
+        const vh = window.visualViewport ? window.visualViewport.height : innerHeight;
+        if (now > was + 0.5 && now <= vh + 1) { if (count) bump(c.fixes, 'maxHeight'); }
+        else { unsetStyle(el, 'max-height'); fitRefused.add(el); }
+      }
+      // An empty block kept below the box (a stand-in for the bar).
+      if (el === bar || !inBar) {
+        for (let s = el.nextElementSibling; s; s = s.nextElementSibling) {
+          if (s.dataset.sgHidden || !isSpacer(s, bar)) continue;
+          if (hide(s, 'spacer') && count) bump(c.fixes, 'spacer');
+        }
+      }
+      if (el === document.documentElement) break;
+    }
   }
   function isSpacer(s, bar) {
     if (s.tagName === 'SCRIPT' || s.tagName === 'STYLE' || s.contains(bar)) return false;
@@ -3003,7 +3067,31 @@
     if (!(r.height > 0 && r.height <= 150) || r.top < bar.getBoundingClientRect().bottom - 1) return false;
     return !(s.textContent || '').trim() && !s.querySelector('img,video,svg,canvas,input,textarea,button,a,[role="button"],iframe');
   }
+  // The panel's tallest height at this width: well short of it means the keyboard is up.
+  function noteViewport() {
+    const h = window.visualViewport ? window.visualViewport.height : innerHeight;
+    if (innerWidth !== composer.vvW) { composer.vvW = innerWidth; composer.vvMax = 0; }
+    composer.vvMax = Math.max(composer.vvMax || 0, h);
+    return h;
+  }
+  // Back puts the keyboard away without leaving the box: shrink it to one line
+  // then too (the draft stays), and open it again when the keyboard comes back.
+  // Only after the keyboard was seen during this focus: a hardware keyboard
+  // never shrinks the panel, so the box stays open there.
+  function composerKeyboard() {
+    const f = composer.field;
+    const h = noteViewport();
+    if (!f || document.activeElement !== f || !composer.vvMax) return;
+    if (h < 0.85 * composer.vvMax) {
+      composer.kbSeen = true;
+      f.dataset.sgOpen = '1';
+    } else if (composer.kbSeen && h >= 0.9 * composer.vvMax) {
+      composer.kbSeen = false;
+      delete f.dataset.sgOpen;
+    }
+  }
   function composerFocus() {
+    composer.kbSeen = false;
     clearTimeout(composer.closing);
     if (composer.field) composer.field.dataset.sgOpen = '1';
     stats.comments.opened++;
@@ -3013,6 +3101,7 @@
   }
   function composerBlur() {
     const f = composer.field;
+    composer.kbSeen = false;
     // A moment later, so a tap on Post lands before the box shrinks under the finger.
     clearTimeout(composer.closing);
     composer.closing = setTimeout(safe(() => {
@@ -3044,11 +3133,15 @@
   if (CFG.role === 'comments') {
     // The keyboard opening or closing resizes the panel's page.
     const resized = safe(() => {
+      composerKeyboard();
       if (Date.now() < composer.keep || (composer.field && document.activeElement === composer.field)) keepComposerInView();
       queueTidy();
     });
     window.addEventListener('resize', resized);
     try { if (window.visualViewport) window.visualViewport.addEventListener('resize', resized); } catch (e) { /* no visual viewport */ }
+    // A box at the end of a page that scrolls is checked when it comes into view
+    // (queueTidy runs at most every 300ms).
+    window.addEventListener('scroll', safe(() => { if (composer.field) queueTidy(); }), { passive: true });
   }
 
   let tidyQueued = false;
