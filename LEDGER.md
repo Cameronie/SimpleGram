@@ -9,6 +9,10 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 - Sound on automatically for a Reel opened from DMs.
 - Scrolling (feed, messages, profiles) after an app restart — see B2.
 
+## Confirmed working on the phone (1.3)
+
+- The Favorites star shows in the bottom bar, right after Home, evenly spaced and in Instagram's colours (Cam's screenshot). Tapping it, and the rest of R5, not yet reported.
+
 ## Confirmed working on the phone (1.2)
 
 - No suggested posts: none slipped through (Suggested removed 48, 0 unrecognised pages, 0 posts with a Follow button). Posts shown because a friend liked them are removed too.
@@ -46,6 +50,7 @@ Plan conflicts between the batch-4 notes are settled in [`notes/batch-4/plan-dec
 | --- | --- | --- | --- |
 | B20 | Comments panel: only two comments fit at a time. Nearly half the panel is the empty "Add a comment…" area: a one-line box with a big blank band under it. The box should be one line high while reading, and grow only once you tap it and start typing. | SimpleGram hides Instagram's own bottom bar inside the comments panel, but Instagram's page still keeps that bar's room under the comment box, so the box floats above an empty band. The space Android keeps for the system navigation bar may add to it. | Comment box one line high, with nothing under it, so the comments get the space. Tapping it opens the keyboard and lets it grow as you type, as Instagram does; it shrinks back when you leave it. |
 | R10 | Full screen for videos and Reels in the Home feed, as an option. | The R8 swipe can't work on Home: a swipe down there is just scrolling, and the post view's "at the top of the page" condition never holds in a feed. Double-tap is Instagram's like, and two-finger gestures are SimpleGram's zoom. | **Proposed (Cam to pick):** (A, recommended) a small full-screen button in a corner of each feed video, kept clear of Instagram's sound and tag icons; a tap gives the same full screen as R8, left with a swipe up or down, or Back. (B) Turning the phone sideways while a video fills most of the screen goes full screen; turning back returns. Good for landscape videos, no new icon. (C) A "Full-screen video" item in the ⋮ menu for the video on screen: no icon, but two taps. A and B can both ship. |
+| R11 | Videos in the Home feed (and elsewhere) can only be played or paused; no way to rewind a part you missed, short of waiting for the whole video to loop. | Instagram's website gives feed videos no seek bar (the app has one on Reels). The video element itself can jump to any point; it just has no control for it. | **Proposed:** when a video is paused, a thin seek bar appears along its bottom edge: drag it, or tap a point, to jump there; it goes away when the video plays, so nothing covers a playing video. The same bar in the full-screen view (R8/R10), where a tap pauses. Alternative if Cam prefers: an always-visible thin progress line, draggable, like the app's Reels. |
 
 ## Batch 4 — fixed (unconfirmed) in 1.3 (reported against 1.2)
 
