@@ -248,6 +248,102 @@ test('B24 data: Reels chains elsewhere work as before; a DM chain off a DM page 
   assert.equal(conn.data.xdt_api__v1__clips__connected__connection_v2.page_info.has_next_page, false);
 });
 
+// A Reel sent while the chat is open arrives as a live message (a slide delta):
+// no list, nothing but the card's link. Read with JSON.parse, as the realtime
+// channel does.
+function sliceDelta(code) {
+  return { data: { slide_delta_processor: [{ __typename: 'SlideUQPPNewMessage', message: {
+    message_id: 'mid.$delta1', timestamp_ms: '1700000000999', sender_fbid: '77',
+    content: { xma: [{ target_url: `https://www.instagram.com/reel/${code}/?igsh=abc`, title: 'card', subtitle: 'friend' }] } } }] } };
+}
+function slideThread(codes) {
+  return { data: { xfb_slide_thread_messages: { edges: codes.map((c, i) => ({ node: {
+    message_id: 'm' + i, content: { xma: [{ target_url: `https://www.instagram.com/reel/${c}/`, title: 'card' }] } } })),
+    page_info: { has_next_page: true, end_cursor: 'o' } } } };
+}
+
+test('B24 data: a Reel sent while the chat is open keeps its own place in its chain (old Reels known, the new one too)', async () => {
+  const page = await openPage(THREAD_URL, '<!doctype html><body></body>');
+  await parse(page, slideThread(['OLD00001', 'OLD00002']));
+  const delta = JSON.stringify(sliceDelta('NEWSENT1'));
+  // None of the words that send other answers through the filter.
+  assert.doesNotMatch(delta, /"(?:edges|items|image_versions2|video_versions)"/);
+  const back = await parse(page, sliceDelta('NEWSENT1'));
+  assert.equal(back.data.slide_delta_processor[0].message.content.xma.length, 1, 'the message itself is untouched');
+  assert.ok(await page.evaluate(() => window.__sg.b24Sent.codes.has('NEWSENT1')), 'the new Reel is known as sent');
+  const out = await parse(page, chainByKey([clip('NEWSENT1'), clip('SUGG001'), clip('SUGG002')]));
+  assert.deepEqual(keyCodes(out), ['NEWSENT1']);
+  assert.equal((await dm(page)).keptSent, 1);
+  // A later page of the same chain keeps nothing.
+  assert.deepEqual(keyCodes(await parse(page, chainByKey([clip('SUGG003'), clip('SUGG004')]))), []);
+});
+
+test('B24 data: an answer with none of the thread\'s known Reels keeps its first one (the one asked for), not nothing', async () => {
+  const page = await openPage(THREAD_URL, '<!doctype html><body></body>');
+  await parse(page, slideThread(['OLD00001', 'OLD00002']));
+  // The new Reel's message was never seen.
+  const out = await parse(page, chainByKey([clip('NEWSENT1'), clip('SUGG001'), clip('SUGG002')]));
+  assert.deepEqual(keyCodes(out), ['NEWSENT1']);
+  assert.equal((await dm(page)).keptFirst, 1);
+  assert.deepEqual(keyCodes(await parse(page, chainByKey([clip('SUGG003'), clip('SUGG004')]))), [], 'its next page brings nothing');
+  // Still never a Reel Instagram marks as recommended.
+  const p2 = await openPage(THREAD_URL, '<!doctype html><body></body>');
+  await parse(p2, slideThread(['OLD00001']));
+  assert.deepEqual(keyCodes(await parse(p2, chainByKey([clip('SUGG001', { inventory_source: 'clips_chaining_recommended' }), clip('SUGG002')]))), []);
+});
+
+// A chat whose Reel bubbles carry no link (pressables), and a viewer: full
+// screen, or a landscape Reel not in a dialog (never counted as open).
+const NOLINKS = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+  <div id="thread" style="position:fixed;left:0;top:60px;width:412px;height:795px;overflow-y:auto">
+    <div style="height:200px">older</div>
+    <div role="button" id="bA" style="width:200px;height:250px;background:#ccc">Reel A</div>
+    <div role="button" id="bB" style="width:200px;height:250px;background:#aaa">Reel B</div>
+  </div>
+  <script>
+    window.openViewer = function (land) {
+      const d = document.createElement('div');
+      d.id = 'viewer';
+      d.style.cssText = 'position:fixed;inset:0;background:#000;z-index:5';
+      d.innerHTML = '<video muted playsinline style="' + (land ? 'position:absolute;top:340px;left:0;width:412px;height:232px' : 'width:412px;height:915px;display:block') + '"></video>';
+      document.body.appendChild(d);
+    };
+    window.closeViewer = () => { const d = document.getElementById('viewer'); if (d) d.remove(); };
+  </script></body></html>`;
+
+test('B24 data: a guessed Reel holds for its own opening only; the next Reel tapped keeps its place', async () => {
+  const B = () => [clip('SENTBBB'), clip('SUGG004')];
+  // A's answer lands after its viewer was closed (a slow network).
+  let page = await openPage(THREAD_URL, NOLINKS);
+  await tapAt(page, 100, 400);
+  await page.evaluate(() => window.openViewer(false));
+  await page.waitForFunction(() => window.__sg.dmReelOpen(), null, { timeout: 3000 });
+  await page.evaluate(() => window.closeViewer());
+  await page.waitForFunction(() => !window.__sg.dmReelOpen(), null, { timeout: 3000 });
+  assert.deepEqual(keyCodes(await parse(page, chainByKey([clip('SENTAAA'), clip('SUGG001')]))), ['SENTAAA']);
+  await tapAt(page, 100, 650);
+  await page.evaluate(() => window.openViewer(false));
+  assert.deepEqual(keyCodes(await parse(page, chainByKey(B()))), ['SENTBBB']);
+  // A landscape Reel's viewer, never counted as open (so never closed).
+  page = await openPage(THREAD_URL, NOLINKS);
+  await tapAt(page, 100, 400);
+  await page.evaluate(() => window.openViewer(true));
+  await page.waitForTimeout(400);
+  assert.equal(await page.evaluate(() => window.__sg.dmReelOpen()), false);
+  assert.deepEqual(keyCodes(await parse(page, chainByKey([clip('SENTAAA'), clip('SUGG001')]))), ['SENTAAA']);
+  await page.evaluate(() => window.closeViewer());
+  await tapAt(page, 100, 650);
+  await page.evaluate(() => window.openViewer(false));
+  assert.deepEqual(keyCodes(await parse(page, chainByKey(B()))), ['SENTBBB']);
+  // No viewer noticed at all (Back before its video was drawn).
+  page = await openPage(THREAD_URL, NOLINKS);
+  await tapAt(page, 100, 400);
+  assert.deepEqual(keyCodes(await parse(page, chainByKey([clip('SENTAAA'), clip('SUGG001')]))), ['SENTAAA']);
+  await tapAt(page, 100, 650);
+  assert.deepEqual(keyCodes(await parse(page, chainByKey(B()))), ['SENTBBB']);
+  assert.deepEqual(await page.evaluate(() => [...window.__sg.b24Sent.codes]), ['SENTBBB'], 'A\'s guess is gone');
+});
+
 /* ---------------- 2: the swipe in the open viewer ---------------- */
 
 // A chat (its list scrolls) and, once opened, Instagram's Reel viewer over it:
@@ -365,6 +461,33 @@ test('B24 swipe: a chat\'s own videos are never taken for the viewer; a landscap
   });
   await page.waitForFunction(() => window.__sg.dmReelOpen(), null, { timeout: 3000 });
   assert.deepEqual(await page.evaluate(() => window.__blocking()), ['touchmove']);
+});
+
+test('B24 swipe: typing in a chat with the keyboard up, a video message is not taken for the viewer; the chat scrolls', async () => {
+  // The chat: header, its list, and the message box. A portrait video message at the end.
+  const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
+    <div style="position:fixed;inset:0;display:flex;flex-direction:column"><div style="height:60px;flex:none">friend</div>
+      <div id="thread" style="flex:1;overflow-y:auto">${Array.from({ length: 60 }, (_, i) => `<div style="height:40px">message ${i}</div>`).join('')}
+        <video id="msgv" muted playsinline style="width:250px;height:440px;display:block;margin-left:150px"></video><div style="height:8px"></div></div>
+      <div style="height:56px;flex:none"><div id="field" contenteditable="true" role="textbox" style="height:40px;border:1px solid #888"></div></div></div></body></html>`;
+  const page = await openPage(THREAD_URL, html, { init: watchListeners });
+  await page.evaluate(() => { const t = document.getElementById('thread'); t.scrollTop = t.scrollHeight; });
+  await page.waitForTimeout(300);
+  // The keyboard comes up: the app makes the page shorter.
+  await page.setViewportSize({ width: 412, height: 580 });
+  await page.evaluate(() => { const t = document.getElementById('thread'); t.scrollTop = t.scrollHeight; document.getElementById('field').focus(); });
+  await page.keyboard.type('hey');
+  await page.evaluate(() => document.getElementById('msgv').dispatchEvent(new Event('loadedmetadata')));
+  await page.waitForTimeout(500);
+  assert.ok(await page.evaluate(() => document.getElementById('msgv').getBoundingClientRect().height >= 0.75 * innerHeight), 'the bubble looks big');
+  assert.equal(await page.evaluate(() => window.__sg.dmReelOpen()), false);
+  assert.deepEqual(await page.evaluate(() => window.__blocking()), []);
+  await watchMoves(page);
+  const before = await page.evaluate(() => document.getElementById('thread').scrollTop);
+  await drag(page, [100, 150], [100, 500]);
+  assert.ok(await page.evaluate(() => document.getElementById('thread').scrollTop) < before - 100, 'the chat scrolled');
+  assert.equal(await page.evaluate(() => window.__held), 0);
+  assert.equal((await dm(page)).swipes, 0);
 });
 
 // Touch moves held still (preventDefault), counted as they happen.
@@ -523,6 +646,86 @@ test('B24 slip: the sent Reel drawn again (a new element for the same Reel) is n
   const s = await dm(page);
   assert.deepEqual([s.hidden, s.header, s.moved], [0, 0, 0]);
   assert.equal(await page.evaluate(() => getComputedStyle(document.getElementById('sent2')).visibility), 'visible');
+});
+
+// The viewer paging sideways through the message's own videos (several videos
+// in one message, or a shared carousel): a scrolling carousel, or a pager that
+// keeps both slides in the page and moves them.
+function sidewaysViewer(kind) {
+  const vid = id => `<video id="${id}" src="/v/${id}.webm" muted playsinline loop style="width:412px;height:915px;display:block;background:#222"></video>`;
+  const head = '<div style="position:absolute;left:12px;top:14px;color:#fff;z-index:1">friend 9h ago</div>';
+  return kind === 'carousel'
+    ? `<div id="car" style="position:absolute;inset:0;display:flex;overflow-x:auto;scroll-snap-type:x mandatory">
+        <div style="flex:0 0 412px;position:relative;scroll-snap-align:start">${head}${vid('s1')}</div>
+        <div style="flex:0 0 412px;position:relative;scroll-snap-align:start">${vid('s2')}</div></div>`
+    : `<div id="track" style="position:absolute;top:0;left:0;width:824px;height:915px;display:flex">
+        <div style="flex:0 0 412px;position:relative">${head}${vid('s1')}</div>
+        <div style="flex:0 0 412px;position:relative">${vid('s2')}</div></div>`;
+}
+for (const kind of ['carousel', 'pager']) {
+  test(`B24 slip: paging sideways to the message's next video (${kind}) follows it: not hidden, not a suggestion`, async () => {
+    const page = await openPage(THREAD_URL, CHAT, { init: countHolds });
+    await page.evaluate(body => {
+      const d = document.createElement('div');
+      d.setAttribute('role', 'dialog');
+      d.style.cssText = 'position:fixed;inset:0;background:#000;z-index:5';
+      d.innerHTML = body;
+      document.body.appendChild(d);
+      for (const v of d.querySelectorAll('video')) v.play().catch(() => {});
+    }, sidewaysViewer(kind));
+    await page.waitForFunction(() => window.__sg.dmReelOpen(), null, { timeout: 3000 });
+    await drag(page, [380, 450], [30, 455], { steps: 10 });
+    if (kind === 'pager') {
+      await page.evaluate(() => { document.getElementById('track').style.transform = 'translateX(-412px)'; document.getElementById('s2').dispatchEvent(new Event('playing')); });
+    }
+    await page.waitForTimeout(900);
+    const r = await page.evaluate(() => {
+      const s2 = document.getElementById('s2');
+      return { left: Math.round(s2.getBoundingClientRect().left), hidden: !!s2.closest('[data-sg-dm-hide]'), vis: getComputedStyle(s2).visibility, paused: s2.paused };
+    });
+    assert.deepEqual(r, { left: 0, hidden: false, vis: 'visible', paused: false });
+    let s = await dm(page);
+    assert.deepEqual([s.moved, s.header, s.hidden, s.stuck, s.returned], [0, 0, 0, 0, 0]);
+    assert.ok(s.sideways >= 1);
+    assert.equal((await sent(page, 'toast')).length, 0);
+    // A vertical swipe on the second video is still held.
+    await page.evaluate(() => { window.__pd = 0; });
+    await drag(page, [200, 700], [200, 200]);
+    assert.ok(await page.evaluate(() => window.__pd) >= 6);
+    s = await dm(page);
+    assert.equal(s.swipes, 1);
+    assert.equal(await page.evaluate(() => window.__sg.dmReelOpen()), true);
+  });
+}
+
+test('B24 slip: a viewer that fades out and stays in the page counts as closed; the next one is watched as usual', async () => {
+  const page = await openPage(THREAD_URL, CHAT, { init: watchListeners });
+  await openViewer(page);
+  assert.deepEqual(await page.evaluate(() => window.__blocking()), ['touchmove']);
+  // Instagram fades its viewer out and leaves it mounted.
+  await page.evaluate(() => {
+    const v = document.getElementById('viewer');
+    v.style.opacity = '0';
+    v.style.pointerEvents = 'none';
+    // Its own names out of the way of the next viewer's.
+    v.id = 'old';
+    for (const el of v.querySelectorAll('[id]')) el.id = 'old-' + el.id;
+  });
+  await page.evaluate(() => { document.getElementById('thread').scrollTop += 200; });
+  await page.waitForFunction(() => !window.__sg.dmReelOpen(), null, { timeout: 3000 });
+  assert.deepEqual(await page.evaluate(() => window.__blocking()), []);
+  assert.equal((await dm(page)).closed, 1);
+  // The chat scrolls with nothing held.
+  await page.waitForTimeout(800);
+  assert.equal(await page.evaluate(() => window.__sg.dmReelOpen()), false, 'the faded one does not open again');
+  // The next viewer: its own Reel is the sent one, and a suggested one is caught.
+  await openViewer(page);
+  assert.equal((await dm(page)).opened, 2);
+  await page.evaluate(() => { document.getElementById('list').scrollTop = 915; });
+  await page.waitForFunction(() => window.__sg.stats.dmReel.returned === 1, null, { timeout: 3000 });
+  assert.equal(await page.evaluate(() => document.getElementById('two').dataset.sgDmHide), '1');
+  assert.equal(await page.evaluate(() => document.getElementById('list').scrollTop), 0);
+  assert.equal((await dm(page)).header, 1);
 });
 
 /* ---------------- The sent Reel: sound and autoplay ---------------- */

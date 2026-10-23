@@ -43,9 +43,10 @@
     // how many Reels the thread is known to share; opened/closed: the viewer;
     // swipes: vertical swipes held in it; header/moved: a suggested Reel seen on
     // screen anyway (its "Suggested" header / the list moved), hidden, then put
-    // back on the sent Reel (returned) or not (stuck).
+    // back on the sent Reel (returned) or not (stuck). sideways: the viewer
+    // paged to the message's next photo or video (followed, never hidden).
     dmReel: { trimmed: 0, lists: 0, byKey: 0, byShape: 0, keptSent: 0, keptFirst: 0, sentKnown: 0, opened: 0, closed: 0,
-      swipes: 0, header: 0, moved: 0, hidden: 0, returned: 0, stuck: 0 },
+      swipes: 0, header: 0, moved: 0, hidden: 0, returned: 0, stuck: 0, sideways: 0 },
   });
   function bump(o, k, n) { o[k] = (o[k] || 0) + (n == null ? 1 : n); }
   // Session storage that never throws (private windows, blocked storage).
@@ -1222,6 +1223,18 @@
       b24Sent.tapped = null;
     }
   }
+  // An opening's anchor (the Reel its chain answer kept) ends with that
+  // opening: when the viewer closes, or with your next tap in the chat (the
+  // viewer may never have been noticed, or its answer came late).
+  function b24DropGuess() {
+    if (b24Sent.guess) {
+      b24Sent.codes.delete(b24Sent.guess.code);
+      b24Sent.pks.delete(b24Sent.guess.pk);
+      b24Sent.pks.delete(b24Sent.guess.pk2);
+    }
+    b24Sent.anchored = false;
+    b24Sent.guess = null;
+  }
   function b24NoteCode(code, pk) {
     b24Thread();
     if (typeof code === 'string' && /^[A-Za-z0-9_-]{5,}$/.test(code) && !b24Sent.codes.has(code)) {
@@ -1285,9 +1298,11 @@
     return !!(m && ((m.code || m.shortcode) === t.code || (t.pk && mediaPk(m) === t.pk)));
   }
   // The viewer's chain: only the sent Reel stays (the one you tapped first, if
-  // the thread shares several). If nothing says which Reel was sent, the
-  // answer's first one is kept once (the one asked for, as trimChaining does),
-  // unless Instagram marks it as recommended.
+  // the thread shares several). If the answer holds none of the Reels known to
+  // be sent (a Reel that arrived while the chat was open may be unknown), its
+  // first one is kept (the one asked for, as trimChaining does) unless
+  // Instagram marks it as recommended. Either way the opening is then anchored:
+  // a later page of the same chain keeps nothing new.
   function b24TrimChain(v, via) {
     b24Thread();
     const dr = stats.dmReel;
@@ -1297,8 +1312,8 @@
       if (!before || !list.every(e => e && typeof e === 'object' && mediaOf(unitOf(e)))) return;
       let kept = list.filter(b24IsSent);
       if (kept.length > 1) kept = kept.filter(b24Tapped).concat(kept).slice(0, 1);
-      if (kept.length) dr.keptSent++;
-      else if (!b24Sent.codes.size && !b24Sent.pks.size && !b24Sent.anchored) {
+      if (kept.length) { dr.keptSent++; b24Sent.anchored = true; }
+      else if (!b24Sent.anchored) {
         const n = unitOf(list[0]), m = mediaOf(n) || n;
         if (m && typeof m === 'object' && !recommendedLike(n, m)) {
           kept = [list[0]];
@@ -1436,7 +1451,8 @@
   const wrappedParse = function parse(text, reviver) {
     const out = nativeParse.apply(this, arguments);
     if (out && typeof out === 'object' && (out.status === 'fail' || out.errors)) noteThrottle(out);
-    if (typeof text === 'string' && text.length > 150 && out && typeof out === 'object' && INTEREST.test(text)) {
+    if (typeof text === 'string' && text.length > 150 && out && typeof out === 'object' &&
+        (INTEREST.test(text) || (text.indexOf('"target_url"') >= 0 && CFG.role === 'main' && route() === 'direct'))) {
       try { cleanse(out, 'parse'); } catch (e) { stats.errors++; }
     }
     return out;
@@ -3932,7 +3948,7 @@
   window.addEventListener('touchstart', safe(e => {
     swipe = null;
     const r = route();
-    if (r === 'direct' && CFG.role === 'main' && !b24View.open && e.touches.length === 1) b24NoteTap(e.target);
+    if (r === 'direct' && CFG.role === 'main' && !b24View.open && e.touches.length === 1) { b24DropGuess(); b24NoteTap(e.target); }
     if (!guardOn || e.touches.length !== 1) return;
     if (r === 'direct' && b24View.open) { b24Arm(e); return; }
     if (r === 'home' || r === 'direct' || r === 'story') return;
@@ -3966,14 +3982,18 @@
   // full-screen dialog. A video in the chat's own list never counts unless it
   // is a whole screen tall (a chat's videos are bubbles), so a chat with a big
   // video in it keeps scrolling. A hidden suggested one doesn't count.
+  // "The screen", for a viewer not yet open, is the page's full height: the
+  // keyboard (the app resizes the page for it) makes a chat's bubble look big.
   function b24ViewerVideo(v) {
-    const screen = innerWidth * innerHeight, a = onScreenArea(v);
-    if (a < 0.1 * screen) return false;
+    const fullH = b24FullHeight();
+    const H = b24View.open ? innerHeight : fullH;
+    const screen = innerWidth * H, a = onScreenArea(v);
+    if (a < 0.1 * innerWidth * innerHeight) return false;
     for (let el = v.parentElement, i = 0; el && el !== document.body && i < 25; el = el.parentElement, i++) {
       const cs = getComputedStyle(el);
       if (!/auto|scroll/.test(cs.overflowY) || el.scrollHeight <= el.clientHeight + 20) continue;
       if (!/(^|\s)(y|both|block)(\s|$)/.test(cs.scrollSnapType)) {
-        return a > 0.45 * screen && v.getBoundingClientRect().height >= 0.75 * innerHeight;
+        return a > 0.45 * screen && v.getBoundingClientRect().height >= 0.75 * H;
       }
       break;
     }
@@ -3982,19 +4002,43 @@
     const r = dlg && dlg.getBoundingClientRect();
     return !!(r && r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.85);
   }
+  // The page's height without the keyboard: the tallest seen at this width
+  // (a turn of the phone starts again).
+  let b24TallW = 0, b24TallH = 0;
+  function b24FullHeight() {
+    if (innerWidth !== b24TallW) { b24TallW = innerWidth; b24TallH = 0; }
+    b24TallH = Math.max(b24TallH, innerHeight);
+    return b24TallH;
+  }
+  // Faded out (Instagram may close its viewer that way and keep it in the page).
+  // visibility is inherited; opacity is not, so every ancestor is looked at.
+  function b24Faded(el) {
+    if (getComputedStyle(el).visibility === 'hidden') return true;
+    for (let n = el; n && n !== document.body; n = n.parentElement) {
+      if (parseFloat(getComputedStyle(n).opacity) === 0) return true;
+    }
+    return false;
+  }
+  // A viewer's video that faded out when it closed: never taken for a new
+  // opening while it stays faded.
+  const b24FadedOut = new WeakSet();
   // How much of a video is on screen (0 to 1).
   function b24Shown(v) {
     const r = v.getBoundingClientRect();
     return r.width * r.height > 0 ? onScreenArea(v) / (r.width * r.height) : 0;
   }
+  // The viewer's video now: the biggest one not faded out. A faded one only
+  // opens a viewer (one fading in) and never keeps a viewer open.
   function b24BigVideo() {
-    let best = null, area = 0;
+    let best = null, area = 0, faint = null, faintArea = 0;
     for (const v of document.getElementsByTagName('video')) {
       if (v.dataset.sgOwn || v.closest('[data-sg-hidden],[data-sg-dm-hide]')) continue;
       const a = onScreenArea(v);
-      if (a > area && b24ViewerVideo(v)) { best = v; area = a; }
+      if ((a <= area && a <= faintArea) || !b24ViewerVideo(v)) continue;
+      if (!b24Faded(v)) { if (a > area) { best = v; area = a; } }
+      else if (a > faintArea && !b24FadedOut.has(v)) { faint = v; faintArea = a; }
     }
-    return best;
+    return best || (b24View.open ? null : faint);
   }
   // The list the viewer's Reels sit in (most of a screen tall), if it scrolls.
   function b24Scroller(v) {
@@ -4070,6 +4114,8 @@
     syncSwipeGuard();
   }
   function b24Close() {
+    const was = b24View.video;
+    if (was && was.isConnected && b24Faded(was)) b24FadedOut.add(was);
     b24View.open = false;
     b24View.video = null;
     b24View.root = null;
@@ -4078,13 +4124,7 @@
     document.removeEventListener('scroll', b24OnScroll, true);
     for (const el of document.querySelectorAll('[data-sg-dm-hide]')) delete el.dataset.sgDmHide;
     // A guess (the answer's first Reel) holds for one opening only.
-    if (b24Sent.guess) {
-      b24Sent.codes.delete(b24Sent.guess.code);
-      b24Sent.pks.delete(b24Sent.guess.pk);
-      b24Sent.pks.delete(b24Sent.guess.pk2);
-    }
-    b24Sent.anchored = false;
-    b24Sent.guess = null;
+    b24DropGuess();
     syncSwipeGuard();
   }
   const b24OnScroll = safe(() => {
@@ -4127,13 +4167,16 @@
   function b24Check() {
     if (CFG.role !== 'main') return;
     if (route() !== 'direct') { if (b24View.open) b24Close(); return; }
+    b24FullHeight();   // seen before the keyboard comes up
     const cur = b24BigVideo();
     if (!b24View.open) { if (cur) b24Open(cur); return; }
     const sent = b24View.video;
     if (!cur) {
-      // A suggested Reel SimpleGram hid still fills the screen: the viewer is open.
+      // A suggested Reel SimpleGram hid still fills the screen: the viewer is
+      // open (unless the viewer around it faded out).
       const held = document.querySelector('[data-sg-dm-hide]');
-      if (held && onScreenArea(held) > 0.3 * innerWidth * innerHeight) { b24View.misses = 0; return; }
+      if (held && onScreenArea(held) > 0.3 * innerWidth * innerHeight &&
+        !(held.parentElement && b24Faded(held.parentElement))) { b24View.misses = 0; return; }
       // Gone (twice, a moment apart): the viewer closed.
       if (++b24View.misses >= 2) b24Close();
       else setTimeout(safe(b24Check), 400);
@@ -4148,7 +4191,22 @@
       b24View.root = b24RootOf(cur);
       return;
     }
-    else if (b24Shown(sent) < 0.2) why = 'moved';
+    else if (b24Shown(sent) < 0.2) {
+      // Still where it stood, top to bottom: the viewer paged sideways (the
+      // message's next photo or video, a shared carousel), not on into
+      // suggested Reels. The new one is followed (its vertical swipes held).
+      const r = sent.getBoundingClientRect();
+      const vy = r.height > 0 ? (Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)) / r.height : 0;
+      if (r.width > 0 && vy >= 0.8) {
+        stats.dmReel.sideways++;
+        b24View.video = cur;
+        b24View.root = b24RootOf(cur);
+        b24View.sc = b24Scroller(cur);
+        b24View.top = b24View.sc ? b24View.sc.scrollTop : 0;
+        return;
+      }
+      why = 'moved';
+    }
     if (!why) return;
     stats.dmReel[why]++;
     b24Hide(cur);
