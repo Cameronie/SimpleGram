@@ -542,6 +542,10 @@ test('Home tab on Following while a result is opening calls the open off and loa
   assert.equal(await searchUp(page), false);
   assert.equal((await opens(page)).cancelled, 1);
   await sleep(9000);   // past every full-load rule: the result is never loaded
-  assert.equal(await loads(page), 1);
-  assert.ok(!(await page.evaluate(() => location.pathname)).startsWith('/p/'));
+  // This bridge only records openFeed, so the router's late push of the
+  // result is replaced by Home itself (one load of '/'; a step back would
+  // also call off the app's load of Home).
+  assert.equal(await loads(page), 2);
+  assert.equal(await page.evaluate(() => location.pathname + location.search), '/');
+  assert.equal((await opens(page)).cancelled, 1);
 });

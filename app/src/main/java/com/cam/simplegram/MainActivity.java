@@ -1212,7 +1212,22 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             b.append("  Home tab: to the top ").append(feed.optInt("homeTapTop"))
                     .append(" · let through ").append(feed.optInt("homeTapRefresh"))
                     .append(" · fresh Home ").append(full == null ? 0 : full.optInt("bar") + full.optInt("header"))
-                    .append(full == null ? "" : " (bar " + full.optInt("bar") + ", header " + full.optInt("header") + ")").append('\n')
+                    .append(full == null ? "" : " (bar " + full.optInt("bar") + ", header " + full.optInt("header") + ")").append('\n');
+            // R5: whether the star found Instagram's bar and lines up with it (shapes only).
+            JSONObject geo = nav == null ? null : nav.optJSONObject("geo");
+            b.append("  Favorites star: ").append(nav == null || nav.optInt("inserted") == 0 ? "not in the bar" : "in the bar");
+            if (geo != null) {
+                b.append(" (").append(geo.optInt("items")).append(" items, off by ").append(geo.optInt("dy")).append(" px)");
+            }
+            if (nav != null && nav.optInt("waitReactGaveUp") > 0) b.append(" · bar never ready ").append(nav.optInt("waitReactGaveUp"));
+            b.append(" · taps ").append(nav == null ? 0 : nav.optInt("taps"));
+            if (nav != null) {
+                b.append(" (to the top ").append(nav.optInt("top"))
+                        .append(", refreshed ").append(nav.optInt("refresh"))
+                        .append(", held ").append(nav.optInt("refreshHeld"))
+                        .append(", search closed ").append(nav.optInt("closedSearch")).append(')');
+            }
+            b.append('\n')
                     .append("  First-page anchors: ").append(feed.optInt("anchor"));
             if (kinds != null) {
                 b.append(" (seen ").append(kinds.optInt("seen")).append(", caught-up line ").append(kinds.optInt("marker"))
