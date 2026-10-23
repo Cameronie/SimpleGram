@@ -1534,8 +1534,17 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         b.append("\nElsewhere\n")
                 .append("  Ads removed (Stories etc.): ").append(stats.optInt("ads")).append('\n')
                 .append("  Endless-Reels items blocked: ").append(stats.optInt("chainingTrimmed")).append('\n')
-                .append("  Reel swipes blocked: ").append(stats.optInt("swipesBlocked")).append('\n')
-                .append("  Explore items removed: ").append(stats.optInt("exploreBlanked")).append('\n')
+                .append("  Reel swipes blocked: ").append(stats.optInt("swipesBlocked")).append('\n');
+        // B24: a Reel sent in a DM (counts only).
+        JSONObject dmReel = stats.optJSONObject("dmReel");
+        if (dmReel != null) {
+            b.append("  DM Reels: suggested removed ").append(dmReel.optInt("trimmed"))
+                    .append(" · swipes held ").append(dmReel.optInt("swipes"))
+                    .append(" · hidden on screen ").append(dmReel.optInt("hidden"))
+                    .append(" (put back ").append(dmReel.optInt("returned"))
+                    .append(", stuck ").append(dmReel.optInt("stuck")).append(")\n");
+        }
+        b.append("  Explore items removed: ").append(stats.optInt("exploreBlanked")).append('\n')
                 .append("  Suggested accounts removed: ").append(stats.optInt("suggestionsBlanked")).append('\n');
         if (dom != null) {
             b.append("\nBackup filter (hidden on screen)\n")
