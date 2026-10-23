@@ -7,8 +7,8 @@ Nothing in 1.4 could be tried against a signed-in Instagram before release, so y
 1. Use full-screen video a lot: a tap on a feed video (R10), the swipe down at the top of a post (R8), and a Story's Reel (R9). Leave it with swipes and with Back, including quick swipes one after another.
 2. Scrolling should keep working everywhere afterwards, including search results.
 3. If scrolling ever stops anyway, **don't restart**:
-   - First tap ⋮ → Copy details right away and send it.
-   - Then try the "Scrolling stopped. Tap to fix" button if it shows, or ⋮ → More… → Fix scrolling.
+   - First take Copy details right away (⋮ → More… → Filter status → Copy details) and send it.
+   - Then try the "Scrolling stopped. Tap to fix" button if it shows, or ⋮ → Fix scrolling.
    - Tell me whether that brought scrolling back.
 
 ## Videos (R10, R11, B21)

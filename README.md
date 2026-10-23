@@ -54,7 +54,7 @@ Extras:
 - **Story Reels**: on a Story that shares a Reel, swipe up to watch the Reel full screen with its
   account, caption, counts, like, save, comments and share; the Story waits.
 - **Self-repair**: if scrolling ever stops working, a "Scrolling stopped. Tap to fix" button (or
-  ⋮ → More… → Fix scrolling) rebuilds the page view in place.
+  ⋮ → Fix scrolling) rebuilds the page view in place.
 - **Screen stays on** while a video plays.
 - **Following** (newest first) and **Favorites** feeds in the menu too (these show everything).
 - **Clean screenshots**: hide the menu button and system bars, tap to bring them back.
