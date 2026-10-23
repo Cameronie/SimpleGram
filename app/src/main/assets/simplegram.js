@@ -214,7 +214,9 @@
   // (^|__)ayml(__|$): the accounts Instagram suggests when Home has nothing new (xdt_api__v1__ayml__strict).
   const SUGGEST_KEY = /^suggested_users(_v2)?$|discover__ayml|^ayml|(^|__)ayml(__|$)|suggested_accounts|similar_accounts|discover__chaining|^chaining_results$|^chaining_users$/i;
   const AD_CONTAINER_KEY = /injected_story|story_ads|ad_media_items|ads_pool|^ads$|xdt_injected/i;
-  const SEARCH_KEY = /fbsearch|top_serp|keyword_search|^media_grid$|serp_/i;
+  // Instagram's own search pages, and its place page (xdt_location_get_web_info_tab,
+  // a post's location link or "Open Instagram's own page"): 3 pages, then they stop.
+  const SEARCH_KEY = /fbsearch|top_serp|keyword_search|^media_grid$|serp_|^xdt_location_get_web_info_tab(_connection)?$/i;
   const AD_LIST_KEY = /^(edges|items|feed_items|reels_media|reels|medias|media|stories|clips|tray|story_items|fill_items)$/;
   let streamed = false;
   let ownFetch = false;     // SimpleGram's own search requests

@@ -18,8 +18,8 @@ const HYATT = { location: { pk: '213385402', name: 'Hyatt Regency Waikiki' }, ti
 const PLACE_KEYS = ['location_id', 'first', 'after', 'tab', 'page_size_override'];
 
 // Opens search on a page served with `api`; `urls` collects every request made.
-async function start(api, html = NAVPAGE) {
-  const page = await open('https://www.instagram.com/', html, { api });
+async function start(api, html = NAVPAGE, url = 'https://www.instagram.com/') {
+  const page = await open(url, html, { api });
   const urls = [];
   page.on('request', r => urls.push(r.method() + ' ' + r.url()));
   await openSearchTab(page);
@@ -524,6 +524,45 @@ test('R4: Instagram\'s own search page (the fallback) still stops after 3 pages'
   }, { data: { xdt_fbsearch__top_serp_graphql: keywordGrid(['SRCH001'], 'next') } });
   assert.deepEqual(flags, [true, true, false, false]);
   assert.equal(await page.evaluate(() => window.__sg.stats.searchStopped), 2);
+});
+
+test('R4: Instagram\'s own place page (a location link, or the Places fallback) also stops after 3 pages', async () => {
+  const page = await open('https://www.instagram.com/explore/locations/213385402/hyatt-regency-waikiki/', BLANK);
+  const flags = await page.evaluate(p => {
+    const out = [];
+    for (let i = 0; i < 4; i++) out.push(JSON.parse(JSON.stringify(p)).data.xdt_location_get_web_info_tab.page_info.has_next_page);
+    return out;
+  }, { data: { xdt_location_get_web_info_tab: placePage(['PLC0001'], 'x') } });
+  assert.deepEqual(flags, [true, true, false, false]);
+  assert.equal(await page.evaluate(() => window.__sg.stats.searchStopped), 2);
+  // Its own count: the Most recent tab starts again from 1.
+  const recent = await page.evaluate(p => {
+    history.pushState({}, '', '/explore/locations/213385402/hyatt-regency-waikiki/recent/');
+    return JSON.parse(JSON.stringify(p)).data.xdt_location_get_web_info_tab_connection.page_info.has_next_page;
+  }, { data: { xdt_location_get_web_info_tab_connection: placePage(['PLC0002'], 'x') } });
+  assert.equal(recent, true);
+});
+
+test('R4: SimpleGram\'s own place grid, opened over Instagram\'s place page, still pages past 3 taps', async () => {
+  const s = placeSite(after => {
+    const n = after == null ? 0 : Number(after.slice(1));
+    return placePage(codes('Q' + n + 'X', 24), 'c' + (n + 1));
+  });
+  const { page } = await start(Object.assign(s.api, placesApi(HYATT)), NAVPAGE,
+    'https://www.instagram.com/explore/locations/213385402/hyatt-regency-waikiki/');
+  assert.equal(await page.evaluate(() => window.__sg.route()), 'search');
+  await query(page, 'hyatt');
+  await openPlace(page);
+  await waitCells(page, 24);
+  for (let i = 1; i <= 4; i++) {
+    await waitText(page, 'Show more');
+    await shadowClick(page, 'Show more');
+    await waitCells(page, 24 * (i + 1));
+  }
+  await waitIdle(page);
+  assert.ok((await searchText(page)).includes('Show more'));
+  assert.equal(conn(s).length, 4);
+  assert.equal(await page.evaluate(() => window.__sg.stats.searchStopped), 0);
 });
 
 test('R4: a page with fewer than 18 new posts chains one more in the same tap; never more than 2 a tap', async () => {
