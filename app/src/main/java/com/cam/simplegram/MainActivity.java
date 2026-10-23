@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.RectF;
@@ -510,6 +511,19 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private final class Chrome extends WebChromeClient {
+        private Bitmap noPoster;
+
+        /**
+         * A video with no poster, before its first frame: nothing (its black box
+         * shows), not WebView's gray play icon. R10 lifts a feed video without
+         * Instagram's cover picture, and R9's own Reel video has no poster.
+         */
+        @Override
+        public Bitmap getDefaultVideoPoster() {
+            if (noPoster == null) noPoster = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+            return noPoster;
+        }
+
         @Override
         public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
             if (fileCallback != null) fileCallback.onReceiveValue(null);
@@ -1347,6 +1361,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 "Following feed (newest first)",
                 "Favorites feed",
                 "Refresh",
+                "Fix scrolling",
                 "Hide controls for screenshot",
                 "More…",
         };
@@ -1380,6 +1395,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     web.reload();
                     break;
                 case 7:
+                    // B25's escape hatch: a new page view, at any time.
+                    fixScrolling();
+                    break;
+                case 8:
                     keepHold[0] = true;
                     enterScreenshot();
                     break;
@@ -1401,7 +1420,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 "Continue Home into Following: " + (continueHome() ? "On" : "Off"),
                 "Open Instagram links with SimpleGram…",
                 "Open copied Instagram link",
-                "Fix scrolling",
                 "About SimpleGram",
         };
         dialog().setItems(items, (x, which) -> {
@@ -1417,10 +1435,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     break;
                 case 3:
                     openCopiedLink();
-                    break;
-                case 4:
-                    // B25's escape hatch: a new page view, at any time.
-                    fixScrolling();
                     break;
                 default:
                     dialog().setTitle("SimpleGram " + BuildConfig.VERSION_NAME)
@@ -2426,7 +2440,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         js("gestureReset");
     }
 
-    /** ⋮ → More… → Fix scrolling. */
+    /** ⋮ → Fix scrolling. */
     private void fixScrolling() {
         manualFix++;
         stuckChipWanted = false;

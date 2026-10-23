@@ -73,6 +73,11 @@ final class ZoomFrame extends FrameLayout {
     private final int[] lastMoves = new int[4];
     private int lastMovesAt;
 
+    // The touch this frame handed on to the page that hasn't ended there yet,
+    // and its latest event: the app's own press (hold) must end it first.
+    private boolean pageOpen;
+    private MotionEvent pageLast;
+
     ZoomFrame(Context context, Listener listener) {
         super(context);
         this.listener = listener;
@@ -112,7 +117,15 @@ final class ZoomFrame extends FrameLayout {
 
     /** Hands a touch event on to the page, counting the MOVEs that get there. */
     private boolean toPage(MotionEvent ev) {
-        if (ev.getActionMasked() == MotionEvent.ACTION_MOVE) seqMoves++;
+        int a = ev.getActionMasked();
+        if (a == MotionEvent.ACTION_DOWN) pageOpen = true;
+        // After hold() ended it, the rest of that touch no longer reaches the page.
+        if (a == MotionEvent.ACTION_MOVE && pageOpen) seqMoves++;
+        if (pageOpen) {
+            if (pageLast != null) pageLast.recycle();
+            pageLast = MotionEvent.obtain(ev);
+        }
+        if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) pageOpen = false;
         return super.dispatchTouchEvent(ev);
     }
 
@@ -137,6 +150,8 @@ final class ZoomFrame extends FrameLayout {
             owned = true;
             if (listener.storyMode() && !holding) {
                 // Leave the first finger down on the Story: Instagram pauses it.
+                // It is the hold now; dropHold ends it.
+                pageOpen = false;
                 holding = true;
                 listener.onHoldChanged(true);
                 holdDownTime = ev.getDownTime();
@@ -319,7 +334,10 @@ final class ZoomFrame extends FrameLayout {
      * Presses and holds the middle of the page (pauses a Story while a menu is open).
      * The press and its release go straight to the page view, not through this
      * frame's touch target: a release that went astray would leave the web engine
-     * believing a finger is still down (B25).
+     * believing a finger is still down (B25). A finger already down on the page
+     * (the menu tapped with another finger) is cancelled first, through this
+     * frame so the rest of that touch stays off the page: a second press over
+     * an open touch would orphan it in the web engine (B25 again).
      */
     void hold() {
         if (holding || page() == null) return;
@@ -329,6 +347,13 @@ final class ZoomFrame extends FrameLayout {
         holdX = getWidth() / 2f;
         holdY = getHeight() / 2f;
         listener.onHoldChanged(true);
+        if (pageOpen && pageLast != null) {
+            MotionEvent c = MotionEvent.obtain(pageLast);
+            c.setAction(MotionEvent.ACTION_CANCEL);
+            super.dispatchTouchEvent(c);
+            c.recycle();
+        }
+        pageOpen = false;
         MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, holdX, holdY, 0);
         page().dispatchTouchEvent(down);
         down.recycle();
@@ -406,6 +431,7 @@ final class ZoomFrame extends FrameLayout {
     }
 
     private void cancelPage(MotionEvent ev) {
+        pageOpen = false;
         MotionEvent cancel = MotionEvent.obtain(ev);
         cancel.setAction(MotionEvent.ACTION_CANCEL);
         super.dispatchTouchEvent(cancel);

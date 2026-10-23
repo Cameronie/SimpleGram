@@ -799,6 +799,89 @@ public class ShellTest {
         }
     }
 
+    /**
+     * B25 again: a finger already down on a Story (not in full screen) while
+     * another finger taps ⋮. The menu's hold must end that touch on the page
+     * before pressing, and the rest of it must stay off the page; a second
+     * press over an open touch orphans it in the web engine.
+     */
+    @Test
+    public void menuHoldEndsAFingerAlreadyOnThePage() {
+        java.util.List<String> calls = new java.util.ArrayList<>();
+        AtomicReference<ZoomFrame> ref = new AtomicReference<>();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            ZoomFrame z = new ZoomFrame(InstrumentationRegistry.getInstrumentation().getTargetContext(), new ZoomFrame.Listener() {
+                @Override
+                public boolean storyMode() {
+                    return true;
+                }
+
+                @Override
+                public void onZoomChanged(float scale) {
+                }
+
+                @Override
+                public void onHoldChanged(boolean on) {
+                    calls.add(on ? "on" : "off");
+                }
+            });
+            View page = new View(z.getContext()) {
+                @Override
+                public boolean dispatchTouchEvent(MotionEvent e) {
+                    calls.add(MotionEvent.actionToString(e.getActionMasked()));
+                    return true;
+                }
+            };
+            z.addView(page, new ViewGroup.LayoutParams(1080, 2000));
+            z.measure(View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(2000, View.MeasureSpec.EXACTLY));
+            z.layout(0, 0, 1080, 2000);
+            ref.set(z);
+            long down = SystemClock.uptimeMillis();
+            z.dispatchTouchEvent(event(down, MotionEvent.ACTION_DOWN, new float[][]{{300f, 900f}}));
+            z.dispatchTouchEvent(event(down, MotionEvent.ACTION_MOVE, new float[][]{{302f, 901f}}));
+            // The other finger's tap on ⋮ (a sibling view) opens the menu.
+            z.hold();
+            z.dispatchTouchEvent(event(down, MotionEvent.ACTION_MOVE, new float[][]{{304f, 902f}}));
+            z.dispatchTouchEvent(event(down, MotionEvent.ACTION_UP, new float[][]{{304f, 902f}}));
+            z.releaseHold();
+        });
+        assertEquals(java.util.Arrays.asList("ACTION_DOWN", "ACTION_MOVE", "on", "ACTION_CANCEL", "ACTION_DOWN",
+                "ACTION_CANCEL", "off"), calls);
+        // Moves that no longer reached the page don't count as drags that did.
+        assertEquals(1, ref.get().recentPageMoves());
+        calls.clear();
+        // A finished touch is not cancelled again.
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            tap(ref.get(), 300f, 900f);
+            ref.get().hold();
+            ref.get().releaseHold();
+        });
+        assertEquals(java.util.Arrays.asList("ACTION_DOWN", "ACTION_UP", "on", "ACTION_DOWN", "ACTION_CANCEL", "off"), calls);
+    }
+
+    /** A video before its first frame shows its own black box, not WebView's gray play icon (R10, R9). */
+    @Test
+    public void videosWithoutAPosterShowNoGrayIcon() {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            s.onActivity(a -> {
+                try {
+                    WebChromeClient chrome = chromeOf(a);
+                    android.graphics.Bitmap b = chrome.getDefaultVideoPoster();
+                    assertNotNull("the app gives its own default poster", b);
+                    for (int x = 0; x < b.getWidth(); x++) {
+                        for (int y = 0; y < b.getHeight(); y++) {
+                            assertEquals("fully transparent", 0, android.graphics.Color.alpha(b.getPixel(x, y)));
+                        }
+                    }
+                    assertTrue("one shared bitmap", b == chrome.getDefaultVideoPoster());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+    }
+
     private static WebChromeClient chromeOf(MainActivity a) throws Exception {
         java.lang.reflect.Field f = MainActivity.class.getDeclaredField("web");
         f.setAccessible(true);
