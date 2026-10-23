@@ -7,6 +7,7 @@ import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeTrue;
 
 import android.app.Instrumentation;
 import android.os.Bundle;
@@ -21,6 +22,7 @@ import android.webkit.WebView;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
+import androidx.webkit.WebViewFeature;
 
 import org.json.JSONObject;
 import org.json.JSONTokener;
@@ -578,22 +580,55 @@ public class B25Test {
 
     /** Taps an item of the dialog showing now (through accessibility, as a finger would pick it). */
     boolean pickMenuItem(String label) {
-        long end = SystemClock.uptimeMillis() + 4000;
+        long end = SystemClock.uptimeMillis() + 6000;
         while (SystemClock.uptimeMillis() < end) {
-            android.view.accessibility.AccessibilityNodeInfo root = inst.getUiAutomation().getRootInActiveWindow();
-            if (root != null) {
+            // The dialog may not be the "active" window yet, and a long menu may
+            // need scrolling on a small screen: look in every window and scroll.
+            java.util.List<android.view.accessibility.AccessibilityNodeInfo> roots = new java.util.ArrayList<>();
+            android.view.accessibility.AccessibilityNodeInfo active = inst.getUiAutomation().getRootInActiveWindow();
+            if (active != null) roots.add(active);
+            for (android.view.accessibility.AccessibilityWindowInfo w : inst.getUiAutomation().getWindows()) {
+                if (w.getRoot() != null) roots.add(w.getRoot());
+            }
+            for (android.view.accessibility.AccessibilityNodeInfo root : roots) {
                 for (android.view.accessibility.AccessibilityNodeInfo n : root.findAccessibilityNodeInfosByText(label)) {
                     if (n.getText() == null || !label.contentEquals(n.getText())) continue;
-                    android.view.accessibility.AccessibilityNodeInfo c = n;
-                    while (c != null && !c.isClickable()) c = c.getParent();
-                    boolean ok = (c != null ? c : n).performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK);
-                    log("menu item '" + label + "' clicked " + ok);
+                    // Tap the item where it is on screen, through the test framework's
+                    // own input path (a dialog's list item takes no accessibility click
+                    // on Android 10).
+                    android.graphics.Rect b = new android.graphics.Rect();
+                    n.getBoundsInScreen(b);
+                    boolean ok = !b.isEmpty() && tapScreen(b.exactCenterX(), b.exactCenterY());
+                    log("menu item '" + label + "' tapped " + ok + " at " + b.toShortString());
                     return ok;
                 }
             }
-            SystemClock.sleep(100);
+            for (android.view.accessibility.AccessibilityNodeInfo root : roots) scrollForward(root, 0);
+            SystemClock.sleep(150);
         }
         log("menu item '" + label + "' not found");
+        return false;
+    }
+
+    private boolean tapScreen(float x, float y) {
+        android.app.UiAutomation ua = inst.getUiAutomation();
+        long t = SystemClock.uptimeMillis();
+        MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
+        down.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+        MotionEvent up = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, x, y, 0);
+        up.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+        try {
+            return ua.injectInputEvent(down, true) && ua.injectInputEvent(up, true);
+        } finally {
+            down.recycle();
+            up.recycle();
+        }
+    }
+
+    private static boolean scrollForward(android.view.accessibility.AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 12) return false;
+        if (n.isScrollable() && n.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) return true;
+        for (int i = 0; i < n.getChildCount(); i++) if (scrollForward(n.getChild(i), depth + 1)) return true;
         return false;
     }
 
@@ -672,8 +707,19 @@ public class B25Test {
     }
 
     /** Control: R8 in and out by swipes, each complete before the next; the exit goes the Back way. */
+    /**
+     * These cases need the page to talk to the app (WebMessageListener, WebView
+     * 82 or newer; the phone has 155). An older WebView, such as the Android 10
+     * emulator image's 74, gets no bridge by design, so they can't run there.
+     */
+    private static void assumeBridge() {
+        assumeTrue("needs the page-to-app bridge (WebMessageListener); this WebView is too old",
+                WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER));
+    }
+
     @Test
     public void r0_r8RoundTripControl() {
+        assumeBridge();
         name = "r0_r8Control";
         loadReel();
         r8Enter();
@@ -857,6 +903,7 @@ public class B25Test {
 
     @Test
     public void repair_chipQuietResetAndRebuild() {
+        assumeBridge();
         name = "repair_chip";
         loadPage(SCRIPT_BASE);
         assertEquals("the page script runs", "true", js("typeof window.__sg==='object'"));
@@ -938,7 +985,9 @@ public class B25Test {
         assertEquals(1, forFresh);
         assertEquals(0, forOld);
         assertEquals(1, intField("manualFix"));
-        assertNotNull(fresh.getWebChromeClient());
+        AtomicReference<Object> chrome = new AtomicReference<>();
+        inst.runOnMainSync(() -> chrome.set(fresh.getWebChromeClient()));   // WebView calls belong on the main thread
+        assertNotNull(chrome.get());
         loadPage(PLAIN_BASE);
         assertStillScrolls();
         // Full screen works on the new WebView, and Back leaves it.
@@ -955,6 +1004,7 @@ public class B25Test {
      */
     @Test
     public void repair_gateAfterAnimatedZoomResetAndTheChipsPlaces() throws Exception {
+        assumeBridge();
         name = "repair_gateAfterZoom";
         loadPage(PLAIN_BASE);
         ZoomFrame z = zoom();
