@@ -47,7 +47,9 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 
 Plan conflicts between the batch-4 notes are settled in [`notes/batch-4/plan-decisions.md`](notes/batch-4/plan-decisions.md).
 
-## Batch 5 — open (reported against 1.3)
+## Batch 5 — building as 1.4 (reported against 1.3)
+
+Cam: "make all your changes and fixes and spit out a new app version" (the go-ahead for this batch). R13 is dropped; everything else here is in the build.
 
 | # | Report | Likely cause (tentative, not yet diagnosed) | Planned fix |
 | --- | --- | --- | --- |
