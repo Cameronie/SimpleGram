@@ -3,7 +3,7 @@
 Distraction-free Instagram for Android. Your friends' posts, Stories, Reels and
 messages — without ads, suggested posts, reposts, the Reels tab or endless scrolling.
 
-**Download:** [`dist/SimpleGram-1.3.apk`](dist/SimpleGram-1.3.apk) · Android 10 or newer.
+**Download:** [`dist/SimpleGram-1.4.apk`](dist/SimpleGram-1.4.apk) · Android 10 or newer.
 It installs over an earlier version and keeps your login.
 
 ## What it does
@@ -14,7 +14,7 @@ It installs over an earlier version and keeps your login.
 | Stories, DMs, profiles, notifications, comments | "Suggested for you" posts and account carousels |
 | Reels opened from a DM, Story, profile, post or search | Friends' reposts and posts surfaced because a friend liked/commented |
 | Search: Accounts · Posts & Reels · Tags · Places | The Reels tab and the Explore suggestion grid |
-| Instagram's own look, buttons and settings | Swiping from one Reel on to the next (go back and pick another) |
+| Instagram's own look, buttons and settings | Swiping from one Reel on to the next, including the suggested Reels after one sent in a DM |
 | | Instagram's all-suggestions feed after "You're all caught up": Home carries on with posts from people you follow instead |
 | | Endless scrolling in search (results load about 24 at a time, only when you tap "Show more") |
 | | "Use the app" banners |
@@ -28,7 +28,7 @@ Extras:
   down or to the other side) (full resolution;
   carousels offer "this one" or "all"). Saved to `Downloads/SimpleGram`. If a Story's
   file wasn't loaded yet, SimpleGram looks it up from the account's Stories.
-- **Comments in a half-screen panel** under the post, like the app — the video keeps playing.
+- **Comments in a half-screen panel** under the post, like the app — the video keeps playing. The comment box stays one line high until you type.
 - **Sound on** for Stories and opened Reels; your own mute is respected.
 - **Opened videos play by themselves** (a Reel from a DM, an opened post or Reel), once,
   unless you already played or paused it.
@@ -45,9 +45,16 @@ Extras:
   to the top and keeps everything; a tap at the top refreshes, like the app.
 - **Favorites star** in the bottom bar, next to Home. It opens Favorites; on Favorites it scrolls
   to the top, and at the top refreshes. Going back to Home from Favorites loads Home fresh.
-- **Full-screen video**: in an opened post or Reel, swipe down on the video (at the top of the
-  page) to see it alone on the whole screen. Swipe up or down, or Back, to return; tap to pause.
-  On a Story that shares a Reel, swipe up to watch the Reel full screen; the Story waits.
+- **Full-screen video**: one tap on a video in the feed or an opened post shows it alone on the
+  whole screen, with sound (a double tap still likes). In an opened post a swipe down at the top
+  does the same, and ⋮ → Full-screen video works for the video on screen. Swipe up or down, or
+  Back, to return; tap to pause.
+- **Progress bar** like the app's Reels: drag it or tap a point to rewind or skip, in full screen,
+  in an opened post, in a Reel sent in a DM and on a Story's Reel.
+- **Story Reels**: on a Story that shares a Reel, swipe up to watch the Reel full screen with its
+  account, caption, counts, like, save, comments and share; the Story waits.
+- **Self-repair**: if scrolling ever stops working, a "Scrolling stopped. Tap to fix" button (or
+  ⋮ → More… → Fix scrolling) rebuilds the page view in place.
 - **Screen stays on** while a video plays.
 - **Following** (newest first) and **Favorites** feeds in the menu too (these show everything).
 - **Clean screenshots**: hide the menu button and system bars, tap to bring them back.
