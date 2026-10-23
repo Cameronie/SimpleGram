@@ -28,6 +28,13 @@ final class ZoomFrame extends FrameLayout {
         boolean storyMode();
 
         void onZoomChanged(float scale);
+
+        /**
+         * The finger held on the page starts (before it presses) or has ended.
+         * WebView cancels a held touch as soon as a dialog or the notification
+         * shade takes focus; the page must not take that for the end of the hold.
+         */
+        void onHoldChanged(boolean on);
     }
 
     static final float MAX_SCALE = 5f;
@@ -100,6 +107,7 @@ final class ZoomFrame extends FrameLayout {
             if (listener.storyMode() && !holding) {
                 // Leave the first finger down on the Story: Instagram pauses it.
                 holding = true;
+                listener.onHoldChanged(true);
                 holdDownTime = ev.getDownTime();
                 holdX = ev.getX(0);
                 holdY = ev.getY(0);
@@ -280,6 +288,7 @@ final class ZoomFrame extends FrameLayout {
         holdDownTime = now;
         holdX = getWidth() / 2f;
         holdY = getHeight() / 2f;
+        listener.onHoldChanged(true);
         MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, holdX, holdY, 0);
         super.dispatchTouchEvent(down);
         down.recycle();
@@ -297,6 +306,7 @@ final class ZoomFrame extends FrameLayout {
         MotionEvent cancel = MotionEvent.obtain(holdDownTime, now, MotionEvent.ACTION_CANCEL, holdX, holdY, 0);
         super.dispatchTouchEvent(cancel);
         cancel.recycle();
+        listener.onHoldChanged(false);
     }
 
     private void cancelPage(MotionEvent ev) {

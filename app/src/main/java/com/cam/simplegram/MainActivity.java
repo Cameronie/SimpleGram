@@ -665,6 +665,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
     }
 
+    @Override
+    public void onHoldChanged(boolean on) {
+        try {
+            js(new JSONObject().put("type", "appHold").put("on", on));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
     /** R9's Reel layer covers the page: no menu tab or system bars over it. */
     private void setPageVideo(boolean on) {
         if (pageVideo == on) return;

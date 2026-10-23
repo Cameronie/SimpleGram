@@ -707,6 +707,45 @@ test('B19: a cancelled touch lets go of the Story (it continues and the next swi
   assert.equal(await page.evaluate(() => window.__story.next), 1);
 });
 
+test('B19: the app\'s own hold (menu, screenshot, zoom) keeps the Story paused through the focus-loss cancel', async () => {
+  const page = await openStory([sharingItem('424242', null)]);
+  const c = await page.context().newCDPSession(page);
+  // The app says it is holding, then presses the middle of the page.
+  await page.evaluate(() => window.__sg.onNative({ type: 'appHold', on: true }));
+  await c.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 206, y: 457 }] });
+  assert.equal(await page.evaluate(() => window.__story.paused), true);
+  // The ⋮ dialog (or the notification shade) takes focus: WebView cancels the touch.
+  await c.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] });
+  await page.waitForTimeout(120);
+  let st = await page.evaluate(() => Object.assign({}, window.__story));
+  assert.deepEqual([st.paused, st.ends], [true, 0], 'the Story stays paused under the menu');
+  assert.equal(await page.evaluate(() => window.__sg.stats.diag.storyCancels), 0);
+  // The app lets go (menu closed, screenshot mode left, zoomed out): the Story continues.
+  await page.evaluate(() => window.__sg.onNative({ type: 'appHold', on: false }));
+  st = await page.evaluate(() => Object.assign({}, window.__story));
+  assert.deepEqual([st.paused, st.ends, st.start, st.next, st.prev], [false, 1, null, 0, 0]);
+  assert.equal(await page.evaluate(() => window.__sg.stats.diag.storyCancels), 1);
+  // A second release changes nothing.
+  await page.evaluate(() => window.__sg.onNative({ type: 'appHold', on: false }));
+  assert.equal(await page.evaluate(() => window.__story.ends), 1);
+  // The release arriving before the hold's own cancel (a pinch that didn't
+  // zoom): the Story is let go once.
+  await page.evaluate(() => window.__sg.onNative({ type: 'appHold', on: true }));
+  await c.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 206, y: 457 }] });
+  await page.evaluate(() => window.__sg.onNative({ type: 'appHold', on: false }));
+  await c.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] });
+  await c.detach();
+  await page.waitForTimeout(60);
+  st = await page.evaluate(() => Object.assign({}, window.__story));
+  assert.deepEqual([st.paused, st.ends, st.start], [false, 2, null]);
+  assert.equal(await page.evaluate(() => window.__sg.stats.diag.storyCancels), 2);
+  // Unheld cancels still let go, and swipes work again.
+  await drag(page, [200, 500], [200, 505], { steps: 1, cancel: true });
+  assert.deepEqual(await page.evaluate(() => [window.__story.paused, window.__sg.stats.diag.storyCancels]), [false, 3]);
+  await drag(page, [330, 500], [100, 510], { steps: 3 });
+  assert.equal(await page.evaluate(() => window.__story.next), 1);
+});
+
 test('B19: in Stories the banner scan is skipped; Story download, sound and the zoom hold still work', async () => {
   const story = media('STORY01', user('friend', true), { pk: '424242', video_versions: [
     { url: 'https://scontent.cdninstagram.com/v/t50/story-high.mp4', width: 720, height: 1280 }] });

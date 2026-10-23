@@ -3192,6 +3192,7 @@
   const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0, r9Pressed: 0 };
   let gesture = null;                  // the current one-finger touch
   let storyPress = null;               // a touch Instagram's Story saw start
+  let appHeld = false;                 // the app is holding a finger on the page (appHold)
   let r8El = null, r8On = false;
   let reelBox = null;                  // R9's Reel layer
   function searchOpen() { return typeof search !== 'undefined' && !!search.open; }
@@ -3307,17 +3308,31 @@
     if (Math.abs(dx) > 50 && Math.abs(dy) < 100 && ms <= 500) storySwitchStart(dx > 0 ? 'back' : 'next');
   }), { capture: true, passive: true });
 
-  // Instagram's Story listens for touchend only. A cancelled touch (the app's
-  // hold while its menu is open, a pinch that didn't zoom, a system gesture)
-  // left the Story paused and its next swipe measured from the old touch, so
-  // it was ignored. Let go of it the way a lifted finger would.
+  // Instagram's Story listens for touchend only. A cancelled touch (a pinch
+  // that didn't zoom, a system gesture) left the Story paused and its next
+  // swipe measured from the old touch, so it was ignored. Let go of it the way
+  // a lifted finger would.
+  // Not while the app holds the Story (its menu, screenshot mode, a zoom):
+  // WebView cancels that touch as soon as a dialog or the notification shade
+  // takes focus, so the cancel comes when the hold starts. The Story stays
+  // pressed until the app lets go (appHold off).
   window.addEventListener('touchcancel', safe(e => {
     gesture = null;
+    if (appHeld) return;
     const p = storyPress;
     storyPress = null;
     if (!e.isTrusted || !p || reelBox || route() !== 'story') return;
     if (releaseStoryPress(p)) stats.diag.storyCancels++;
   }), { capture: true, passive: true });
+  // From the app: on before its hold presses the page, off once it has let go.
+  function appHold(on) {
+    appHeld = on;
+    if (on) return;
+    const p = storyPress;
+    storyPress = null;
+    if (!p || reelBox || route() !== 'story') return;
+    if (releaseStoryPress(p)) stats.diag.storyCancels++;
+  }
   function releaseStoryPress(p) {
     const el = p && p.target;
     if (!el || !el.isConnected || typeof Touch !== 'function' || typeof TouchEvent !== 'function') return false;
@@ -5712,6 +5727,7 @@
         if (cmd.variant === 'following') continueFeed(cmd.variant);
         break;
       case 'storyHold': storyHold(!!cmd.on); break;
+      case 'appHold': appHold(!!cmd.on); break;
       case 'fullVideoExit': exitFullVideo('back'); break;
       case 'viewer': if (cmd.id) CFG.viewerId = String(cmd.id); break;
       case 'status':

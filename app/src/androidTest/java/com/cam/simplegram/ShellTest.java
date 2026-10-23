@@ -660,6 +660,107 @@ public class ShellTest {
         }
     }
 
+    /**
+     * The page is told when the app's hold starts (before it presses) and when
+     * it ends: WebView cancels the held touch as soon as the menu dialog or the
+     * notification shade takes focus, and the Story must stay paused anyway.
+     */
+    @Test
+    public void appHoldIsAnnouncedToThePage() throws Exception {
+        java.util.List<String> calls = new java.util.ArrayList<>();
+        boolean[] story = {true};
+        AtomicReference<ZoomFrame> ref = new AtomicReference<>();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            ZoomFrame z = new ZoomFrame(InstrumentationRegistry.getInstrumentation().getTargetContext(), new ZoomFrame.Listener() {
+                @Override
+                public boolean storyMode() {
+                    return story[0];
+                }
+
+                @Override
+                public void onZoomChanged(float scale) {
+                }
+
+                @Override
+                public void onHoldChanged(boolean on) {
+                    calls.add(on ? "on" : "off");
+                }
+            });
+            View page = new View(z.getContext()) {
+                @Override
+                public boolean dispatchTouchEvent(MotionEvent e) {
+                    calls.add(MotionEvent.actionToString(e.getActionMasked()));
+                    return true;
+                }
+            };
+            z.addView(page, new ViewGroup.LayoutParams(1080, 2000));
+            z.measure(View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(2000, View.MeasureSpec.EXACTLY));
+            z.layout(0, 0, 1080, 2000);
+            ref.set(z);
+            // The menu's hold: announced before the press; released once.
+            z.hold();
+            z.hold();
+            z.releaseHold();
+            z.releaseHold();
+        });
+        assertEquals(java.util.Arrays.asList("on", "ACTION_DOWN", "ACTION_CANCEL", "off"), calls);
+        calls.clear();
+        // The zoom's hold on a Story: on when the second finger lands, off when zoomed out.
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> pinch(ref.get(), 540f, 1000f, 100f, 300f));
+        assertTrue(ref.get().isZoomed());
+        assertEquals("on", calls.get(calls.indexOf("ACTION_DOWN") + 1));
+        assertFalse(calls.contains("off"));
+        calls.clear();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> ref.get().reset(false));
+        assertEquals(java.util.Arrays.asList("ACTION_CANCEL", "off"), calls);
+        calls.clear();
+        // Outside Stories a pinch holds nothing.
+        story[0] = false;
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            pinch(ref.get(), 540f, 1000f, 100f, 300f);
+            ref.get().reset(false);
+        });
+        assertFalse(calls.contains("on"));
+        assertFalse(calls.contains("off"));
+
+        // The menu and screenshot mode in a Story hold and let go through the frame.
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+            route.setAccessible(true);
+            s.onActivity(a -> {
+                try {
+                    route.set(a, "story");
+                    call(a, "showMenu", new Class<?>[]{});
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            SystemClock.sleep(400);
+            assertTrue(zoomOf(act.get()).isHolding());
+            InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                    .performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+            SystemClock.sleep(800);
+            idle();
+            assertFalse(zoomOf(act.get()).isHolding());
+            s.onActivity(a -> {
+                try {
+                    call(a, "enterScreenshot", new Class<?>[]{});
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertTrue(zoomOf(act.get()).isHolding());
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertFalse(zoomOf(act.get()).isHolding());
+        }
+    }
+
     private static WebChromeClient chromeOf(MainActivity a) throws Exception {
         java.lang.reflect.Field f = MainActivity.class.getDeclaredField("web");
         f.setAccessible(true);
