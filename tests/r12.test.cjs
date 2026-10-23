@@ -665,14 +665,15 @@ test('R12: an action on its way belongs to the Reel: closed and opened again, a 
   assert.deepEqual([s.like.on, s.like.n], [false, '1,234']);
   assert.equal(p2.hits['/api/graphql'], 1);
   // A follow refused after the Reel was opened again: Follow is back on the open one.
-  const p3 = await openStory({ api: { '/api/v1/friendships/*': () => ({ status: 400, body: { status: 'fail', message: 'oops' }, delay: 1200 }) } });
+  // Long enough that the second tap surely lands while the first follow is still on its way, even on a busy machine.
+  const p3 = await openStory({ api: { '/api/v1/friendships/*': () => ({ status: 400, body: { status: 'fail', message: 'oops' }, delay: 4000 }) } });
   await openReel(p3);
   await tapOn(p3, '.follow');
   await closeReel(p3);
   await openReel(p3);
   assert.equal((await ui(p3)).follow, 'Following', 'on its way: shown as Following');
   await tapOn(p3, '.follow');
-  await p3.waitForFunction(() => window.__sent.some(m => m.action === 'toast'), null, { timeout: 4000 });
+  await p3.waitForFunction(() => window.__sent.some(m => m.action === 'toast'), null, { timeout: 9000 });
   // The refusal's toast can trail another note on a busy machine: wait for the button itself.
   for (let i = 0; i < 40 && (await ui(p3)).follow !== 'Follow'; i++) await p3.waitForTimeout(100);
   assert.equal((await ui(p3)).follow, 'Follow');

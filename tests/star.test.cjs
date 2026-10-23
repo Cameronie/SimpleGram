@@ -592,7 +592,17 @@ async function racedOpen(start, tap, how) {
   await sleep(2500);
   // The old page can match first (the router's push): read only once the app's load has landed.
   if (loading) await loading;
-  const r = await page.evaluate(() => ({ where: location.pathname + location.search, opens: JSON.parse(sessionStorage.getItem('sg_search_opens') || '{}') }));
+  // A late navigation on a slow machine can replace the page under this read: retry once it settles.
+  let r = null;
+  for (let i = 0; i < 5 && !r; i++) {
+    try {
+      r = await page.evaluate(() => ({ where: location.pathname + location.search, opens: JSON.parse(sessionStorage.getItem('sg_search_opens') || '{}') }));
+    } catch (e) {
+      if (!/Execution context was destroyed|navigat/i.test(String(e))) throw e;
+      await page.waitForLoadState('load').catch(() => {});
+      await sleep(500);
+    }
+  }
   return { before, r, docs: page.__docs, aborted, page };
 }
 for (const how of ['assign', 'goto']) {
