@@ -660,6 +660,107 @@ public class ShellTest {
         }
     }
 
+    /**
+     * The page is told when the app's hold starts (before it presses) and when
+     * it ends: WebView cancels the held touch as soon as the menu dialog or the
+     * notification shade takes focus, and the Story must stay paused anyway.
+     */
+    @Test
+    public void appHoldIsAnnouncedToThePage() throws Exception {
+        java.util.List<String> calls = new java.util.ArrayList<>();
+        boolean[] story = {true};
+        AtomicReference<ZoomFrame> ref = new AtomicReference<>();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            ZoomFrame z = new ZoomFrame(InstrumentationRegistry.getInstrumentation().getTargetContext(), new ZoomFrame.Listener() {
+                @Override
+                public boolean storyMode() {
+                    return story[0];
+                }
+
+                @Override
+                public void onZoomChanged(float scale) {
+                }
+
+                @Override
+                public void onHoldChanged(boolean on) {
+                    calls.add(on ? "on" : "off");
+                }
+            });
+            View page = new View(z.getContext()) {
+                @Override
+                public boolean dispatchTouchEvent(MotionEvent e) {
+                    calls.add(MotionEvent.actionToString(e.getActionMasked()));
+                    return true;
+                }
+            };
+            z.addView(page, new ViewGroup.LayoutParams(1080, 2000));
+            z.measure(View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(2000, View.MeasureSpec.EXACTLY));
+            z.layout(0, 0, 1080, 2000);
+            ref.set(z);
+            // The menu's hold: announced before the press; released once.
+            z.hold();
+            z.hold();
+            z.releaseHold();
+            z.releaseHold();
+        });
+        assertEquals(java.util.Arrays.asList("on", "ACTION_DOWN", "ACTION_CANCEL", "off"), calls);
+        calls.clear();
+        // The zoom's hold on a Story: on when the second finger lands, off when zoomed out.
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> pinch(ref.get(), 540f, 1000f, 100f, 300f));
+        assertTrue(ref.get().isZoomed());
+        assertEquals("on", calls.get(calls.indexOf("ACTION_DOWN") + 1));
+        assertFalse(calls.contains("off"));
+        calls.clear();
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> ref.get().reset(false));
+        assertEquals(java.util.Arrays.asList("ACTION_CANCEL", "off"), calls);
+        calls.clear();
+        // Outside Stories a pinch holds nothing.
+        story[0] = false;
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            pinch(ref.get(), 540f, 1000f, 100f, 300f);
+            ref.get().reset(false);
+        });
+        assertFalse(calls.contains("on"));
+        assertFalse(calls.contains("off"));
+
+        // The menu and screenshot mode in a Story hold and let go through the frame.
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+            route.setAccessible(true);
+            s.onActivity(a -> {
+                try {
+                    route.set(a, "story");
+                    call(a, "showMenu", new Class<?>[]{});
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            SystemClock.sleep(400);
+            assertTrue(zoomOf(act.get()).isHolding());
+            InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                    .performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+            SystemClock.sleep(800);
+            idle();
+            assertFalse(zoomOf(act.get()).isHolding());
+            s.onActivity(a -> {
+                try {
+                    call(a, "enterScreenshot", new Class<?>[]{});
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertTrue(zoomOf(act.get()).isHolding());
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertFalse(zoomOf(act.get()).isHolding());
+        }
+    }
+
     private static WebChromeClient chromeOf(MainActivity a) throws Exception {
         java.lang.reflect.Field f = MainActivity.class.getDeclaredField("web");
         f.setAccessible(true);
@@ -784,6 +885,171 @@ public class ShellTest {
             assertTrue(hidden[0]);
             assertEquals(0, eaten[0]);
             assertNull(story.getParent());
+        }
+    }
+
+    /** R8: a post's video in full screen has the whole screen; the tab (elevated) is not drawn or touchable over it. */
+    @Test
+    public void postVideoFullScreenHidesTheMenuTab() throws Exception {
+        for (String r : new String[]{"post", "reel"}) {
+            try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+                AtomicReference<MainActivity> act = new AtomicReference<>();
+                s.onActivity(act::set);
+                boolean[] hidden = new boolean[1];
+                View video = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+                java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+                route.setAccessible(true);
+                s.onActivity(a -> {
+                    try {
+                        route.set(a, r);
+                        chromeOf(a).onShowCustomView(video, () -> hidden[0] = true);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+                idle();
+                assertEquals(r, View.GONE, menuTab(act.get()).getVisibility());
+                // Back leaves full screen through onHideCustomView: the tab comes back.
+                s.onActivity(MainActivity::onBackPressed);
+                idle();
+                assertTrue(hidden[0]);
+                assertNull(video.getParent());
+                assertEquals(r, View.VISIBLE, menuTab(act.get()).getVisibility());
+            }
+        }
+    }
+
+    /** In a Story's full screen the tab stays: it is how Stories are saved (R9's layer hides it itself). */
+    @Test
+    public void storyFullScreenKeepsTheMenuTab() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            View story = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            java.lang.reflect.Field route = MainActivity.class.getDeclaredField("route");
+            route.setAccessible(true);
+            s.onActivity(a -> {
+                try {
+                    route.set(a, "story");
+                    chromeOf(a).onShowCustomView(story, () -> { });
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertEquals(View.VISIBLE, menuTab(act.get()).getVisibility());
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onHideCustomView();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertEquals(View.VISIBLE, menuTab(act.get()).getVisibility());
+        }
+    }
+
+    /** A new page starting (Back to Home, a menu load, an offline error page) takes the old page's skip note with it. */
+    @Test
+    public void skipNoteGoesWhenANewPageStarts() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", true).put("kind", "nothingNew").toString());
+            idle();
+            assertNotNull(visibleChild(act.get(), "Skip status"));
+            // Home starts loading (an Instagram URL, so route and pageUrl stay until its 'ready').
+            s.onActivity(a -> {
+                try {
+                    java.lang.reflect.Field f = MainActivity.class.getDeclaredField("web");
+                    f.setAccessible(true);
+                    WebView w = (WebView) f.get(a);
+                    w.getWebViewClient().onPageStarted(w, "https://www.instagram.com/", null);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertNull(visibleChild(act.get(), "Skip status"));
+        }
+    }
+
+    /**
+     * A Story closing sends its route message while its full screen is still up
+     * (Instagram exits full screen after the viewer has left): the skip note and
+     * the end card come back when the full screen ends.
+     */
+    @Test
+    public void skipNoteAndEndCardComeBackWhenFullScreenEnds() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", true).put("kind", "skipping").put("n", 19).toString());
+            idle();
+            assertNotNull(visibleChild(act.get(), "Skip status"));
+            View story = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            String routeStory = new JSONObject().put("action", "route").put("route", "story")
+                    .put("url", "https://www.instagram.com/stories/x/1/").toString();
+            String routeBack = new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString();
+            s.onActivity(a -> {
+                try {
+                    call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", routeStory);
+                    chromeOf(a).onShowCustomView(story, () -> { });
+                    call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", routeBack);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            assertNull("never over the full screen", visibleChild(act.get(), "Skip status"));
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onHideCustomView();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            View chip = visibleChild(act.get(), "Skip status");
+            assertNotNull("the note is back", chip);
+            assertTrue(String.valueOf(((android.widget.TextView) chip).getText()).contains("Skipping 19 posts"));
+
+            // The end card on Home, the same way.
+            message(s, new JSONObject().put("action", "skipStatus").put("on", false).toString());
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            View story2 = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            String feedEnd = new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).toString();
+            String routeHome = new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString();
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onShowCustomView(story2, () -> { });
+                    call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", routeHome);
+                    call(a, "onMessage", new Class<?>[]{String.class, String.class}, "main", feedEnd);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(400);
+            idle();
+            assertNull(visibleChild(act.get(), "End of Home"));
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onHideCustomView();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(400);
+            idle();
+            assertNotNull("the card is back", visibleChild(act.get(), "End of Home"));
         }
     }
 }

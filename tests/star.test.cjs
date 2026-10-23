@@ -582,14 +582,16 @@ async function racedOpen(start, tap, how) {
   await sleep(300);
   const before = await page.evaluate(() => location.pathname + location.search);
   await page.tap(tap);
-  let aborted = null;
+  let aborted = null, loading = null;
   if (how === 'goto') {
     const v = await page.evaluate(() => window.__wantFeed);
-    page.goto('https://www.instagram.com/' + (v === 'home' ? '' : '?variant=' + v)).catch(e => { aborted = String(e).slice(0, 80); });
+    loading = page.goto('https://www.instagram.com/' + (v === 'home' ? '' : '?variant=' + v)).catch(e => { aborted = String(e).slice(0, 80); });
   }
   const want = start === '/' ? '?variant=favorites' : '';
   await page.waitForFunction(w => location.search === w && document.readyState === 'complete' && !!window.__sg, want, { timeout: 12000, polling: 100 });
   await sleep(2500);
+  // The old page can match first (the router's push): read only once the app's load has landed.
+  if (loading) await loading;
   const r = await page.evaluate(() => ({ where: location.pathname + location.search, opens: JSON.parse(sessionStorage.getItem('sg_search_opens') || '{}') }));
   return { before, r, docs: page.__docs, aborted, page };
 }

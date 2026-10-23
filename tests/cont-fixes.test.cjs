@@ -233,3 +233,112 @@ test('fix 13: a restart whose first Following read fails stops Instagram\'s pagi
   assert.equal(lastEnd(s).cont, 'failed');
   await context.close();
 });
+
+/* ---------------- Final review ---------------- */
+
+test('final 1: after a full load (the star\'s round trip to Favorites, then Home) Home goes on with Following posts not shown before', async () => {
+  const { pg, context } = await openIG({ home: phoneHome(), follow: range(1, 400) }, { sgCfg: ON });
+  await readToEnd(pg, 14);
+  const first = await snap(pg);
+  assert.equal(first.cont.stats.state, 'running');
+  const shown1 = first.codes.filter(c => !HOME_KEPT.includes(c));
+  assert.ok(shown1.length > 30, 'document 1 went well into Following');
+  await pg.goto('https://www.instagram.com/?variant=favorites');
+  await pg.waitForTimeout(800);
+  await pg.goto('https://www.instagram.com/');
+  await pg.waitForFunction(() => window.__ig && window.__ig.conn, null, { timeout: 5000 });
+  await readToEnd(pg, 10);
+  const s = await snap(pg);
+  const following = s.codes.filter(c => !HOME_KEPT.includes(c));
+  assert.ok(following.length > 0, 'Home goes on into Following');
+  assert.deepEqual(following.filter(c => shown1.includes(c)), [], 'no Following post from document 1 again');
+  assert.equal(s.cont.stats.repeats, 0);
+  // Only codes and a time are kept, for this account, in the tab's session.
+  const kept = await pg.evaluate(() => JSON.parse(sessionStorage.getItem('sg_home_seen')));
+  assert.deepEqual(Object.keys(kept).sort(), ['acct', 'at', 'codes']);
+  await context.close();
+});
+
+test('final 3: the "caught up" line above Following\'s first post is not drawn on that post\'s own page', async () => {
+  const home = { head: { edges: [friend('F02'), friend('F01'), marker()], next: 'm1', ps: 'feed_recs' } };
+  const { pg, context } = await openIG({ home, follow: range(1, 60) }, { sgCfg: ON });
+  await readToEnd(pg, 8);
+  const code = (await snap(pg)).cont.firstCode;
+  assert.match(code || '', /^F\d\d$/);
+  const r = await pg.evaluate(c => new Promise(done => {
+    const feedEl = document.querySelector('#main article[data-code="' + c + '"]');
+    const onFeed = feedEl ? getComputedStyle(feedEl, '::before').content : 'missing';
+    history.pushState({}, '', '/p/' + c + '/');
+    const art = document.createElement('article');
+    art.innerHTML = '<header>someone</header><div style="height:300px"></div><a href="/someone/p/' + c + '/"><time>1d</time></a>';
+    document.body.appendChild(art);
+    requestAnimationFrame(() => done({ onFeed, post: getComputedStyle(art, '::before').content, display: getComputedStyle(art).display }));
+  }), code);
+  assert.notEqual(r.onFeed, 'none', 'the line on Home');
+  assert.equal(r.post, 'none', 'no line on the post page');
+  assert.equal(r.display, 'block');
+  await context.close();
+});
+
+test('final 4: switched off then on mid-run, a Home reload goes on from where Following had got to (never a false "everything")', async () => {
+  const { pg, S, context } = await openIG({ home: phoneHome(), follow: range(1, 400) }, { sgCfg: ON });
+  await readToEnd(pg, 10);
+  let s = await snap(pg);
+  assert.equal(s.cont.stats.state, 'running');
+  await pg.evaluate(() => window.__sg.onNative({ type: 'contSet', on: false }));
+  await pg.evaluate(() => window.__sg.onNative({ type: 'contSet', on: true }));
+  s = await snap(pg);
+  assert.equal(s.cont.stats.state, 'off');
+  assert.equal(s.cont.more, true, 'Following still has more');
+  await readToEnd(pg, 6);
+  const n = own(S).length;
+  await tapHome(pg);
+  await pg.waitForTimeout(2500);
+  await readToEnd(pg, 10);
+  s = await snap(pg);
+  assert.notEqual(s.cont.stats.state, 'done');
+  assert.equal(s.cont.stats.state, 'running');
+  assert.ok(own(S).slice(n).some(e => e.after != null), 'a read from the carried cursor, not only Following\'s newest page');
+  assert.notEqual(lastEnd(s).cont, 'done');
+  await context.close();
+});
+
+test('final 5: switched off while a Following read is on its way: its posts never come after the card', async () => {
+  const cfg = { home: phoneHome(), follow: range(1, 400), delay: { home: 100, following: 3000 } };
+  const { pg, context } = await openIG(cfg, { sgCfg: ON });
+  let s;
+  for (let i = 0; i < 60; i++) {
+    await readToEnd(pg, 1, 200);
+    s = await snap(pg);
+    if (s.cont.stats.handed > 0 && s.cont.buffer === 0 && s.cont.inFlight) break;
+  }
+  assert.ok(s.cont.inFlight && s.cont.buffer === 0, 'Home waits on a read in flight');
+  const handed0 = s.cont.stats.handed;
+  await pg.evaluate(() => window.__sg.onNative({ type: 'contSet', on: false }));
+  await pg.waitForTimeout(3500);
+  await readToEnd(pg, 10, 300);
+  s = await snap(pg);
+  assert.equal(s.cont.stats.handed, handed0, 'no Following posts after the switch went off');
+  assert.equal(s.cont.buffer, 0);
+  assert.equal(s.hasNext, false);
+  assert.equal(lastEnd(s).on, true);
+  assert.equal(lastEnd(s).contWhy, 'switchedOff');
+  await context.close();
+});
+
+test('final 6: deep in Following, a slow read with nothing being skipped never says "Skipping posts you saw in Home…"', async () => {
+  const cfg = { home: phoneHome(), follow: range(1, 400), delay: { home: 100, following: 150 } };
+  const { pg, context } = await openIG(cfg, { sgCfg: ON });
+  await readToEnd(pg, 14, 350);
+  let s = await snap(pg);
+  assert.ok(s.cont.stats.skippedSeen > 0, 'the run passed posts seen in Home at its start');
+  const notes0 = s.skipStatus.filter(m => m.on).length;
+  const seen0 = s.cont.stats.skippedSeen;
+  cfg.delay.following = 8000;   // the network gets slow
+  await readToEnd(pg, 40, 300);
+  s = await snap(pg);
+  assert.equal(s.cont.stats.skippedSeen, seen0, 'no seen post was passed while waiting');
+  assert.ok(s.cont.stats.handed > 104, 'Following went on');
+  assert.equal(s.skipStatus.filter(m => m.on).length - notes0, 0);
+  await context.close();
+});

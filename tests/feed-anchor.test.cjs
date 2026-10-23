@@ -600,3 +600,67 @@ test('recovery: a reload of the page opened from the end card keeps its one-time
   const out = await parse(pg, page([friend('HOME003'), friend('HOME002'), friend('NEW0001')], { source: 'following' }));
   assert.deepEqual(keys(out), ['NEW0001'], 'still skipping Home\'s posts after the reload');
 });
+
+/* ---------------- Final review: anchors on every feed, and only on feeds ---------------- */
+
+const repost = c => edge({ media: media(c, user('creator' + c, false)), reposter: { username: 'fav1', pk: '77' } });
+const drawn = (pg, codes) => pg.evaluate(cs => new Promise(done => {
+  const feed = document.getElementById('feed');
+  for (const c of cs) feed.insertAdjacentHTML('beforeend', '<article data-c="' + c + '"><a href="/p/' + c + '/"><time>1d</time></a><div style="height:300px"></div></article>');
+  requestAnimationFrame(() => done(cs.map(c => getComputedStyle(document.querySelector('article[data-c="' + c + '"]')).display)));
+}), codes);
+
+for (const variant of ['favorites', 'following']) {
+  for (const [name, head] of [['repost, repost, repost', () => [repost('RP00001'), repost('RP00002'), repost('RP00003')]],
+    ['ad, repost, ad', () => [adUnit('AD00001'), repost('RP00004'), adUnit('AD00002')]]]) {
+    test('anchor: a ' + variant + ' first page [' + name + '] keeps one hidden post (never an empty feed) and pages on to the posts', async () => {
+      const pg = await open('https://www.instagram.com/?variant=' + variant, FEED);
+      const first = await parse(pg, page(head(), { source: variant }));
+      const code = conn(first).edges.length === 1 && conn(first).edges[0].node.media.code;
+      assert.match(code || '', /^RP0000[14]$/, 'exactly one edge, a repost, never an ad');
+      assert.equal(conn(first).page_info.has_next_page, true, 'has_next as sent');
+      let st = await feedState(pg);
+      assert.equal(st.handed, 1);
+      assert.equal(st.shownCount, 0, 'a hidden post is not a post shown');
+      assert.equal(st.anchorKind, 'recs');
+      assert.deepEqual(await drawn(pg, [code, 'OTHER01']), ['none', 'block'], 'hidden before it is drawn, on this feed too');
+      assert.equal(await pg.evaluate(() => !!document.getElementById('sg-skip-room')), true, 'the scroll room lets a swipe page on');
+      await pg.waitForTimeout(2600);
+      assert.ok(((await feedStats(pg)).nudges || 0) >= 2, 'nudges keep trying while only the hidden post is there');
+      const second = await parse(pg, page([friend('FV00001'), friend('FV00002')], { source: variant }));
+      assert.deepEqual(keys(second), ['FV00001', 'FV00002']);
+      st = await feedState(pg);
+      assert.equal(st.shownCount, 2);
+      await pg.waitForFunction(() => !document.getElementById('sg-skip-room'), null, { timeout: 4000 });
+    });
+  }
+}
+
+test('anchor: a first page of only ads is still not anchored on Favorites (nothing to hide)', async () => {
+  const pg = await open('https://www.instagram.com/?variant=favorites', FEED);
+  const out = await parse(pg, page([adUnit('AD00001'), adUnit('AD00002')], { source: 'favorites' }));
+  assert.deepEqual(keys(out), []);
+  assert.equal((await feedStats(pg)).anchor || 0, 0);
+});
+
+test('anchor: the hidden post shows on its own post page (a share, a profile, search), and is hidden again back on Home', async () => {
+  const pg = await open('https://www.instagram.com/', FEED);
+  const out = await parse(pg, page([recs('REC0001'), recs('REC0002'), adUnit('AD00001')]));
+  assert.deepEqual(keys(out), ['explore:REC0001']);
+  assert.deepEqual(await drawn(pg, ['REC0001']), ['none']);
+  const onPost = await pg.evaluate(() => new Promise(done => {
+    history.pushState({}, '', '/p/REC0001/');
+    const art = document.createElement('article');
+    art.id = 'pp';
+    art.innerHTML = '<header>someone</header><div style="height:300px"></div><a href="/someone/p/REC0001/"><time>1d</time></a>';
+    document.body.appendChild(art);
+    requestAnimationFrame(() => done(getComputedStyle(art).display));
+  }));
+  assert.equal(onPost, 'block', 'the post page is never blank');
+  const back = await pg.evaluate(() => new Promise(done => {
+    document.getElementById('pp').remove();
+    history.back();
+    addEventListener('popstate', () => requestAnimationFrame(() => done(getComputedStyle(document.querySelector('article[data-c="REC0001"]')).display)), { once: true });
+  }));
+  assert.equal(back, 'none');
+});
