@@ -4,10 +4,12 @@ import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.view.animation.DecelerateInterpolator;
 import android.webkit.WebView;
 import android.widget.FrameLayout;
@@ -78,6 +80,17 @@ final class CommentsPanel extends LinearLayout {
         body.addView(spinner, new FrameLayout.LayoutParams(dp(36), dp(36), Gravity.CENTER));
         addView(body, new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setVisibility(GONE);
+        // B20: the panel always sits clear of the system bars, and the window
+        // resizes for the keyboard (the activity re-sizes the panel), so its
+        // page must not keep room for either: kept room shows as an empty band
+        // under the comment box.
+        setOnApplyWindowInsetsListener((v, insets) -> consumed(insets));
+    }
+
+    /** Insets with nothing left for the panel's children (the comments page). */
+    static WindowInsets consumed(WindowInsets insets) {
+        if (Build.VERSION.SDK_INT >= 30) return WindowInsets.CONSUMED;
+        return insets.consumeSystemWindowInsets().consumeStableInsets().consumeDisplayCutout();
     }
 
     private int dp(int v) {
