@@ -74,7 +74,7 @@
     e.preventDefault();
     sgPrevented.add(e);
   }
-  // SimpleGram's own surface over the page (R9's Reel layer; R11's bar later):
+  // SimpleGram's own surface over the page (R9's Reel layer, R11's bar):
   // nothing under it scrolls while a finger drags on it.
   function holdStill(el) {
     el.addEventListener('touchmove', e => { e.stopPropagation(); sgPrevent(e); }, { passive: false });
@@ -191,12 +191,20 @@
     return /^\d+$/.test(s) ? s : null;
   }
   function itemOf(o) {
+    const dims = videoDims(o);
     return {
       pk: mediaPk(o),
       image: bestOf(o.image_versions2 && o.image_versions2.candidates),
       video: bestOf(o.video_versions),
       files: [],
+      vw: dims[0], vh: dims[1],         // B21: a video's own shape (0 for a photo)
     };
+  }
+  // A video's width and height from its data (its renditions, else the original).
+  function videoDims(o) {
+    if (!Array.isArray(o.video_versions) || !o.video_versions.length) return [0, 0];
+    for (const v of o.video_versions) if (v && v.width > 0 && v.height > 0) return [+v.width, +v.height];
+    return o.original_width > 0 && o.original_height > 0 ? [+o.original_width, +o.original_height] : [0, 0];
   }
   function indexMedia(o) {
     if (index.children.has(o)) return;
@@ -2464,6 +2472,13 @@
       'video[data-sg-full]:fullscreen::-webkit-media-controls{display:none!important}',
       'video[data-sg-full]:fullscreen::-webkit-media-controls-enclosure{display:none!important}',
       'video[data-sg-full]:fullscreen::-webkit-media-controls-overlay-play-button{display:none!important}',
+      // R10/R11: the page is full screen and the video is lifted over it (the top
+      // layer), so SimpleGram's progress bar can be drawn and touched above it.
+      'video[data-sg-full]:popover-open{position:fixed!important;inset:0!important;width:100%!important;height:100%!important;' +
+        'max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;border:0!important;' +
+        'border-radius:0!important;transform:none!important;object-fit:contain!important;background:#000!important;' +
+        'opacity:1!important;visibility:visible!important;overflow:hidden!important}',
+      'video[data-sg-full]:popover-open::-webkit-media-controls{display:none!important}',
       // B20: the comment box is one line high while reading; Instagram sizes it while typing.
       'textarea[data-sg-composer]:not([data-sg-open]){max-height:var(--sg-one-line,40px)!important;overflow-y:hidden!important}',
     ].concat(FAV_CSS).join('\n');
@@ -3466,6 +3481,8 @@
     safe(tidyStory)();
     safe(tidyCommentsChild)();
     safe(autoplay)();
+    queueCovers();
+    queuePageBar();
   }
   let lastTidy = 0, lastBannerScan = 0;
   function queueTidy() {
@@ -3657,6 +3674,9 @@
     if (CFG.role === 'main' && stars.size && !noStarHere()) armGeo();
     safe(syncSwipeGuard)();
     safe(noteStoryUrl)();
+    // R10: a tap waiting out the double-tap window belongs to the page it was on.
+    if (r10Wait) { clearTimeout(r10Wait.timer); r10Wait = null; }
+    queuePageBar();
     if (CFG.role === 'main' && route() === 'reels-tab') {
       // The endless Reels tab is not part of SimpleGram.
       location.replace('/');
@@ -3790,11 +3810,25 @@
    * when its own full screen ends.
    * ------------------------------------------------------------------ */
   const FV_SWIPE = 60;                 // px of mostly vertical travel
-  const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0, r9Pressed: 0 };
+  // r10: full screens from a tap; r10Doubles: taps that turned out to be a double tap
+  // (Instagram's like); r10Skipped: single taps that started nothing (a switch settling,
+  // a stale lift, a finger already down); r10Menu: from ⋮; r10Restored: feed videos put
+  // back as they were; liftFailed: the video couldn't be lifted (full screen left at once).
+  const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0, r9Pressed: 0,
+    r10: 0, r10Doubles: 0, r10Skipped: 0, r10Menu: 0, r10MenuNone: 0, r10Restored: 0, liftFailed: 0 };
   let gesture = null;                  // the current one-finger touch
   let storyPress = null;               // a touch Instagram's Story saw start
   let appHeld = false;                 // the app is holding a finger on the page (appHold)
   let r8El = null, r8On = false;
+  // How the full-screen video is shown: 'page' (the page is full screen and the
+  // video is lifted over it into the top layer, so R11's bar can be drawn and
+  // touched above it) or 'element' (the video itself is full screen: an older
+  // engine without popovers, or Instagram's own request taken over). The browser
+  // makes everything outside a full-screen element inert, so nothing of
+  // SimpleGram's could be touched over a full-screen <video>.
+  let r8Mode = 'element';
+  let fullKind = '';                   // who asked: 'r8' (swipe), 'r10' (tap), 'menu' (⋮)
+  let fullLayer = null;                // the lifted video and its bar
   // B25: an R8 request on its way (a late exit event must not lose track of it),
   // and an exit asked of the app that hasn't landed yet.
   let r8Pending = false, r8PendingAt = 0, r8ExitAt = 0;
@@ -3868,6 +3902,7 @@
     if (CFG.role !== 'main' || !e.isTrusted) return;
     if (e.touches.length !== 1) return;
     if (reelBox && reelBox.box.contains(e.target)) return;    // the Reel layer has its own
+    if (onSeekBar(e.target)) return;                         // R11: the bar's touches are the bar's
     const t = e.touches[0];
     const g = { x: t.clientX, y: t.clientY, at: Date.now(), target: e.target };
     const r = route();
@@ -3876,7 +3911,7 @@
     // second swipe would otherwise switch again under the finger, or land in a
     // full screen R8 has lost track of.
     if (fullScreenSettling()) { fsCounts.r8Settling++; return; }
-    if (r8On && fs && fs === r8El) g.exit = true;
+    if (fullVideoOn()) g.exit = true;
     else if ((r === 'post' || r === 'reel') && !fs && !searchOpen()) {
       const v = videoAt(g.x, g.y);
       if (v && ownTouch(v, e.target) && atTop(v)) { g.video = v; g.r8 = 'pending'; }
@@ -3971,12 +4006,73 @@
 
   // R8 in full screen: Instagram's tap layer isn't shown, so a tap pauses or plays.
   window.addEventListener('click', safe(e => {
-    const fs = document.fullscreenElement;
-    if (!r8On || !fs || fs !== r8El || !e.isTrusted) return;
+    if (!fullVideoOn() || !e.isTrusted || onSeekBar(e.target)) return;
     e.stopImmediatePropagation();
     e.preventDefault();
-    togglePlay(fs);
+    togglePlay(r8El);
   }), true);
+
+  // SimpleGram's full-screen video is showing (either way it is shown).
+  function fullVideoOn() {
+    const fs = document.fullscreenElement;
+    if (!r8On || !r8El || !fs) return false;
+    return r8Mode === 'page' ? fs === document.documentElement : fs === r8El;
+  }
+  // The page can be made full screen with the video lifted over it.
+  function canLift(v) {
+    const de = document.documentElement;
+    return CFG.role === 'main' && typeof v.showPopover === 'function' && typeof v.hidePopover === 'function' &&
+      !!de && typeof (de.requestFullscreen || de.webkitRequestFullscreen) === 'function';
+  }
+  // Lifts the video over the full-screen page (the top layer: above everything,
+  // whatever Instagram's own layout around it) and puts the bar over it. Only
+  // attributes are added: Instagram's own nodes stay where they are.
+  function liftVideo(v) {
+    try {
+      if (!v.isConnected) return false;
+      if (!v.hasAttribute('popover')) { v.setAttribute('popover', 'manual'); v.dataset.sgPop = '1'; }
+      if (!v.matches(':popover-open')) v.showPopover();
+    } catch (e) { return false; }
+    showFullBar(v);
+    return true;
+  }
+  function dropLift() {
+    const l = fullLayer;
+    fullLayer = null;
+    if (!l) return;
+    if (l.bar) l.bar.detach();
+    try { if (l.pop.matches(':popover-open')) l.pop.hidePopover(); } catch (e) { /* gone */ }
+    l.pop.remove();
+    const v = l.video;
+    try { if (v.matches(':popover-open')) v.hidePopover(); } catch (e) { /* gone */ }
+    if (v.dataset.sgPop) { v.removeAttribute('popover'); delete v.dataset.sgPop; }
+  }
+  // R11 in full screen: the bar in a layer of its own, shown after the video so
+  // it is drawn (and touched) above it.
+  function showFullBar(v) {
+    const pop = document.createElement('div');
+    pop.id = 'sg-fullbar';
+    pop.setAttribute('popover', 'manual');
+    pop.style.cssText = 'position:fixed;top:auto;left:0;right:0;bottom:0;width:100%;height:96px;margin:0;padding:0;' +
+      'border:0;background:transparent;overflow:visible;color:#fff;pointer-events:none';
+    (document.body || document.documentElement).appendChild(pop);
+    fullLayer = { video: v, pop: pop, bar: null };
+    try { pop.showPopover(); } catch (e) { pop.remove(); return; }
+    fullLayer.bar = attachSeekBar(v, pop, { where: 'full' });
+  }
+  // While SimpleGram's video is full screen on Home or a profile, the page under
+  // it is held still too (no blocking listener there otherwise): a swipe on the
+  // full-screen video leaves it and never scrolls the feed underneath. Only
+  // while a full screen is asked for or on, so Home scrolls freely otherwise.
+  let fullHoldOn = false;
+  const fullHoldMove = safe(e => { if (!guardOn) fullVideoMove(e); });
+  function syncFullHold() {
+    const want = CFG.role === 'main' && (r8On || r8Pending);
+    if (want === fullHoldOn) return;
+    fullHoldOn = want;
+    if (want) window.addEventListener('touchmove', fullHoldMove, { capture: true, passive: false });
+    else window.removeEventListener('touchmove', fullHoldMove, true);
+  }
 
   /* B25 touch rules for full screen (R8 now; R10's tap and R11's bar build on
    * them): leaveFullScreen is the one way out; nothing starts while a switch
@@ -3986,7 +4082,7 @@
   // A full-screen switch R8 asked for or was told of hasn't landed yet. Each
   // wait has a limit, so a request that never answers can't block R8 for good.
   function fullScreenSettling() {
-    if (r8Pending && performance.now() - r8PendingAt > 3000) r8Pending = false;
+    if (r8Pending && performance.now() - r8PendingAt > 3000) { r8Pending = false; syncFullHold(); }
     if (r8ExitAt && Date.now() - r8ExitAt > 1500) r8ExitAt = 0;
     const fs = document.fullscreenElement;
     return r8Pending || (r8On && !fs) || (!!r8ExitAt && !!fs);
@@ -4017,45 +4113,63 @@
   }
   SG.leaveFullScreen = leaveFullScreen;
 
-  function enterR8(v) {
-    if (!v || !v.isConnected || document.fullscreenElement || fullScreenSettling()) return;
-    const req = v.requestFullscreen || v.webkitRequestFullscreen;
-    if (typeof req !== 'function') { fvStats.r8Failed++; return; }
+  // R8's swipe, R10's tap and ⋮ → Full-screen video all come here. Returns
+  // whether a request was made.
+  function enterR8(v, kind) {
+    if (!v || !v.isConnected || document.fullscreenElement || fullScreenSettling()) return false;
+    const page = canLift(v);
+    const target = page ? document.documentElement : v;
+    const req = target.requestFullscreen || target.webkitRequestFullscreen;
+    if (typeof req !== 'function') { fvStats.r8Failed++; return false; }
     const fail = () => {
       fvStats.r8Failed++;
       if (r8El === v) r8Pending = false;
-      if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; }
+      if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; fullKind = ''; r10Snap = null; }
+      syncFullHold();
     };
     r8El = v;
+    r8Mode = page ? 'page' : 'element';
+    fullKind = kind || 'r8';
     r8Pending = true;
     r8PendingAt = performance.now();
     v.dataset.sgFull = '1';
+    syncFullHold();
     let p;
-    try { p = req.call(v, { navigationUI: 'hide' }); } catch (err) { fail(); return; }
+    try { p = req.call(target, { navigationUI: 'hide' }); } catch (err) { fail(); return false; }
     if (p && typeof p.then === 'function') {
-      p.then(() => { if (r8El === v && document.fullscreenElement === v) r8Pending = false; },
-        () => { if (document.fullscreenElement !== v) fail(); });
+      p.then(() => { if (r8El === v && document.fullscreenElement === target) r8Pending = false; },
+        () => { if (document.fullscreenElement !== target) fail(); });
     }
+    return true;
   }
   function exitFullVideo(why) {
     if (reelBox) { closeStoryReel(why); return; }
-    if (!r8On || document.fullscreenElement !== r8El) return;
+    if (!fullVideoOn()) return;
     leaveFullScreen(why);
   }
   document.addEventListener('fullscreenchange', safe(() => {
     const el = document.fullscreenElement;
     let via = 'other';
-    if (r8El && el === r8El) {
+    const landed = r8El && el && (r8Mode === 'page' ? el === document.documentElement && (r8Pending || r8On) : el === r8El);
+    if (landed) {
       via = 'r8';
       r8Pending = false;
       if (!r8On) {
         r8On = true;
-        fvStats.r8++;
+        bump(fvStats, fullKind === 'r8' ? 'r8' : 'r10');
+        const v = r8El, kind = fullKind;
+        if (r8Mode === 'page' && !liftVideo(v)) {
+          // Full screen with nothing lifted over it would show the feed: leave at once.
+          fvStats.liftFailed++;
+          leaveFullScreen('lift');
+        }
         // A landscape video small in the post played muted; full screen is
         // the sound rule's "opened video". Checked once the layout settles.
-        const v = r8El;
+        // R10: a tap opens it playing, with sound (its play brings the sound).
         setTimeout(safe(() => {
-          if (document.fullscreenElement === v && v.muted && !userMuted && !v.paused && wantsSound(v)) unmute(v);
+          if (!fullVideoOn() || r8El !== v) return;
+          if (kind !== 'r8' && v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+          else if (v.muted && !userMuted && !v.paused && wantsSound(v)) unmute(v);
         }), 150);
       }
     } else if (el && el.tagName === 'VIDEO' && !el.dataset.sgOwn && !r8Pending && CFG.role === 'main' &&
@@ -4064,14 +4178,20 @@
       // request that landed after R8 lost track of it) is taken over, so a swipe
       // leaves it the safe way and the browser's controls stay hidden.
       if (r8El && r8El !== el) delete r8El.dataset.sgFull;
+      dropLift();
       r8El = el;
       r8On = true;
+      r8Mode = 'element';
+      fullKind = 'r8';
+      r10Snap = null;
       el.dataset.sgFull = '1';
       fsCounts.r8Adopted++;
       via = 'r8-adopted';
     } else if (r8On || r8El) {
+      const wasOn = r8On;
       if (r8On) fvStats.exits++;
       r8On = false;
+      dropLift();
       if (r8Pending && !el) {
         // B25: an exit from before, arriving while the next request is on its
         // way. That request stays tracked (it used to land untracked).
@@ -4081,14 +4201,200 @@
         via = 'r8';
         r8Pending = false;
         if (r8El) delete r8El.dataset.sgFull;
+        // R10: out of full screen the feed video goes back to how it was.
+        const snap = r10Snap;
+        r10Snap = null;
+        if (snap && wasOn && snap.v === r8El) restoreAfterFull(snap);
         r8El = null;
+        fullKind = '';
       }
     }
     if (!el) r8ExitAt = 0;
+    syncFullHold();
+    queuePageBar();
     noteFsPage(el, via);
     // The full screen R9's layer lived in ended: Instagram is closing the Story.
     if (reelBox && reelBox.inFull && (!el || !el.contains(reelBox.box))) closeStoryReel('ended');
   }));
+
+  /* ------------------------------------------------------------------ *
+   * R10: one tap on a video in the feed (Home, Following, Favorites, a
+   * profile's posts) or in the post view opens it full screen, playing,
+   * with sound and the progress bar (R11); nothing else over it. Out of
+   * full screen it goes back to how it was (muted if it was).
+   *
+   * Instagram's own tap handling (PolarisDoubleTappable, used for posts and
+   * DM messages): a double tap is counted from touches, not dblclick (two
+   * touchstart/touchend pairs, each start within 300 ms of the last and
+   * within 40 px of the first), and the like runs in the second tap's click;
+   * the single-tap action runs 300 ms after a click that no second click
+   * followed (polarisOnlyHandleSingleClick, MULTI_CLICK_DELAY 300). Its video
+   * players toggle sound or pause on a click of their tap layer. So R10
+   * never takes a tap from Instagram: every touch and click still reaches
+   * it (its double tap still likes), and R10 waits out the same 300 ms. A
+   * second touch in that time is a double tap (or something else): no full
+   * screen. Whatever Instagram's single tap toggled on the feed video is
+   * put back when full screen ends.
+   * ------------------------------------------------------------------ */
+  const R10_WAIT = 300;                // Instagram's MULTI_CLICK_DELAY
+  const R10_SLOP = 12;                 // px a tap may wander
+  let tapSeq = null;                   // the current touch, as R10 sees it
+  let r10Wait = null;                  // a single tap waiting out the double-tap window
+  let r10Snap = null;                  // the video as it was before the tap: put back afterwards
+  let menuArm = null;                  // ⋮ → Full-screen video: the tap the app is about to make
+  function r10Route(r) { return r === 'home' || r === 'post' || r === 'reel' || r === 'other'; }
+  // Instagram's own controls on a video (the sound and tag icons, a tagged
+  // person, any link) keep their taps. A layer as big as the video is its tap area.
+  function videoControl(el, v) {
+    if (!el || !el.closest) return true;
+    if (el.closest('a[href],input,textarea,select,label,[contenteditable="true"],[contenteditable=""]')) return true;
+    const c = el.closest('button,[role="button"],svg[aria-label]');
+    if (!c || c.contains(v)) return false;
+    const r = c.getBoundingClientRect(), vr = v.getBoundingClientRect();
+    return r.width * r.height < 0.5 * vr.width * vr.height;
+  }
+  // The feed or post video a tap at (x, y) on `target` is for, or null.
+  function r10Video(target, x, y) {
+    const r = route();
+    if (CFG.role !== 'main' || !r10Route(r) || document.fullscreenElement || reelBox || searchOpen()) return null;
+    if (!(target instanceof Element) || onSeekBar(target) || isField(target)) return null;
+    const v = videoAt(x, y);
+    if (!v || v.dataset.sgOwn || isOldMedia(v) || !ownTouch(v, target) || videoControl(target, v)) return null;
+    if ((r === 'home' || r === 'other') && !v.closest(POST)) return null;
+    return v;
+  }
+  function stillOf(v) { return v ? { v: v, muted: v.muted, paused: v.paused } : null; }
+  // Before Instagram's own handlers run (pointerdown comes before touchstart):
+  // the video as it was, for afterwards.
+  window.addEventListener('pointerdown', safe(e => {
+    if (!e.isTrusted || e.pointerType === 'mouse' || !e.isPrimary) return;
+    tapSeq = { fresh: true, x: e.clientX, y: e.clientY, at: performance.now(), moved: false, multi: false, second: false,
+      snap: stillOf(videoAt(e.clientX, e.clientY)) };
+  }), { capture: true, passive: true });
+  window.addEventListener('touchstart', safe(e => {
+    if (!e.isTrusted) return;
+    let second = false;
+    if (r10Wait) {
+      // A new touch ends the wait: a second tap (Instagram's double tap: it likes) or anything else.
+      const w = r10Wait;
+      r10Wait = null;
+      clearTimeout(w.timer);
+      const t0 = e.touches[0];
+      second = !!t0 && Math.hypot(t0.clientX - w.x, t0.clientY - w.y) <= 40;
+      fvStats[second ? 'r10Doubles' : 'r10Skipped']++;
+    }
+    if (e.touches.length !== 1) { if (tapSeq) tapSeq.multi = true; return; }
+    const t = e.touches[0];
+    const s = tapSeq && tapSeq.fresh ? tapSeq : { snap: stillOf(videoAt(t.clientX, t.clientY)) };
+    tapSeq = { fresh: false, x: t.clientX, y: t.clientY, at: performance.now(), moved: false, multi: false,
+      second: second, snap: s.snap };
+  }), { capture: true, passive: true });
+  window.addEventListener('touchmove', safe(e => {
+    const s = tapSeq;
+    if (!s || !e.isTrusted) return;
+    if (e.touches.length !== 1) { s.multi = true; return; }
+    const t = e.touches[0];
+    if (Math.hypot(t.clientX - s.x, t.clientY - s.y) > R10_SLOP) s.moved = true;
+  }), { capture: true, passive: true });
+  window.addEventListener('touchcancel', safe(e => { if (e.isTrusted) tapSeq = null; }), { capture: true, passive: true });
+  window.addEventListener('click', safe(e => {
+    if (!e.isTrusted) return;
+    const s = tapSeq;
+    tapSeq = null;
+    if (menuArm && menuTapped(e)) return;
+    if (!s || s.fresh || s.multi || s.moved || s.second || performance.now() - s.at > 900) return;
+    const v = r10Video(e.target, e.clientX, e.clientY);
+    if (!v) return;
+    // B25: no switch while one settles, and none from a lift handled too late.
+    if (fullScreenSettling() || staleTouch(e)) { fvStats.r10Skipped++; return; }
+    const snap = s.snap && s.snap.v === v ? s.snap : stillOf(v);
+    const w = { v: v, snap: snap, x: e.clientX, y: e.clientY, timer: 0 };
+    w.timer = setTimeout(safe(() => fireR10(w)), R10_WAIT);
+    r10Wait = w;
+  }), true);
+  // The double-tap window passed with no second touch: a single tap. Still
+  // within the tap's user activation (a few seconds), so full screen is allowed.
+  function fireR10(w) {
+    if (r10Wait !== w) return;
+    r10Wait = null;
+    const v = w.v;
+    // B25: never while a finger is down (the switch would split its touch) or a switch settles.
+    if (!v.isConnected || document.fullscreenElement || downIds.size || fullScreenSettling() || !r10Route(route()) ||
+      reelBox || searchOpen()) { fvStats.r10Skipped++; return; }
+    r10Snap = w.snap;
+    if (!enterR8(v, 'r10')) r10Snap = null;
+  }
+  // Instagram's single tap may have toggled the feed video's sound or paused
+  // it: put it back as it was before the tap. Sound goes off through
+  // Instagram's own sound control, so its icon and its feed-wide sound
+  // setting agree with the video.
+  function restoreAfterFull(s) {
+    setTimeout(safe(() => {
+      const v = s.v;
+      if (!v.isConnected || document.fullscreenElement) return;     // gone, or full screen again
+      if (s.muted && !v.muted) muteBack(v);
+      if (s.paused && !v.paused) v.pause();
+      else if (!s.paused && v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+      fvStats.r10Restored++;
+    }), 120);
+  }
+  function muteBack(v) {
+    const toggle = findControl(v, /audio|sound|mute/i, false);
+    const label = toggle ? controlState(toggle) : '';
+    if (toggle && /playing|is on|^mute$|turn off/i.test(label)) {
+      try { press(toggle); } catch (e) { /* ignore */ }
+      setTimeout(() => { if (!v.muted && !fullVideoOn()) v.muted = true; }, 300);
+    } else {
+      v.muted = true;
+    }
+  }
+  // ⋮ → Full-screen video. A native menu gives the page no user activation, so
+  // the page can't ask for full screen itself: it names a spot on the video
+  // (clear of Instagram's icons) and the app taps it through the web view's
+  // own input once the menu has gone. That tap is turned straight into R10's
+  // full screen; Instagram never sees its click, so nothing is toggled.
+  function fullVideoMenu() {
+    if (CFG.role !== 'main' || document.fullscreenElement || reelBox) return;
+    const none = msg => { fvStats.r10MenuNone++; post('toast', { message: msg }); };
+    if (!r10Route(route())) { none('No video to show full screen here.'); return; }
+    let v = snapshot && snapshot.el && snapshot.el.tagName === 'VIDEO' && snapshot.el.isConnected &&
+      Date.now() - snapshot.at < 10 * 60 * 1000 ? snapshot.el : null;
+    if (!v) { const m = pickMedia(null, null); if (m && m.tagName === 'VIDEO') v = m; }
+    const pt = v && !v.dataset.sgOwn ? tapPointOn(v) : null;
+    if (!pt) { none('No video on the screen.'); return; }
+    menuArm = { v: v, x: pt.x, y: pt.y, until: performance.now() + 2500 };   // the app tries for about 2 s
+    post('fullVideoTap', { x: Math.round(pt.x), y: Math.round(pt.y), w: innerWidth });
+  }
+  // A spot on the video's visible part that is the video's own (not an icon, a
+  // link, the bar or a sheet over it).
+  function tapPointOn(v) {
+    const r = v.getBoundingClientRect();
+    const top = Math.max(r.top, 0), bottom = Math.min(r.bottom, innerHeight - navHeight());
+    const left = Math.max(r.left, 0), right = Math.min(r.right, innerWidth);
+    if (bottom - top < 60 || right - left < 60) return null;
+    for (const fy of [0.5, 0.35, 0.65]) {
+      for (const fx of [0.5, 0.3, 0.7]) {
+        const x = left + (right - left) * fx, y = top + (bottom - top) * fy;
+        const el = document.elementFromPoint(x, y);
+        if (el && !onSeekBar(el) && videoAt(x, y) === v && ownTouch(v, el) && !videoControl(el, v)) return { x: x, y: y };
+      }
+    }
+    return null;
+  }
+  // The app's tap for the menu item: full screen at once (no double tap to wait for).
+  function menuTapped(e) {
+    const m = menuArm;
+    if (performance.now() > m.until) { menuArm = null; return false; }
+    if (Math.hypot(e.clientX - m.x, e.clientY - m.y) > 24) return false;
+    menuArm = null;
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    if (!m.v.isConnected || document.fullscreenElement || fullScreenSettling()) { fvStats.r10Skipped++; return true; }
+    fvStats.r10Menu++;
+    r10Snap = stillOf(m.v);
+    if (!enterR8(m.v, 'menu')) r10Snap = null;
+    return true;
+  }
 
   function sharedReelHere() {
     const pk = storyPk();
@@ -4146,6 +4452,8 @@
       if (reelBox === rb && rb.video.getAttribute('src')) togglePlay(rb.video);
     }));
     host.appendChild(box);
+    // R11: the progress bar along the bottom, as in the app's Reels.
+    rb.bar = attachSeekBar(v, box, { where: 'story' });
     reelBox = rb;
     fvStats.r9++;
     post('fullVideo', { on: true });
@@ -4226,6 +4534,7 @@
     const rb = reelBox;
     if (!rb) return;
     reelBox = null;
+    if (rb.bar) rb.bar.detach();
     if (why !== 'missing') fvStats.exits++;
     try { rb.video.pause(); rb.video.removeAttribute('src'); rb.video.load(); } catch (e) { /* gone */ }
     rb.box.remove();
@@ -4239,6 +4548,247 @@
         for (const v of rb.held) if (v.isConnected && v.paused && !v.ended && route() === 'story') v.play().catch(() => {});
       }), 350);
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * R11: a progress bar like the app's Reels bar, wherever a video plays on
+   * its own: full screen (R8/R10), the post view, Instagram's DM Reel
+   * viewer and R9's Story Reel (R12 builds on the same bar). A thin line
+   * across the bottom, white for the part played and dark translucent for
+   * the rest. Touch it and it thickens, a round handle and the time show
+   * ("0:12 / 0:45"); drag to scrub and let go to jump, or tap a point.
+   * Its touches are its own: they start no full-screen swipe, no carousel
+   * swipe, no like and no scroll (held still with a blocking touchmove on
+   * the bar itself, never touch-action; B25), and no click comes of them.
+   * ------------------------------------------------------------------ */
+  const barStats = (stats.seekBar = { attached: 0, taps: 0, drags: 0, cancels: 0, where: {} });
+  const BAR_THIN = 2, BAR_THICK = 6, BAR_KNOB = 14;
+  const BAR_CSS = ':host{all:initial;display:block;position:absolute;z-index:2147483600;pointer-events:auto;' +
+    'contain:layout style;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}' +
+    '.track{position:absolute;left:0;right:0;bottom:var(--sg-line);height:' + BAR_THIN + 'px;background:rgba(0,0,0,.4);' +
+      'transition:height .1s ease-out}' +
+    '.fill{position:absolute;left:0;top:0;bottom:0;width:100%;background:#fff;transform-origin:0 50%;transform:scaleX(0)}' +
+    '.knob{position:absolute;left:0;bottom:calc(var(--sg-line) + ' + (BAR_THICK - BAR_KNOB) / 2 + 'px);width:' + BAR_KNOB + 'px;' +
+      'height:' + BAR_KNOB + 'px;margin-left:-' + BAR_KNOB / 2 + 'px;border-radius:50%;background:#fff;' +
+      'box-shadow:0 0 3px rgba(0,0,0,.45);opacity:0;transition:opacity .1s;pointer-events:none}' +
+    '.time{position:absolute;left:50%;bottom:calc(var(--sg-line) + 18px);transform:translateX(-50%);color:#fff;' +
+      'font:600 13px/1.2 system-ui,-apple-system,Roboto,sans-serif;font-variant-numeric:tabular-nums;white-space:nowrap;' +
+      'text-shadow:0 1px 3px rgba(0,0,0,.75);opacity:0;transition:opacity .1s;pointer-events:none}' +
+    ':host([data-active]) .track{height:' + BAR_THICK + 'px}' +
+    ':host([data-active]) .knob,:host([data-active]) .time{opacity:1}';
+  function onSeekBar(t) { return !!(t && t.closest && t.closest('[data-sg-bar]')); }
+  function clockOf(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = String(s % 60).padStart(2, '0');
+    return h ? h + ':' + String(m).padStart(2, '0') + ':' + ss : m + ':' + ss;
+  }
+  // The bar for `video`, inside `host`. Docked (the default): along the bottom
+  // of host, which covers the screen (the full-screen layer, R9's Reel layer).
+  // { follow: true }: laid over the video's own bottom edge, wherever the page
+  // puts it (the post view, a DM Reel); its place() keeps it there. Returns
+  // { el, video, place(), detach() }.
+  function attachSeekBar(video, host, opts) {
+    opts = opts || {};
+    const follow = !!opts.follow;
+    const where = /^[a-z]{1,8}$/.test(opts.where || '') ? opts.where : 'other';
+    const el = document.createElement('div');
+    el.dataset.sgBar = where;
+    el.setAttribute('role', 'slider');
+    el.setAttribute('aria-label', 'Video progress');
+    el.setAttribute('aria-valuemin', '0');
+    // Docked: a 44 px touch strip whose line sits 16 px up from its bottom, the
+    // strip 12 px above the screen's edge (clear of the system's gesture area).
+    // Following: an 18 px strip, the line on the video's bottom edge.
+    el.style.cssText = follow
+      ? 'position:absolute;left:0;top:0;width:0;height:18px;--sg-line:6px;visibility:hidden'
+      : 'position:absolute;left:0;right:0;bottom:calc(12px + env(safe-area-inset-bottom, 0px));height:44px;--sg-line:16px';
+    const root = el.attachShadow({ mode: 'open' });
+    root.innerHTML = '<style>' + BAR_CSS + '</style><div class="track"><div class="fill"></div></div>' +
+      '<div class="knob"></div><div class="time"></div>';
+    const track = root.querySelector('.track'), fill = root.querySelector('.fill');
+    const knob = root.querySelector('.knob'), time = root.querySelector('.time');
+    let drag = null, frame = 0, idle = 0, gone = false;
+    const length = () => { const d = video.duration; return isFinite(d) && d > 0 ? d : 0; };
+    function paint() {
+      const d = length();
+      const at = drag ? drag.frac * d : video.currentTime || 0;
+      const f = d ? Math.min(1, Math.max(0, at / d)) : 0;
+      fill.style.transform = 'scaleX(' + f + ')';
+      knob.style.left = f * 100 + '%';
+      el.setAttribute('aria-valuemax', String(Math.round(d)));
+      el.setAttribute('aria-valuenow', String(Math.round(at)));
+      if (el.hasAttribute('data-active')) time.textContent = clockOf(at) + ' / ' + clockOf(d);
+    }
+    // Smooth while playing (one frame each), still otherwise.
+    const loop = safe(() => {
+      frame = 0;
+      if (gone) return;
+      paint();
+      if (!video.paused && !document.hidden) frame = requestAnimationFrame(loop);
+    });
+    const kick = safe(() => { if (!frame && !gone) frame = requestAnimationFrame(loop); });
+    const MEDIA = ['play', 'playing', 'pause', 'seeked', 'timeupdate', 'durationchange', 'loadedmetadata', 'emptied', 'ended'];
+    MEDIA.forEach(t => video.addEventListener(t, kick, { passive: true }));
+    function fracAt(x) {
+      const r = track.getBoundingClientRect();
+      return r.width ? Math.min(1, Math.max(0, (x - r.left) / r.width)) : 0;
+    }
+    function activate(on) {
+      clearTimeout(idle);
+      if (on) el.setAttribute('data-active', '');
+      else el.removeAttribute('data-active');
+      paint();
+    }
+    // Nothing of a touch here reaches the page: not Instagram's handlers (the
+    // like, the carousel), not the Reel layer's swipe, not R8's.
+    el.addEventListener('touchstart', safe(e => {
+      e.stopPropagation();
+      if (e.touches.length !== 1) { if (drag) { drag = null; barStats.cancels++; activate(false); } return; }
+      const t = e.touches[0];
+      drag = { x0: t.clientX, frac: fracAt(t.clientX), moved: false };
+      activate(true);
+    }), { passive: true });
+    holdStill(el);
+    el.addEventListener('touchmove', safe(e => {
+      const d = drag;
+      if (!d) return;
+      const t = e.touches[0];
+      if (e.touches.length !== 1 || !t) return;
+      if (Math.abs(t.clientX - d.x0) > 4) d.moved = true;
+      d.frac = fracAt(t.clientX);
+      paint();
+    }), { passive: true });
+    el.addEventListener('touchend', safe(e => {
+      e.stopPropagation();
+      sgPrevent(e);                      // no click: the video under it isn't paused, nothing is liked
+      const d = drag;
+      if (!d || e.touches.length) return;
+      drag = null;
+      const t = e.changedTouches[0];
+      if (t) d.frac = fracAt(t.clientX);
+      const len = length();
+      if (len) {
+        try { video.currentTime = Math.min(d.frac * len, Math.max(0, len - 0.05)); } catch (err) { /* not seekable yet */ }
+        barStats[d.moved ? 'drags' : 'taps']++;
+      }
+      paint();
+      idle = setTimeout(safe(() => activate(false)), 900);
+    }), { passive: false });
+    el.addEventListener('touchcancel', safe(e => {
+      e.stopPropagation();
+      if (drag) barStats.cancels++;
+      drag = null;
+      activate(false);
+    }), { passive: true });
+    for (const type of ['click', 'dblclick', 'contextmenu', 'pointerdown', 'pointerup', 'mousedown', 'mouseup']) {
+      el.addEventListener(type, e => {
+        e.stopPropagation();
+        if (type === 'click' || type === 'dblclick' || type === 'contextmenu') e.preventDefault();
+      });
+    }
+    const place = safe(() => {
+      if (!follow || gone) return;
+      const vr = video.getBoundingClientRect();
+      const nav = navHeight();
+      // A video as tall as the screen (a Reel viewer): the line at the bottom of what shows of it.
+      const y = vr.height >= innerHeight * 0.8 ? Math.min(vr.bottom, innerHeight - nav) : vr.bottom;
+      const show = video.isConnected && vr.width >= 100 && vr.height >= 100 && y > 40 && y <= innerHeight - nav + 1 &&
+        !coveredOver(video);
+      el.style.visibility = show ? '' : 'hidden';
+      if (!show) return;
+      const o = barOrigin(el);
+      el.style.left = (vr.left - o.x) + 'px';
+      el.style.width = vr.width + 'px';
+      el.style.top = (y - 12 - o.y) + 'px';
+    });
+    host.appendChild(el);
+    barStats.attached++;
+    bump(barStats.where, where);
+    place();
+    paint();
+    kick();
+    return {
+      el: el,
+      video: video,
+      place: place,
+      detach: () => {
+        if (gone) return;
+        gone = true;
+        cancelAnimationFrame(frame);
+        clearTimeout(idle);
+        MEDIA.forEach(t => video.removeEventListener(t, kick, { passive: true }));
+        el.remove();
+      },
+    };
+  }
+  // Where an absolutely placed element's coordinates start, in the viewport.
+  function barOrigin(el) {
+    const p = el.offsetParent;
+    if (!p || (p === document.body && getComputedStyle(p).position === 'static')) return { x: -scrollX, y: -scrollY };
+    const r = p.getBoundingClientRect();
+    return { x: r.left + p.clientLeft - p.scrollLeft, y: r.top + p.clientTop - p.scrollTop };
+  }
+  // A sheet or dialog of Instagram's over the video (its comments, Share): the bar steps aside.
+  function coveredOver(v) {
+    if (searchOpen()) return true;
+    const list = document.querySelectorAll('[role="dialog"],[aria-modal="true"]');
+    for (let i = 0; i < list.length && i < 20; i++) {
+      const d = list[i];
+      if (d.contains(v)) continue;
+      const r = d.getBoundingClientRect();
+      if (r.width > 1 && r.height > 1 && getComputedStyle(d).visibility !== 'hidden') return true;
+    }
+    return false;
+  }
+
+  // The post view and Instagram's DM Reel viewer: one bar, on the video that
+  // plays there (the biggest one on screen). Not on Home: one tap (R10) opens
+  // a feed video full screen, bar and all.
+  let pageBar = null, pageBarQueued = false;
+  function pageBarVideo() {
+    const r = route();
+    if (CFG.role !== 'main' || (r !== 'post' && r !== 'reel' && r !== 'direct')) return null;
+    if (fullVideoOn() || reelBox || searchOpen()) return null;
+    const fs = document.fullscreenElement;
+    if (fs && /^(VIDEO|IMG|IFRAME|CANVAS)$/i.test(fs.tagName)) return null;
+    const screen = innerWidth * innerHeight;
+    const least = r === 'direct' ? 0.45 * screen : Math.max(0.15 * screen, 120 * 120);
+    let best = null, area = 0;
+    for (const v of document.getElementsByTagName('video')) {
+      if (v.dataset.sgOwn || isOldMedia(v) || !isFinite(v.duration) || !(v.duration > 0.5)) continue;
+      if (fs && !fs.contains(v)) continue;
+      const a = onScreenArea(v);
+      if (a < least || v.getBoundingClientRect().width < innerWidth * 0.6) continue;
+      if (v.closest('[data-sg-hidden]')) continue;
+      if (a > area) { best = v; area = a; }
+    }
+    return best;
+  }
+  function syncPageBar() {
+    const v = pageBarVideo();
+    if (pageBar && (pageBar.video !== v || !pageBar.el.isConnected)) { pageBar.detach(); pageBar = null; }
+    if (!v) return;
+    if (!pageBar) {
+      // Inside a full-screen element of Instagram's (if any): what is outside it can't be touched.
+      const fs = document.fullscreenElement;
+      const host = fs && fs !== document.documentElement && fs.contains(v) ? fs : document.body;
+      if (!host) return;
+      pageBar = attachSeekBar(v, host, { follow: true, where: route() === 'direct' ? 'dm' : 'post' });
+    }
+    pageBar.place();
+  }
+  function queuePageBar() {
+    if (pageBarQueued || CFG.role !== 'main') return;
+    pageBarQueued = true;
+    requestAnimationFrame(() => { pageBarQueued = false; safe(syncPageBar)(); });
+  }
+  if (CFG.role === 'main') {
+    ['loadedmetadata', 'durationchange', 'playing', 'emptied'].forEach(t =>
+      document.addEventListener(t, e => { if (e.target instanceof HTMLVideoElement) queuePageBar(); }, true));
+    document.addEventListener('scroll', () => { if (pageBar) queuePageBar(); }, { capture: true, passive: true });
+    window.addEventListener('resize', () => queuePageBar(), { passive: true });
+    // Layout moves that fire no event (a caption opening, Instagram's own transitions).
+    setInterval(() => { if (pageBar || /^(post|reel|direct)$/.test(route())) queuePageBar(); }, 1000);
   }
 
   /* ------------------------------------------------------------------ *
@@ -4527,7 +5077,11 @@
     storyPress = null;
     dseq = null;
     downIds.clear();
+    tapSeq = null;
+    menuArm = null;
+    if (r10Wait) { clearTimeout(r10Wait.timer); r10Wait = null; }
     syncSwipeGuard();
+    syncFullHold();
   }
   function touchCensus() {
     const h = document.documentElement, b = document.body;
@@ -4556,6 +5110,8 @@
   const unmuteBudget = new WeakMap();
   function wantsSound(v) {
     if (CFG.role !== 'main') return false;
+    // R8/R10: a video you opened full screen plays with sound, wherever it is.
+    if (v === r8El && fullVideoOn()) return true;
     if (isOldMedia(v)) return false;
     const r = route();
     if (r === 'story' || r === 'reel') return true;
@@ -4685,6 +5241,91 @@
   ['loadedmetadata', 'canplay'].forEach(t => document.addEventListener(t, e => {
     if (e.target instanceof HTMLVideoElement) setTimeout(safe(autoplay), 50);
   }, true));
+
+  /* ------------------------------------------------------------------ *
+   * B21: a video post's still cover picture is framed like its video.
+   * Instagram shows the cover (an <img> over the player, as large as the
+   * post's box) cropped to fill the box, then the video whole inside the
+   * same box: a vertical Reel in a 4:5 post snapped narrower, with black
+   * bars, as it started. The cover now takes the video's own framing: the
+   * same size and place, with the same black bars, so nothing moves.
+   * Instagram's nodes stay where they are; only the cover's style changes,
+   * and only where the change leaves its box exactly as it was.
+   * ------------------------------------------------------------------ */
+  const coverStats = (stats.covers = { framed: 0, undone: 0 });
+  let coverTimer = 0;
+  function queueCovers() {
+    if (coverTimer || CFG.role !== 'main') return;
+    coverTimer = setTimeout(() => { coverTimer = 0; safe(frameCovers)(); }, 60);
+  }
+  // The video's own shape: from the video once it knows, else from Instagram's data.
+  function videoAspect(v, img) {
+    if (v.videoWidth > 0 && v.videoHeight > 0) return v.videoWidth / v.videoHeight;
+    for (const src of [img && (img.currentSrc || img.src), v.poster]) {
+      const hit = src && index.byFile.get(fileOf(src));
+      if (!hit) continue;
+      const it = hit.child >= 0 ? hit.rec.children[hit.child] : hit.rec;
+      if (it && it.vw > 0 && it.vh > 0) return it.vw / it.vh;
+    }
+    return 0;
+  }
+  // The cover pictures over a video: images exactly as large as it, close around it.
+  function coversOf(v, vr) {
+    const out = [];
+    const same = r => Math.abs(r.left - vr.left) < 3 && Math.abs(r.top - vr.top) < 3 &&
+      Math.abs(r.width - vr.width) < 3 && Math.abs(r.height - vr.height) < 3;
+    let n = v.parentElement;
+    for (let i = 0; n && i < 4 && !out.length; i++, n = n.parentElement) {
+      for (const img of n.getElementsByTagName('img')) if (same(img.getBoundingClientRect())) out.push(img);
+    }
+    return out;
+  }
+  function frameCovers() {
+    const r = route();
+    if (CFG.role !== 'main' || r === 'story' || r === 'direct') return;
+    for (const v of document.getElementsByTagName('video')) {
+      if (v.dataset.sgOwn || v.dataset.sgFull || !v.closest(POST)) continue;
+      const vr = v.getBoundingClientRect();
+      if (vr.width < 100 || vr.height < 100 || vr.bottom < -innerHeight || vr.top > 3 * innerHeight) continue;
+      const covers = coversOf(v, vr);
+      if (!covers.length) continue;
+      const a = videoAspect(v, covers[0]);
+      if (!a || !/^(contain|)$/.test(getComputedStyle(v).objectFit)) continue;
+      // The video's picture: whole and as large as fits, centred (how a <video> draws).
+      const box = vr.width / vr.height;
+      const pw = a > box ? vr.width : vr.height * a, ph = a > box ? vr.width / a : vr.height;
+      const bx = Math.max(0, (vr.width - pw) / 2), by = Math.max(0, (vr.height - ph) / 2);
+      for (const img of covers) frameCover(img, bx, by);
+    }
+  }
+  // The bars are the cover's own padding, painted black; the picture fills
+  // what is left (cropped only if Instagram's cover isn't the video's shape).
+  function frameCover(img, bx, by) {
+    const key = bx.toFixed(1) + ' ' + by.toFixed(1);
+    if (img.dataset.sgCover === key || img.dataset.sgCover === 'no') return;
+    if (bx < 0.5 && by < 0.5 && !img.dataset.sgCover) return;     // no bars: nothing to match
+    const before = img.getBoundingClientRect();
+    const st = img.style;
+    st.setProperty('box-sizing', 'border-box', 'important');
+    st.setProperty('padding', by.toFixed(2) + 'px ' + bx.toFixed(2) + 'px', 'important');
+    st.setProperty('object-fit', 'cover', 'important');
+    st.setProperty('background-color', '#000', 'important');
+    const after = img.getBoundingClientRect();
+    if (Math.abs(after.width - before.width) > 1 || Math.abs(after.height - before.height) > 1) {
+      // Its box would change size: leave Instagram's cover as it was.
+      for (const p of ['box-sizing', 'padding', 'object-fit', 'background-color']) st.removeProperty(p);
+      img.dataset.sgCover = 'no';
+      coverStats.undone++;
+      return;
+    }
+    if (!img.dataset.sgCover) coverStats.framed++;
+    img.dataset.sgCover = key;
+  }
+  if (CFG.role === 'main') {
+    document.addEventListener('load', e => { if (e.target instanceof HTMLImageElement) queueCovers(); }, true);
+    document.addEventListener('loadedmetadata', e => { if (e.target instanceof HTMLVideoElement) queueCovers(); }, true);
+    window.addEventListener('resize', () => queueCovers(), { passive: true });
+  }
 
   /* ------------------------------------------------------------------ *
    * Keep the screen on while a visible video plays.
@@ -6772,6 +7413,7 @@
       case 'storyHold': storyHold(!!cmd.on); break;
       case 'appHold': appHold(!!cmd.on); break;
       case 'fullVideoExit': exitFullVideo('back'); break;
+      case 'fullVideoMenu': fullVideoMenu(); break;
       case 'gestureReset': gestureReset(); break;
       case 'scrollStuckAck': stuckAck(cmd); break;
       // The app's chip is still up from an earlier page: the first drag here that scrolls clears it.

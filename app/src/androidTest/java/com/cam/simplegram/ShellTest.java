@@ -923,10 +923,10 @@ public class ShellTest {
         }
     }
 
-    /** R8: a post's video in full screen has the whole screen; the tab (elevated) is not drawn or touchable over it. */
+    /** R8/R10: a video in full screen (a post's, a Reel's, the feed's) has the whole screen; the tab (elevated) is not drawn or touchable over it. */
     @Test
     public void postVideoFullScreenHidesTheMenuTab() throws Exception {
-        for (String r : new String[]{"post", "reel"}) {
+        for (String r : new String[]{"post", "reel", "home", "other"}) {
             try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
                 AtomicReference<MainActivity> act = new AtomicReference<>();
                 s.onActivity(act::set);
@@ -951,6 +951,49 @@ public class ShellTest {
                 assertNull(video.getParent());
                 assertEquals(r, View.VISIBLE, menuTab(act.get()).getVisibility());
             }
+        }
+    }
+
+    /**
+     * R10 from the menu: the app taps the page's video for it (a real tap through
+     * the web view's input), but never while a full-screen view is up or the menu
+     * is still showing; held taps are counted. Shapes only.
+     */
+    @Test
+    public void menuFullScreenVideoTapsThePageOnlyWhenSafe() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            java.lang.reflect.Field taps = MainActivity.class.getDeclaredField("videoTaps");
+            java.lang.reflect.Field held = MainActivity.class.getDeclaredField("videoTapsHeld");
+            taps.setAccessible(true);
+            held.setAccessible(true);
+            String tap = new JSONObject().put("action", "fullVideoTap").put("x", 200).put("y", 300).put("w", 412).toString();
+            // A full-screen view is up: held.
+            View video = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            s.onActivity(a -> {
+                try {
+                    chromeOf(a).onShowCustomView(video, () -> { });
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            idle();
+            message(s, tap);
+            SystemClock.sleep(600);
+            idle();
+            assertEquals(0, taps.getInt(act.get()));
+            assertEquals(1, held.getInt(act.get()));
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            // Nothing in the way: one tap is made. Nonsense spots are ignored.
+            message(s, tap);
+            message(s, new JSONObject().put("action", "fullVideoTap").put("x", -5).put("y", 300).put("w", 412).toString());
+            message(s, new JSONObject().put("action", "fullVideoTap").put("x", 200).put("y", 300).put("w", 0).toString());
+            SystemClock.sleep(600);
+            idle();
+            assertEquals(1, taps.getInt(act.get()));
+            assertEquals(1, held.getInt(act.get()));
         }
     }
 

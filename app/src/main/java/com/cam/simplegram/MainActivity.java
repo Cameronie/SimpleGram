@@ -25,6 +25,7 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -110,6 +111,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private boolean pageVideo;
     // A post's video in full screen (R8) hid the menu tab: the whole screen, no icons over it.
     private boolean fullHidTab;
+    // R10 from the menu: the taps the app made on the page's video for it, and the ones it held back.
+    private int videoTaps, videoTapsHeld;
     private Downloads downloads;
 
     private String route = "other";
@@ -550,10 +553,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             // finger down on the page now is cancelled here, where the input lives.
             logFullScreen("show", "page");
             splitTouch(true, liveInput(view));
-            // R8: a post's video takes the whole screen. The tab's elevation would
-            // draw it (and give it taps) over the video, so it goes. Not in a Story,
-            // where the tab is how Stories are saved (R9's layer hides it itself).
-            if ("post".equals(route) || "reel".equals(route)) {
+            // R8/R10: a video takes the whole screen (from a post, a Reel, the feed or
+            // a profile). The tab's elevation would draw it (and give it taps) over
+            // the video, so it goes. Not in a Story, where the tab is how Stories are
+            // saved (R9's layer hides it itself), nor in DMs (Instagram's own).
+            if (!"story".equals(route) && !"direct".equals(route)) {
                 fullHidTab = true;
                 menuButton.setVisibility(View.GONE);
                 zoomChip.setVisibility(View.GONE);
@@ -717,6 +721,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "fullVideo":
                 if (main) setPageVideo(m.optBoolean("on"));
+                break;
+            case "fullVideoTap":
+                // R10 from the menu: the page names a spot on its video; the app taps it.
+                if (main) tapVideoForPage(m.optDouble("x", -1), m.optDouble("y", -1), m.optDouble("w", 0), 0);
                 break;
             case "fullVideoExitRequest":
                 // R8's swipe (and R10's later): leave full screen the Back way, view
@@ -1228,6 +1236,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         final boolean[] keepHold = {false};
         String[] items = {
                 "Download photo / video",
+                "Full-screen video",
                 "Copy link",
                 "Share link…",
                 "Following feed (newest first)",
@@ -1242,18 +1251,22 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     js("download");
                     break;
                 case 1:
-                    copyLink();
+                    // R10: the page finds the video on screen and asks for a tap (fullVideoTap).
+                    js("fullVideoMenu");
                     break;
                 case 2:
-                    shareLink();
+                    copyLink();
                     break;
                 case 3:
-                    loadMain(FOLLOWING);
+                    shareLink();
                     break;
                 case 4:
-                    loadMain(FAVORITES);
+                    loadMain(FOLLOWING);
                     break;
                 case 5:
+                    loadMain(FAVORITES);
+                    break;
+                case 6:
                     feedWanted = false;
                     skipKind = "";
                     updateFeedBar();
@@ -1261,7 +1274,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     goBackAt = 0;
                     web.reload();
                     break;
-                case 6:
+                case 7:
                     keepHold[0] = true;
                     enterScreenshot();
                     break;
@@ -1528,6 +1541,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         .append(" · not found: ").append(fv.optInt("r9Missing"))
                         .append(" · Story moved on: ").append(fv.optInt("r9Moved"))
                         .append(" · from the card: ").append(fv.optInt("r9Pressed")).append('\n')
+                        .append("  Feed and post videos (one tap): ").append(fv.optInt("r10"))
+                        .append(" · double taps (likes): ").append(fv.optInt("r10Doubles"))
+                        .append(" · from the menu: ").append(fv.optInt("r10Menu"))
+                        .append(" (taps made ").append(videoTaps).append(", held ").append(videoTapsHeld).append(")\n")
                         .append("  Back to the post or Story: ").append(fv.optInt("exits")).append('\n');
             }
         }
@@ -1641,6 +1658,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("fullScreens", fullScreens);
             n.put("fullScreenLast", fullScreenLast);
             n.put("fullScreenNested", fullScreenNested);
+            n.put("videoTaps", videoTaps);
+            n.put("videoTapsHeld", videoTapsHeld);
             n.put("continueHome", continueHome());
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
@@ -2080,6 +2099,58 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             getWindow().superDispatchTouchEvent(c);
             c.recycle();
         }
+    }
+
+    /**
+     * R10 from the menu. Full screen needs a tap of yours, and a native menu gives
+     * the page none, so the app taps the page's video for it once the menu has
+     * gone: one finger, down and up at once, straight to the page view, through
+     * the web engine's own input (a real, trusted tap). The page turns that tap
+     * into full screen at once and keeps it from Instagram. B25: never while a
+     * finger is down, a full-screen view is up or the zoom frame holds or owns
+     * the page; the down and up go together, so no touch of yours can come
+     * between them, and nothing the app holds is split.
+     *
+     * @param x the spot, in the page's CSS pixels
+     * @param w the page's width in CSS pixels (the scale to the view's pixels)
+     */
+    private void tapVideoForPage(final double x, final double y, final double w, final int tries) {
+        if (!(x >= 0) || !(y >= 0) || !(w > 0) || Double.isInfinite(x) || Double.isInfinite(y) || Double.isInfinite(w)) return;
+        ui.postDelayed(() -> {
+            if (isFinishing() || web == null) return;
+            if (menuOpen || !hasWindowFocus()) {
+                // The menu is still going away.
+                if (tries < 10) tapVideoForPage(x, y, w, tries + 1);
+                else videoTapsHeld++;
+                return;
+            }
+            if (customView != null || touchOpen || zoom.isHolding() || zoom.isOwned() || zoom.isPinching()
+                    || screenshotMode || pageVideo || rebuilding || web.getWidth() <= 0) {
+                videoTapsHeld++;
+                return;
+            }
+            float f = web.getWidth() / (float) w;
+            float px = (float) (x * f), py = (float) (y * f);
+            if (px >= web.getWidth() || py >= web.getHeight()) return;
+            long t = SystemClock.uptimeMillis();
+            MotionEvent.PointerProperties[] pp = {new MotionEvent.PointerProperties()};
+            pp[0].id = 0;
+            pp[0].toolType = MotionEvent.TOOL_TYPE_FINGER;
+            MotionEvent.PointerCoords[] pc = {new MotionEvent.PointerCoords()};
+            pc[0].x = px;
+            pc[0].y = py;
+            pc[0].pressure = 1f;
+            pc[0].size = 0.05f;
+            MotionEvent down = MotionEvent.obtain(t - 40, t - 40, MotionEvent.ACTION_DOWN, 1, pp, pc, 0, 0, 1f, 1f,
+                    0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
+            MotionEvent up = MotionEvent.obtain(t - 40, t, MotionEvent.ACTION_UP, 1, pp, pc, 0, 0, 1f, 1f,
+                    0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
+            web.dispatchTouchEvent(down);
+            web.dispatchTouchEvent(up);
+            down.recycle();
+            up.recycle();
+            videoTaps++;
+        }, 150);
     }
 
     /** Leaves full screen the Back way: the view goes first, then Chromium is told. */
