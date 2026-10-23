@@ -1353,4 +1353,101 @@ public class ShellTest {
             idle();
         }
     }
+
+    /**
+     * R12: comments for a Reel shown over a Story. The Story is in the app's
+     * full-screen view; the comments sheet comes up over it (drawn and touched
+     * above it, raised by Z with no view moved in the tree), the page under the
+     * Story isn't split, Back closes the comments first and then the Reel, and
+     * the comments go when the Reel or the Story's full screen does.
+     */
+    @Test
+    public void commentsSheetShowsOverAStoryReel() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            MainActivity a = act.get();
+            CommentsPanel panel = panelOf(a);
+            ZoomFrame z = zoomOf(a);
+            boolean[] hidden = new boolean[1];
+            int[] storyTouches = new int[1];
+            View story = new View(InstrumentationRegistry.getInstrumentation().getTargetContext()) {
+                @Override
+                public boolean dispatchTouchEvent(MotionEvent e) {
+                    storyTouches[0]++;
+                    return true;
+                }
+            };
+            String on = new JSONObject().put("action", "fullVideo").put("on", true).toString();
+            String open = new JSONObject().put("action", "comments").put("code", "REELCODE1")
+                    .put("url", "https://www.instagram.com/p/REELCODE1/comments/").put("dpr", 2.625).toString();
+            s.onActivity(x -> {
+                try {
+                    chromeOf(x).onShowCustomView(story, () -> hidden[0] = true);
+                    call(x, "onMessage", new Class<?>[]{String.class, String.class}, "main", on);
+                    call(x, "onMessage", new Class<?>[]{String.class, String.class}, "main", open);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(500);
+            idle();
+            assertTrue(panel.isOpen());
+            assertEquals(View.VISIBLE, panel.getVisibility());
+            assertFalse("the page under the Story isn't split", z.isSplit());
+            assertTrue("the sheet is above the full-screen view", panel.getZ() > story.getZ());
+            ViewGroup root = (ViewGroup) panel.getParent();
+            assertEquals("no view moved in the tree", 1, root.indexOfChild(panel));
+            int rootH = root.getHeight();
+            int top = Math.round(rootH * 0.42f);
+            assertEquals(rootH - top, panel.getHeight(), 3);
+            // A touch on the sheet is the sheet's; one above it is the Story's (its Reel's).
+            int[] at = new int[2];
+            root.getLocationInWindow(at);
+            s.onActivity(x -> tap(x.getWindow().getDecorView(), at[0] + root.getWidth() / 2f, at[1] + top + dpOf(x, 120)));
+            idle();
+            assertEquals(0, storyTouches[0]);
+            s.onActivity(x -> tap(x.getWindow().getDecorView(), at[0] + root.getWidth() / 2f, at[1] + top / 2f));
+            idle();
+            assertEquals(2, storyTouches[0]);
+            // Back: the comments first; the Reel and the Story's full screen stay.
+            s.onActivity(MainActivity::onBackPressed);
+            SystemClock.sleep(500);
+            idle();
+            assertFalse(panel.isOpen());
+            assertEquals(0f, panel.getTranslationZ(), 0.001f);
+            assertFalse(hidden[0]);
+            assertEquals(View.GONE, menuTab(a).getVisibility());
+            // Open again; the Reel closing (fullVideo off) takes the comments with it.
+            message(s, open);
+            SystemClock.sleep(400);
+            idle();
+            assertTrue(panel.isOpen());
+            message(s, new JSONObject().put("action", "fullVideo").put("on", false).toString());
+            SystemClock.sleep(400);
+            idle();
+            assertFalse(panel.isOpen());
+            assertFalse(hidden[0]);
+            // And the Story's full screen ending takes them too.
+            message(s, on);
+            message(s, open);
+            SystemClock.sleep(400);
+            idle();
+            assertTrue(panel.isOpen());
+            s.onActivity(x -> {
+                try {
+                    chromeOf(x).onHideCustomView();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(400);
+            idle();
+            assertFalse(panel.isOpen());
+        }
+    }
+
+    private static float dpOf(MainActivity a, int v) {
+        return v * a.getResources().getDisplayMetrics().density;
+    }
 }
