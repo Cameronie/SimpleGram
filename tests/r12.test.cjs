@@ -637,8 +637,9 @@ test('R12: comments limited for you can still be read: the panel opens; turned o
 test('R12: an action on its way belongs to the Reel: closed and opened again, a tap sends nothing more; a late refusal shows on the open one', async () => {
   let refuse = false;
   const page = await openStory({ api: {
-    '/api/graphql': () => refuse ? { body: { errors: [{ message: 'no', code: 1357004 }], data: null }, delay: 1200 }
-      : { body: { data: { xig_media_like: { media: { id: REEL_PK } } } }, delay: 1200 },
+    // Long enough that the reopened Reel's tap surely lands while the like is still on its way.
+    '/api/graphql': () => refuse ? { body: { errors: [{ message: 'no', code: 1357004 }], data: null }, delay: 4000 }
+      : { body: { data: { xig_media_like: { media: { id: REEL_PK } } } }, delay: 4000 },
   } });
   await openReel(page);
   await tapOn(page, '.like');
