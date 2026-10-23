@@ -167,3 +167,84 @@ test('B22 Instagram stops asking for ready posts: after about 40 s at the bottom
   assert.ok(s.cont.stats.waits.atCard.ms >= 30000 && s.cont.stats.waits.atCard.buffer > 0, JSON.stringify(s.cont.stats.waits.atCard));
   await context.close();
 });
+
+test('B22 a slow reader, then Instagram\'s own next page takes 20 s: no stalled card (the wait at the bottom has its own 40 s)', { timeout: 150000 }, async () => {
+  // 45 s over the last handed page, so Instagram's previous page is long past when you reach the bottom.
+  let slow = false;
+  const { pg, S, context } = await openIG({ home: phoneHome(), follow: range(1, 400),
+    delay: { home: 100, following: 150, recs: () => slow ? 20000 : 150 } }, { sgCfg: ON });
+  await readToEnd(pg, 8, 300);
+  assert.ok(await waitFor(pg, async () => (await snap(pg)).cont.stats.swaps >= 2, 15000), 'two handovers');
+  await pg.evaluate(() => { const se = document.scrollingElement; se.scrollTop = se.scrollHeight - innerHeight * 4; });
+  await pg.waitForTimeout(45000);
+  assert.ok((await snap(pg)).cont.buffer > 0, 'posts ready');
+  slow = true;
+  const recs0 = S.recsN, swaps = (await snap(pg)).cont.stats.swaps;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 24000) {
+    await sitAtBottom(pg, 1000);
+    assert.equal(stalledCards(await snap(pg)).length, 0, 'no stalled card at ' + (Date.now() - t0));
+  }
+  assert.ok(S.recsN > recs0, 'Instagram asked');
+  assert.ok(await waitFor(pg, async () => (await snap(pg)).cont.stats.swaps > swaps, 5000), 'the slow page arrived');
+  await pg.evaluate(() => { document.scrollingElement.scrollTop = 0; });
+  await pg.waitForTimeout(800);
+  const s = await snap(pg);
+  assert.equal(stalledCards(s).length, 0);
+  assert.equal(s.cont.stats.waits.cards, 0);
+  assert.ok(s.cont.stats.waits.last.some(e => e.end === 'posts' && e.i >= 15000), JSON.stringify(s.cont.stats.waits.last));
+  await context.close();
+});
+
+test('B22 diagnostics: posts ready while a slow refill read is on its way and Instagram\'s page is pending: the wait is Instagram\'s, not "read"', { timeout: 150000 }, async () => {
+  let slowN = 0;
+  const { pg, S, context } = await openIG({ home: phoneHome(), follow: range(1, 400),
+    delay: { home: 100, following: 7000, recs: n => (slowN && n === slowN) ? 12000 : 150 } }, { sgCfg: ON });
+  await readToEnd(pg, 8, 300);
+  assert.ok(await waitFor(pg, async () => (await snap(pg)).cont.buffer >= 24, 45000), 'two pages ready');
+  slowN = S.recsN + 2;   // the page after the next one is slow
+  for (let i = 0; i < 30 && S.recsN < slowN; i++) await readScreens(pg, 500, 4);
+  assert.ok(S.recsN >= slowN, 'Instagram asked for the slow page');
+  const samples = [];
+  const t0 = Date.now();
+  while (Date.now() - t0 < 14000) {
+    await sitAtBottom(pg, 1000);
+    const c = (await snap(pg)).cont;
+    samples.push(c);
+    if (c.buffer > 0) assert.equal(c.why, 'ig', 'posts ready: ' + c.buffer + '/' + c.inFlight);
+  }
+  assert.ok(samples.some(c => c.buffer > 0 && c.inFlight), 'a refill read was on its way while posts were ready');
+  await pg.evaluate(() => { document.scrollingElement.scrollTop = 0; });
+  await pg.waitForTimeout(800);
+  const W = (await snap(pg)).cont.stats.waits;
+  // The last wait: the one at the slow page (an earlier one, while the first reads filled the buffer, is rightly "read").
+  const w = W.last.filter(e => e.ms >= 8000 && e.end === 'posts').pop();
+  assert.ok(w, JSON.stringify(W.last));
+  assert.equal(w.r, 0, "not blamed on own reads: " + JSON.stringify(W.last));
+  assert.equal(w.p, 0);
+  assert.ok(w.i >= w.ms - 1000, JSON.stringify(w));
+  assert.equal(W.cards, 0);
+  await context.close();
+});
+
+test('B22 an own read that never settles (a token request that hangs) still ends in the stalled card, about 20 s at the bottom', { timeout: 120000 }, async () => {
+  // DTSGInitialData in neither the modules nor the page: the token is asked of "/", which never answers.
+  const { pg, S, context } = await openIG({ home: phoneHome(), follow: range(1, 400) }, { sgCfg: ON, igP: { missing: ['DTSGInitialData'] } });
+  await pg.route(u => new URL(u).pathname === '/', route => {
+    if (route.request().resourceType() === 'fetch') return;   // a quiet connection: never answered
+    return route.fallback();
+  });
+  await pg.evaluate(() => { for (const s of document.querySelectorAll('script:not([src])')) if (/DTSGInitialData/.test(s.textContent)) s.remove(); });
+  await readToEnd(pg, 8, 300);
+  const t0 = Date.now();
+  let shownAt = 0;
+  while (Date.now() - t0 < 40000 && !shownAt) {
+    await sitAtBottom(pg, 1000);
+    if (stalledCards(await snap(pg)).length) shownAt = Date.now() - t0;
+  }
+  const s = await snap(pg);
+  assert.equal(own(S).length, 0, 'the own read never got as far as its request');
+  assert.equal(s.cont.inFlight, true);
+  assert.ok(shownAt >= 14000 && shownAt <= 30000, 'the stalled card at ' + shownAt);
+  await context.close();
+});

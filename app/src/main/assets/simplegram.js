@@ -434,14 +434,22 @@
   // B23: what Home's continuation (R7) already read of Following, carried to
   // the card's Following page so its first page starts right past the posts
   // seen in Home: Following's cursor there and the posts read but not shown.
-  // Only fresh reads (5 min) of the same account; bounded in size.
-  const CARRY_MS = 5 * 60000, CARRY_POSTS = 48, CARRY_CHARS = 1000000;
+  // Only fresh reads (5 min) of the same account; bounded in size. read: the
+  // codes R7 read along the chain that ends at the cursor, nearest Following's
+  // head (the proof that no post lies between Following's head and the cursor).
+  const CARRY_MS = 5 * 60000, CARRY_POSTS = 48, CARRY_CHARS = 1000000, CARRY_READ = 60;
+  // Why a carry was left behind (kept for the next report): too big for
+  // storage, too many posts, storage refused, or an error reading it.
+  const CARRY_DROPS = ['big', 'many', 'quota', 'error'];
   function carryOk(c) {
     if (!c || typeof c !== 'object') return '';
+    if (c.dropped) return CARRY_DROPS.includes(c.dropped) ? c.dropped : 'shape';
     if (!c.acct || c.acct !== (viewerId() || '')) return 'acct';
     if (!(Date.now() - c.at < CARRY_MS && Date.now() >= c.at - 1000)) return 'stale';
     if (typeof c.cursor !== 'string' || !c.cursor || c.cursor.length > 512 || !Array.isArray(c.edges) ||
         c.edges.length > CARRY_POSTS || c.edges.some(e => !e || typeof e !== 'object' || !edgeCode(e))) return 'shape';
+    if (c.read !== undefined && (!Array.isArray(c.read) || c.read.length > CARRY_READ ||
+        c.read.some(k => typeof k !== 'string' || k.length > 64))) return 'shape';
     return 'ok';
   }
   // Used once, by the page the end-of-Home card opens, then forgotten:
@@ -456,10 +464,16 @@
       skip = { variant: saved.variant, path: here(), codes: new Set(saved.codes),
         passed: new Set(), nudgedAt: [], halted: false, status: '', statusTimer: 0, carry: null };
       // Diagnostics: none (nothing carried), used, cursor (only the cursor),
-      // new (Instagram's first page was all new: B17's skipping), or why it was ignored.
+      // new (Instagram's first page was not in R7's reading: B17's skipping),
+      // why it was ignored, or why Home left it behind (CARRY_DROPS, with the
+      // number of posts and, when too big, its size).
       const ok = saved.variant === 'following' ? carryOk(saved.carry) : '';
       stats.feed.carry = ok || 'none';
       if (ok === 'ok') skip.carry = saved.carry;
+      else if (CARRY_DROPS.includes(ok)) {
+        if (typeof saved.carry.n === 'number') stats.feed.carryN = saved.carry.n;
+        if (typeof saved.carry.chars === 'number') stats.feed.carryChars = saved.carry.chars;
+      }
     }
   } catch (e) { /* storage unavailable */ }
   function skipping() {
@@ -478,13 +492,18 @@
   function continueFeed(variant) {
     const saved = { variant: variant, codes: Array.from(homeSeen).slice(-3000), at: Date.now() };
     let carry = null;
-    if (variant === 'following') { try { carry = contCarry(); } catch (e) { carry = null; } }
+    if (variant === 'following') { try { carry = contCarry(); } catch (e) { carry = { dropped: 'error' }; } }
+    // Left behind (B17's skipping only), with why, so the next report can tell it from "nothing read".
+    const dropped = (why, chars) => JSON.stringify(Object.assign({ carry: carry ? { dropped: why,
+      n: Array.isArray(carry.edges) ? carry.edges.length : (carry.n || 0), chars: chars || 0 } : null }, saved));
     try {
       let text = JSON.stringify(Object.assign({ carry: carry }, saved));
-      if (text.length > CARRY_CHARS) text = JSON.stringify(saved);   // too big: B17's skipping only
+      if (text.length > CARRY_CHARS) text = dropped('big', text.length);
       sessionStorage.setItem(SKIP_KEY, text);
     } catch (e) {
-      try { sessionStorage.setItem(SKIP_KEY, JSON.stringify(saved)); } catch (e2) { /* storage unavailable: no skipping */ }
+      try { sessionStorage.setItem(SKIP_KEY, dropped(carry && carry.dropped ? carry.dropped : 'quota')); } catch (e2) {
+        try { sessionStorage.setItem(SKIP_KEY, JSON.stringify(saved)); } catch (e3) { /* storage unavailable: no skipping */ }
+      }
     }
     location.assign('/?variant=' + variant);
   }
@@ -1047,6 +1066,7 @@
     safe(syncRoom)(fs, more);
     if (seenCodes) safe(skipProgress)(fs);
     if (carried >= 0) tr.cy = carried;
+    if (seenCodes && first && stats.feed.carry) tr.cr = stats.feed.carry;   // B23's outcome, kept across restarts
     safe(pushTrail)(Object.assign(tr, { out: list.length, k: keptMedia, sk: alreadySeen, ad: tally.ad || 0,
       sg: (tally.suggested || 0) + (tally.notFollowed || 0) + (tally.exploreTitle || 0), nx1: more,
       an: anchor ? anchor.kind : '', first: first, ae: false }));
@@ -1057,18 +1077,20 @@
   // duplicates, has_next only with a string cursor): this page's own new
   // posts, then the carried posts, and Following's cursor past them, so
   // Instagram's next request starts right past the posts seen in Home. Only
-  // when this page holds a post Home showed or one carried: Following is
-  // newest first, so anything newer than R7's reading is then on this page
-  // (all new: a gap could follow; B17's skipping instead). Returns null to
-  // leave the page to B17's skipping.
+  // when this page holds a post R7 itself read along the chain that ends at
+  // the carried cursor (c.read): Following is newest first, so anything newer
+  // than R7's reading is then on this page. A post Home showed is no proof
+  // (Home can show posts newer than R7's reading: Instagram's own pages, a
+  // refreshed Home); otherwise a gap could follow: B17's skipping instead.
+  // Returns null to leave the page to B17's skipping.
   function takeCarry(owner, list, verdicts, seen) {
     const c = skip.carry;
     skip.carry = null;
     const pi = owner.page_info;
     if (!pi || typeof pi !== 'object' || list.length !== verdicts.length) { stats.feed.carry = 'shape'; return null; }
-    const known = new Set(c.edges.map(edgeCode));
+    const proof = new Set(Array.isArray(c.read) ? c.read : []);
     const codes = list.map((e, i) => verdicts[i].media ? edgeCode(e) : null);
-    if (!codes.some(k => k && (seen.has(k) || known.has(k)))) { stats.feed.carry = 'new'; return null; }
+    if (!codes.some(k => k && proof.has(k))) { stats.feed.carry = 'new'; return null; }
     const have = new Set(codes.filter((k, i) => k && !verdicts[i].drop));
     let n = 0;
     for (const e of c.edges) {
@@ -1485,10 +1507,11 @@
   // line; hand: per handover, posts and the page height in screens before
   // and 1.5 s after (growth: appended; shrink: replaced). waits (B22): times
   // you waited at the bottom while Home went on (1 s or more), how long and
-  // why in ms (empty: nothing ready or on its way, read: an own read on its
-  // way, pacing: its turn not come, ig: posts ready, Instagram's next page
-  // pending), the "Loading more…" notes, the stalled cards while it ran (with
-  // the wait so far), and the last few waits (end: posts, up, ended).
+  // why in ms (empty: nothing ready or on its way, read: nothing ready, an own
+  // read on its way, pacing: nothing ready, its turn not come, ig: posts
+  // ready, Instagram's next page pending), the "Loading more…" notes, the
+  // stalled cards while it ran (with the wait so far), and the last few
+  // waits (end: posts, up, ended).
   const cont = (stats.cont = { on: CFG.continueHome === true, state: 'off', reason: '', own: 0, ownFail: 0, pages: 0,
     swaps: 0, handed: 0, empty: 0, skippedSeen: 0, heads: 0, anchors: 0, recsAnchors: 0, nudges: 0,
     headWhy: { marker: 0, seen: 0, jump: 0, tap: 0, ended: 0 }, igKept: 0, resets: 0, keptBuffer: 0,
@@ -1500,6 +1523,7 @@
   let contAnsweredAt = 0, contFetchAt = 0;
   let contResumeAt = null;       // what a reset kept: where Following had got to, and posts read but not shown
   let contSeenPassed = 0;        // seen posts passed in this page load
+  let contRead = [];             // B23: codes read along the current chain of Following, nearest its head (CARRY_READ)
   const contOwnAt = [], contStarts = [], labelCodes = [];
   // Instagram's refresh paths call window.scrollTo(0, 0) right before they
   // reload Home's first page (twice from the Home tab on mobile: b314
@@ -1607,21 +1631,26 @@
   // a read on its way or waiting for its turn, the buffer being filled (the
   // next read is started here if it is due), or posts ready while Instagram's
   // own next page is pending (it was nudged), for up to CONT_IG_WAIT since
-  // Instagram's last Home page. Past that, Instagram has stopped asking: the card.
+  // Instagram's last Home page or since reaching the bottom, whichever is
+  // later (a slow reader gets the whole wait too). Past that, Instagram has
+  // stopped asking: the card. A read that never settles counts only as long
+  // as contReading allows it, so a stuck read still ends in the card.
   function contWorking(fs) {
     if (!contAlive()) return false;
     if (contReading()) return true;
-    if (contWantsRead()) { contFill(); if (contInFlight || cs.timer) return true; }
-    return cs.buffer.length > 0 && Date.now() - fs.lastPageAt < CONT_IG_WAIT;
+    if (contWantsRead()) { contFill(); if (contReading() || cs.timer) return true; }
+    return cs.buffer.length > 0 && Date.now() - Math.max(fs.lastPageAt, atBottomSince || 0) < CONT_IG_WAIT;
   }
-  // Why Home waits at the bottom (diagnostics): an own read on its way, its
-  // turn not come yet (pacing), posts ready while Instagram's next page is
-  // pending, or the buffer empty with nothing on its way.
+  // Why Home waits at the bottom (diagnostics): posts ready while Instagram's
+  // next page is pending (whatever refill is on its way: the handover never
+  // waits for it), or nothing ready and an own read on its way, its turn not
+  // come yet (pacing), or nothing on its way.
   function contWhy() {
     if (!contAlive()) return '';
+    if (cs.buffer.length) return 'ig';
     if (contInFlight) return 'read';
     if (cs.timer) return 'pacing';
-    return cs.buffer.length ? 'ig' : 'empty';
+    return 'empty';
   }
   // merged: the second head of the same reload (counted once).
   function contStart(merged) {
@@ -1781,6 +1810,7 @@
       if (!take(e) && edgeCode(e)) { cont.skippedSeen++; contSeenPassed++; }
     }
     if (!recognised) { contFail('format'); return; }
+    contNoteRead(c.edges, q.name === CONT_ROOT);
     let next = cursorOf(c);
     if (!hasMore(c) || !next || next === after) cs.more = false;
     cs.fmore = cs.more;
@@ -1806,11 +1836,30 @@
     if (cs.buffer.length && cs.waiting) { cont.nudges++; scheduleNudge(true); }
     contFill();
   }
+  // B23: the codes of a read, for the carried start's proof of no gap. A
+  // first read starts a new chain, unless a reset's cursor follows it: then
+  // its posts join only when they meet the old chain (else a gap lies between).
+  // Further reads go on along the chain; only the first CARRY_READ codes count.
+  function contNoteRead(edges, root) {
+    const codes = [];
+    for (const e of edges) {
+      const k = edgeCode(e);
+      if (typeof k === 'string' && k.length <= 64 && !codes.includes(k)) codes.push(k);
+    }
+    if (!root) {
+      for (const k of codes) if (contRead.length < CARRY_READ && !contRead.includes(k)) contRead.push(k);
+    } else if (!cs.resume || !cs.resume.cursor) {
+      contRead = codes.slice(0, CARRY_READ);
+    } else if (codes.some(k => contRead.includes(k))) {
+      contRead = codes.concat(contRead.filter(k => !codes.includes(k))).slice(0, CARRY_READ);
+    }
+  }
   // B23: for the card's Following page, where this page load's reading of
   // Following got to: its cursor past the posts read, whether Following has
   // more, and the posts read but not shown yet (in Following's order). Only
   // when a read placed a cursor; nothing is dropped (dropping a post would
-  // leave a gap before the cursor): too many posts and nothing is carried.
+  // leave a gap before the cursor): too many posts and nothing is carried
+  // (only why, for the report).
   function contCarry() {
     // fmore is Following's own word; more can be a stop of the run (a failure, the request cap).
     const moreOf = r => typeof r.fmore === 'boolean' ? r.fmore : r.more !== false;
@@ -1830,8 +1879,8 @@
       have.add(code);
       out.push(e);
     }
-    if (out.length > CARRY_POSTS) return null;
-    return { acct: viewerId() || '', at: at, cursor: cursor, more: more, edges: out };
+    if (out.length > CARRY_POSTS) return { dropped: 'many', n: out.length };
+    return { acct: viewerId() || '', at: at, cursor: cursor, more: more, edges: out, read: contRead.slice(0, CARRY_READ) };
   }
   // Back on Home, or the app back in front: a nudge that was due is given again.
   function contResume() {

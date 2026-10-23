@@ -79,6 +79,7 @@ test('B23 the card\'s Following starts right past the posts seen in Home: the ca
   const tr = await pg.evaluate(() => window.__sg.trail().filter(e => e.cy != null));
   assert.equal(tr.length, 1);
   assert.equal(tr[0].cy, h.cont.buffer);
+  assert.equal(tr[0].cr, 'used', 'the outcome kept in the trail');
   await o.context.close();
 });
 
@@ -178,3 +179,76 @@ test('B23 Following opened from the menu is unchanged: Instagram\'s pages as sen
   assert.equal(s.cursor, 'f3');
   await o.context.close();
 });
+
+test('B23 a refreshed Home showed posts newer than R7\'s reading (R7 failed, so no new read): a seen post is no proof, B17\'s skipping shows every new post', { timeout: 120000 }, async () => {
+  const home = Object.assign(phoneHome(), {
+    headA: { edges: [friend('N4'), friend('N3'), ad('A5'), friend('F02')], next: 'hA' },
+    headB: { edges: [friend('N4'), friend('N3'), ad('A6'), marker()], next: 'hB', ps: 'feed_recs' },
+    hA: { edges: [recs('X5'), ad('A7'), marker()], next: 'mA', ps: 'feed_recs' },
+  });
+  delete home.r2;
+  const cfg = { home, follow: S => (S.fresh ? ['N4', 'N3', 'N2', 'N1'] : []).concat(range(1, 400)) };
+  const o = await openIG(cfg, { sgCfg: ON });
+  const { pg, S } = o;
+  await readToEnd(pg, 8, 350);
+  // A read of Following fails: Home's continuation is over for this page load.
+  cfg.followFail = { at: S.log.filter(e => e.variant === 'following').length + 1, status: 500 };
+  assert.ok(await waitFor(pg, async () => { await readToEnd(pg, 2, 350); return (await snap(pg)).cont.stats.state === 'failed'; }, 30000), 'failed');
+  delete cfg.followFail;
+  // Friends post N4..N1; the Home tab refreshes Home, which leads with N4 N3, then the marker.
+  S.fresh = true;
+  await pg.evaluate(() => { window.__ig.lastHeadLoad -= 31000; document.getElementById('home').click(); });
+  await pg.waitForTimeout(1500);
+  await readToEnd(pg, 8, 350);
+  const h = await snap(pg);
+  assert.ok(h.codes.includes('N4') && h.codes.includes('N3'), 'Home showed N4 N3');
+  assert.ok(!h.codes.includes('N2') && !h.codes.includes('N1'));
+  await tapFollowing(o);
+  await readToEnd(pg, 6, 350);
+  const s = await snap(pg);
+  assert.equal(s.feed.carry, 'new', 'the carried cursor is not used');
+  assert.ok(s.codes.includes('N2') && s.codes.includes('N1'), 'every new post: ' + s.codes.slice(0, 8).join(' '));
+  assert.equal(s.codes.some(c => h.codes.includes(c)), false, 'seen posts still skipped');
+  const tr = await pg.evaluate(() => window.__sg.trail().filter(e => e.cr != null));
+  assert.equal(tr.length, 1);
+  assert.equal(tr[0].cr, 'new');
+  await o.context.close();
+});
+
+// Following's posts with a large payload (about 80 K characters each), like carousels and videos.
+const bigUnit = code => { const u = friend(code); u.node.media.video_dash_manifest = 'x'.repeat(80000); return [u]; };
+// The card's button, with sessionStorage refusing the entry with the carried posts (a full storage).
+async function tapFollowingQuota(o) {
+  await Promise.all([o.pg.waitForURL(/variant=following/), o.pg.evaluate(() => {
+    const set = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (k, v) {
+      if (k === 'sg_skip_seen' && String(v).includes('"edges":[')) throw new DOMException('full', 'QuotaExceededError');
+      return set.call(this, k, v);
+    };
+    window.__sg.onNative({ type: 'continueFeed', variant: 'following' });
+  })]);
+  await o.pg.waitForFunction(() => window.__ig && window.__ig.conn, null, { timeout: 5000 });
+}
+for (const [why, cfg, tap] of [
+  ['big', { follow: range(1, 400), followUnit: bigUnit, followFirst: 30 }, tapFollowing],
+  ['many', { follow: range(1, 400), followFirst: 100 }, tapFollowing],
+  ['quota', { follow: range(1, 400) }, tapFollowingQuota],
+]) {
+  test(`B23 a carry left behind (${why}) says why in Filter status and the trail, and B17's skipping takes over`, { timeout: 90000 }, async () => {
+    const o = await homeToCard(Object.assign({ home: phoneHome() }, cfg));
+    assert.ok(o.home.cont.buffer > 0, 'posts read but not shown');
+    await tap(o);
+    await o.pg.waitForTimeout(400);
+    const s = await snap(o.pg);
+    assert.equal(s.feed.carry, why);
+    assert.ok(s.feed.carryN > 0 && s.feed.carryN >= o.home.cont.buffer - 1, 'posts left behind: ' + s.feed.carryN);
+    if (why === 'big') assert.ok(s.feed.carryChars > 1000000, String(s.feed.carryChars));
+    if (why === 'many') assert.ok(s.feed.carryN > 48);
+    assert.equal(s.feed.anchor, 1, 'a seen post as the starting point (B17)');
+    const tr = await o.pg.evaluate(() => window.__sg.trail().filter(e => e.cr != null));
+    assert.equal(tr.length, 1);
+    assert.equal(tr[0].cr, why);
+    assert.doesNotMatch(JSON.stringify(tr) + JSON.stringify({ c: s.feed.carry, n: s.feed.carryN }), /F\d\d|"f\d+"/);
+    await o.context.close();
+  });
+}
