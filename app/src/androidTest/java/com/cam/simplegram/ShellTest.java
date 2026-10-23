@@ -15,6 +15,7 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.webkit.WebChromeClient;
 import android.webkit.WebView;
 
@@ -27,6 +28,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.lang.reflect.Method;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -1050,6 +1052,104 @@ public class ShellTest {
             SystemClock.sleep(400);
             idle();
             assertNotNull("the card is back", visibleChild(act.get(), "End of Home"));
+        }
+    }
+
+    // B20: the comments page gets no room for the system bars or the keyboard
+    // (the panel sits clear of both), the panel shrinks above the keyboard,
+    // and the comment box's report keeps only its numbers.
+    @Test
+    public void commentsPanelKeepsNoBarRoomAndShrinksAboveTheKeyboard() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            MainActivity a = act.get();
+            CommentsPanel panel = panelOf(a);
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                AtomicBoolean reached = new AtomicBoolean();
+                AtomicReference<WindowInsets> out = new AtomicReference<>();
+                s.onActivity(x -> {
+                    panel.web().setOnApplyWindowInsetsListener((v, in) -> {
+                        reached.set(true);
+                        return in;
+                    });
+                    WindowInsets in = new WindowInsets.Builder()
+                            .setInsets(WindowInsets.Type.navigationBars(), android.graphics.Insets.of(0, 0, 0, 126))
+                            .setInsets(WindowInsets.Type.ime(), android.graphics.Insets.of(0, 0, 0, 900))
+                            .build();
+                    out.set(panel.dispatchApplyWindowInsets(in));
+                    panel.web().setOnApplyWindowInsetsListener(null);
+                });
+                assertTrue(out.get().isConsumed());
+                assertFalse("the comments page never sees bar or keyboard room", reached.get());
+            }
+
+            JSONObject msg = new JSONObject()
+                    .put("code", "ABCDEFG")
+                    .put("rect", new JSONObject().put("x", 0).put("y", 120).put("w", 412).put("h", 515))
+                    .put("dpr", 2.625);
+            s.onActivity(x -> {
+                try {
+                    call(x, "openComments", new Class<?>[]{JSONObject.class}, msg);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(500);
+            idle();
+            View root = (View) panel.getParent();
+            int rootH = root.getHeight();
+            assertEquals(rootH - Math.round(rootH * 0.42f), panel.getHeight(), 3);
+            // The keyboard: the content area gets shorter (adjustResize); the panel follows it, bottom-aligned.
+            int typing = Math.round(rootH * 0.55f);
+            s.onActivity(x -> {
+                ViewGroup.LayoutParams lp = root.getLayoutParams();
+                lp.height = typing;
+                root.setLayoutParams(lp);
+            });
+            SystemClock.sleep(400);
+            idle();
+            assertEquals(typing, root.getHeight());
+            assertEquals(typing - Math.round(typing * 0.30f), panel.getLayoutParams().height, 3);
+            assertEquals(typing, panel.getBottom(), 3);
+            s.onActivity(x -> {
+                ViewGroup.LayoutParams lp = root.getLayoutParams();
+                lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+                root.setLayoutParams(lp);
+            });
+            SystemClock.sleep(400);
+            idle();
+            assertEquals(rootH - Math.round(rootH * 0.42f), panel.getLayoutParams().height, 3);
+
+            // The box's report: numbers kept, anything else dropped; only from the comments page.
+            String report = new JSONObject().put("action", "commentsLayout").put("gapBefore", 50).put("gapAfter", 0)
+                    .put("barH", 44).put("boxes", 1).put("who", "someone")
+                    .put("fixes", new JSONObject().put("margin", 1).put("padding", 2).put("text", "x")).toString();
+            String fromMain = new JSONObject().put("action", "commentsLayout").put("gapBefore", 999).toString();
+            s.onActivity(x -> {
+                try {
+                    call(x, "onMessage", new Class<?>[]{String.class, String.class}, "main", fromMain);
+                    call(x, "onMessage", new Class<?>[]{String.class, String.class}, "comments", report);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            java.lang.reflect.Field f = MainActivity.class.getDeclaredField("commentsLayout");
+            f.setAccessible(true);
+            JSONObject kept = (JSONObject) f.get(a);
+            assertNotNull(kept);
+            assertEquals(50, kept.getInt("gapBefore"));
+            assertEquals(0, kept.getInt("gapAfter"));
+            assertFalse(kept.has("who"));
+            assertFalse(kept.getJSONObject("fixes").has("text"));
+            assertEquals(2, kept.getJSONObject("fixes").getInt("padding"));
+            JSONObject device = (JSONObject) call(a, "deviceDiagnostics", new Class<?>[]{});
+            assertEquals(50, device.getJSONObject("comments").getInt("gapBefore"));
+            assertEquals("gap under it 50 → 0 px, 44 px high (padding 2, margin 1) · typed in 0", MainActivity.commentsLine(kept));
+            assertEquals("not opened yet", MainActivity.commentsLine(null));
+            s.onActivity(MainActivity::onBackPressed);
+            SystemClock.sleep(400);
+            idle();
         }
     }
 }

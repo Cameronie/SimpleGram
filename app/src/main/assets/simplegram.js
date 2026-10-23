@@ -34,6 +34,8 @@
     nav: { homeFull: { bar: 0, header: 0 }, inserted: 0, moved: 0, notBottom: 0, waitReact: 0, waitReactGaveUp: 0,
       igHasFav: 0, taps: 0, top: 0, refresh: 0, refreshHeld: 0, closedSearch: 0, openCancelled: 0, tidyScans: 0,
       obsMs: 0, geo: null },
+    // B20: the comment box in the comments panel (pixel sizes and counts only).
+    comments: { boxes: 0, gapBefore: null, gapAfter: null, barH: 0, fieldH: 0, fixes: {}, opened: 0, scrolled: 0, reverted: 0 },
   });
   function bump(o, k, n) { o[k] = (o[k] || 0) + (n == null ? 1 : n); }
   // Session storage that never throws (private windows, blocked storage).
@@ -2155,6 +2157,8 @@
       'video[data-sg-full]:fullscreen::-webkit-media-controls{display:none!important}',
       'video[data-sg-full]:fullscreen::-webkit-media-controls-enclosure{display:none!important}',
       'video[data-sg-full]:fullscreen::-webkit-media-controls-overlay-play-button{display:none!important}',
+      // B20: the comment box is one line high while reading; Instagram sizes it while typing.
+      'textarea[data-sg-composer]:not([data-sg-open]){max-height:var(--sg-one-line,40px)!important;overflow-y:hidden!important}',
     ].concat(FAV_CSS).join('\n');
     (document.head || document.documentElement).appendChild(s);
   }
@@ -2838,6 +2842,8 @@
       let el = a;
       for (let i = 0; i < 10 && el.parentElement && el.parentElement !== document.body; i++) {
         el = el.parentElement;
+        // B20: never the comment box, even if it shares a fixed layer with the bar.
+        if (el.querySelector('textarea')) break;
         const cs = getComputedStyle(el);
         if (cs.position === 'fixed' || cs.position === 'sticky') { hide(el, 'nav'); break; }
       }
@@ -2850,6 +2856,199 @@
       const b = svg.closest('a,button,[role="button"]') || svg;
       if (b.getBoundingClientRect().top < 80) hide(b, 'back');
     }
+    safe(fitComposer)();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * B20: the comment box in the comments panel. Instagram's page keeps room
+   * under it for its own bottom bar (hidden above: the main column's bottom
+   * margin, or the box's bottom offset) and for the phone's navigation bar
+   * (safe-area padding). The panel already sits clear of both, so that room
+   * is an empty band. Take it away, keep the box one line high while
+   * reading, and let it grow (as Instagram sizes it) only while typing.
+   * Never hides the box; only bottom offsets, paddings and margins change.
+   * ------------------------------------------------------------------ */
+  const composer = { field: null, bar: null, sent: '', posts: 0, keep: 0 };
+  function composerField() {
+    for (const t of document.querySelectorAll('form textarea, textarea[aria-label], textarea[placeholder]')) {
+      if (visibleBox(t)) return t;
+    }
+    return null;
+  }
+  // The row holding the box (avatar, field, Post): the highest ancestor still about its size.
+  function composerBar(field) {
+    const limit = Math.max(160, field.getBoundingClientRect().height + 120);
+    let bar = field.closest('form') || field.parentElement || field;
+    for (let el = bar.parentElement; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      const r = el.getBoundingClientRect();
+      if (r.height > limit || el.querySelectorAll('textarea').length > 1) break;
+      bar = el;
+    }
+    return bar;
+  }
+  // What each changed element had inline before, so it can be put back exactly.
+  const fitWas = new WeakMap();
+  function setStyle(el, prop, value, kind) {
+    const was = fitWas.get(el) || {};
+    if (!(prop in was)) was[prop] = [el.style.getPropertyValue(prop), el.style.getPropertyPriority(prop)];
+    fitWas.set(el, was);
+    el.dataset.sgFit = Object.keys(was).join(' ');
+    el.style.setProperty(prop, value, 'important');
+    bump(stats.comments.fixes, kind);
+  }
+  // Puts back everything fitComposer changed (the box ended up covered).
+  function unfitComposer() {
+    for (const el of document.querySelectorAll('[data-sg-fit]')) {
+      const was = fitWas.get(el) || {};
+      for (const prop of Object.keys(was)) {
+        if (was[prop][0]) el.style.setProperty(prop, was[prop][0], was[prop][1]);
+        else el.style.removeProperty(prop);
+      }
+      fitWas.delete(el);
+      delete el.dataset.sgFit;
+    }
+    for (const el of document.querySelectorAll('[data-sg-hidden="spacer"]')) unhide(el);
+  }
+  // The box must stay where a finger can reach it: the middle of the field hits the box.
+  function composerReachable(field, bar) {
+    const r = field.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + Math.min(r.height / 2, 12);
+    if (y < 0 || y > innerHeight || x < 0 || x > innerWidth) return true;   // scrolled away: nothing to check
+    const hit = document.elementFromPoint(x, y);
+    return !!hit && (hit === field || bar.contains(hit) || field.contains(hit));
+  }
+  function px(v) { const n = parseFloat(v); return isFinite(n) ? n : 0; }
+  // Where the element's content ends on screen (its own padding and border excluded).
+  function contentEnd(el, cs) {
+    const r = el.getBoundingClientRect();
+    if (el.scrollHeight > el.clientHeight + 1 && /auto|scroll|hidden/.test(cs.overflowY)) {
+      return r.top + el.clientTop - el.scrollTop + el.scrollHeight - px(cs.paddingBottom);
+    }
+    return r.bottom - px(cs.borderBottomWidth) - px(cs.paddingBottom);
+  }
+  function composerGap(bar) {
+    const vh = window.visualViewport ? window.visualViewport.height : innerHeight;
+    return Math.max(-999, Math.min(999, Math.round(vh - bar.getBoundingClientRect().bottom)));
+  }
+  function fitComposer() {
+    // Only Instagram's comments page (the panel can go on to a profile or post).
+    if (CFG.role !== 'comments' || route() !== 'comments') return;
+    const field = composerField();
+    if (!field) return;
+    const c = stats.comments;
+    const bar = composerBar(field);
+    if (field !== composer.field) {
+      composer.field = field;
+      composer.blocked = false;
+      field.dataset.sgComposer = '1';
+      field.addEventListener('focus', safe(composerFocus));
+      field.addEventListener('blur', safe(composerBlur));
+      if (document.activeElement === field) field.dataset.sgOpen = '1';
+      c.boxes++;
+    }
+    composer.bar = bar;
+    // One line: Instagram's line height plus the field's own padding and border.
+    const fcs = getComputedStyle(field);
+    const lh = px(fcs.lineHeight) || px(fcs.fontSize) * 1.3 || 18;
+    const extra = fcs.boxSizing === 'border-box'
+      ? px(fcs.paddingTop) + px(fcs.paddingBottom) + px(fcs.borderTopWidth) + px(fcs.borderBottomWidth) : 0;
+    field.style.setProperty('--sg-one-line', Math.ceil(lh + extra) + 'px');
+    if (c.gapBefore == null) c.gapBefore = composerGap(bar);
+    if (composer.blocked) { c.gapAfter = composerGap(bar); reportComposer(); return; }
+    const reachable = composerReachable(field, bar);
+    for (let el = field.parentElement; el; el = el.parentElement) {
+      const cs = getComputedStyle(el);
+      const inBar = el === bar || bar.contains(el);
+      // A bottom offset that lifted the box above Instagram's bar.
+      if ((cs.position === 'fixed' || cs.position === 'sticky') && px(cs.bottom) > 0.5 && px(cs.bottom) <= 200) {
+        setStyle(el, 'bottom', '0px', 'offset');
+      }
+      const pb = px(cs.paddingBottom), pt = px(cs.paddingTop);
+      if (inBar) {
+        // The row's own padding stays; only room added under it (safe area, the bar's height) goes.
+        if (pb - pt > 6) setStyle(el, 'padding-bottom', pt + 'px', 'padding');
+      } else if (pb > 0.5 && Math.abs(contentEnd(el, cs) - bar.getBoundingClientRect().bottom) <= 2) {
+        setStyle(el, 'padding-bottom', '0px', 'padding');
+      }
+      // A margin under something that ends with the box is only empty space.
+      if ((el === bar || !inBar) && px(cs.marginBottom) > 0.5 &&
+          Math.abs(el.getBoundingClientRect().bottom - bar.getBoundingClientRect().bottom) <= 2) {
+        setStyle(el, 'margin-bottom', '0px', 'margin');
+      }
+      // An empty block kept below the box (a stand-in for the bar).
+      if (el === bar || !inBar) {
+        for (let s = el.nextElementSibling; s; s = s.nextElementSibling) {
+          if (s.dataset.sgHidden || !isSpacer(s, bar)) continue;
+          if (hide(s, 'spacer')) bump(c.fixes, 'spacer');
+        }
+      }
+      if (el === document.documentElement) break;
+    }
+    // Something covered it only after the change (not a passing overlay): put everything back.
+    if (reachable && document.querySelector('[data-sg-fit],[data-sg-hidden="spacer"]') && !composerReachable(field, bar)) {
+      unfitComposer();
+      composer.blocked = true;
+      c.reverted++;
+    }
+    c.gapAfter = composerGap(bar);
+    c.barH = Math.round(bar.getBoundingClientRect().height);
+    c.fieldH = Math.round(field.getBoundingClientRect().height);
+    reportComposer();
+  }
+  function isSpacer(s, bar) {
+    if (s.tagName === 'SCRIPT' || s.tagName === 'STYLE' || s.contains(bar)) return false;
+    const cs = getComputedStyle(s);
+    if (cs.position === 'absolute' || cs.position === 'fixed' || cs.display === 'none') return false;
+    const r = s.getBoundingClientRect();
+    if (!(r.height > 0 && r.height <= 150) || r.top < bar.getBoundingClientRect().bottom - 1) return false;
+    return !(s.textContent || '').trim() && !s.querySelector('img,video,svg,canvas,input,textarea,button,a,[role="button"],iframe');
+  }
+  function composerFocus() {
+    clearTimeout(composer.closing);
+    if (composer.field) composer.field.dataset.sgOpen = '1';
+    stats.comments.opened++;
+    // The keyboard is coming: the panel shrinks, then the box is brought into view.
+    composer.keep = Date.now() + 1500;
+    setTimeout(safe(keepComposerInView), 350);
+  }
+  function composerBlur() {
+    const f = composer.field;
+    // A moment later, so a tap on Post lands before the box shrinks under the finger.
+    clearTimeout(composer.closing);
+    composer.closing = setTimeout(safe(() => {
+      if (f && document.activeElement !== f) delete f.dataset.sgOpen;
+    }), 400);
+  }
+  function keepComposerInView() {
+    const f = composer.field, bar = composer.bar;
+    if (!f || !bar || document.activeElement !== f || !bar.isConnected) return;
+    const vv = window.visualViewport;
+    const top = vv ? vv.offsetTop : 0, bottom = top + (vv ? vv.height : innerHeight);
+    const r = bar.getBoundingClientRect();
+    if (r.bottom > bottom + 1 || r.top < top - 1) {
+      try { bar.scrollIntoView({ block: 'end', inline: 'nearest' }); } catch (e) { /* old engine */ }
+      stats.comments.scrolled++;
+    }
+  }
+  // Shapes only (pixel sizes and counts), for the app's Filter status.
+  function reportComposer() {
+    const c = stats.comments;
+    const shape = { boxes: c.boxes, gapBefore: c.gapBefore, gapAfter: c.gapAfter, barH: c.barH, fieldH: c.fieldH,
+      fixes: Object.assign({}, c.fixes), opened: c.opened, scrolled: c.scrolled, reverted: c.reverted };
+    const key = JSON.stringify(shape);
+    if (key === composer.sent || composer.posts >= 30) return;
+    composer.sent = key;
+    composer.posts++;
+    post('commentsLayout', shape);
+  }
+  if (CFG.role === 'comments') {
+    // The keyboard opening or closing resizes the panel's page.
+    const resized = safe(() => {
+      if (Date.now() < composer.keep || (composer.field && document.activeElement === composer.field)) keepComposerInView();
+      queueTidy();
+    });
+    window.addEventListener('resize', resized);
+    try { if (window.visualViewport) window.visualViewport.addEventListener('resize', resized); } catch (e) { /* no visual viewport */ }
   }
 
   let tidyQueued = false;

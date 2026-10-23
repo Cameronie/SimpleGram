@@ -127,6 +127,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private int fullWidth;
     private String viewerId;
     private final List<Script> scripts = new ArrayList<>();
+    // B20: the comments panel's comment box, as its page last measured it (sizes and counts only).
+    private JSONObject commentsLayout;
 
     /** A WebView's injected page script, re-registered when the signed-in account changes. */
     private static final class Script {
@@ -637,6 +639,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "comments":
                 if (main) openComments(m);
+                break;
+            case "commentsLayout":
+                if ("comments".equals(role)) commentsLayout = commentsShape(m);
                 break;
             case "menuContext":
                 if (main) menuLink = m.optString("link", null);
@@ -1436,11 +1441,53 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         b.append("  Page loads since the app started: ").append(startsAll)
                 .append(" (app: open ").append(startsLoadUrl).append(", back ").append(startsGoBack)
                 .append(", refresh ").append(startsReload).append(")\n")
-                .append("  Back presses in the page: ").append(backPresses).append('\n');
+                .append("  Back presses in the page: ").append(backPresses).append('\n')
+                .append("  Comment box: ").append(commentsLine(commentsLayout)).append('\n');
         b.append("\nCounts since the page last loaded. No account names or post details are kept.");
         dialog().setTitle("Filter status").setMessage(b.toString())
                 .setNeutralButton("Copy details", (d, w) -> copyDetails(stats, device))
                 .setPositiveButton("OK", null).show();
+    }
+
+    private static final String[] COMMENTS_KEYS = {"boxes", "gapBefore", "gapAfter", "barH", "fieldH", "opened", "scrolled", "reverted"};
+    private static final String[] COMMENTS_FIXES = {"offset", "padding", "margin", "spacer"};
+
+    /** Only the known numbers from the comments page's report, whatever else it sends. */
+    static JSONObject commentsShape(JSONObject m) {
+        JSONObject out = new JSONObject();
+        try {
+            for (String k : COMMENTS_KEYS) {
+                if (m.opt(k) instanceof Number) out.put(k, Math.max(-9999, Math.min(9999, m.optInt(k))));
+            }
+            JSONObject fixes = m.optJSONObject("fixes");
+            JSONObject f = new JSONObject();
+            for (String k : COMMENTS_FIXES) {
+                if (fixes != null && fixes.opt(k) instanceof Number) f.put(k, Math.max(0, Math.min(9999, fixes.optInt(k))));
+            }
+            out.put("fixes", f);
+        } catch (JSONException e) {
+            // Keys are constants; not reachable.
+        }
+        return out;
+    }
+
+    /** "gap under it 50 → 0 px, 44 px high (padding 1, margin 1)": the comment box's layout. */
+    static String commentsLine(JSONObject c) {
+        if (c == null) return "not opened yet";
+        StringBuilder b = new StringBuilder();
+        b.append("gap under it ").append(c.has("gapBefore") ? String.valueOf(c.optInt("gapBefore")) : "?")
+                .append(" → ").append(c.has("gapAfter") ? String.valueOf(c.optInt("gapAfter")) : "?").append(" px, ")
+                .append(c.optInt("barH")).append(" px high");
+        JSONObject f = c.optJSONObject("fixes");
+        StringBuilder fx = new StringBuilder();
+        for (String k : COMMENTS_FIXES) {
+            int n = f == null ? 0 : f.optInt(k);
+            if (n > 0) fx.append(fx.length() > 0 ? ", " : "").append(k).append(' ').append(n);
+        }
+        if (fx.length() > 0) b.append(" (").append(fx).append(')');
+        if (c.optInt("reverted") > 0) b.append(" · put back ").append(c.optInt("reverted"));
+        b.append(" · typed in ").append(c.optInt("opened"));
+        return b.toString();
     }
 
     /** "back 900 ms (address 120), next 400 ms": timings only. */
@@ -1471,6 +1518,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("continueHome", continueHome());
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
+            if (commentsLayout != null) n.put("comments", commentsLayout);
             n.put("pageStarts", new JSONObject().put("all", startsAll).put("loadUrl", startsLoadUrl)
                     .put("goBack", startsGoBack).put("reload", startsReload).put("backPresses", backPresses));
         } catch (JSONException e) {
