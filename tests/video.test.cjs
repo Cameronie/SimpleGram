@@ -100,6 +100,19 @@ async function stubFullscreen(page, already) {
       document.dispatchEvent(new Event('fullscreenchange'));
       return Promise.resolve();
     };
+    // The app (B25): a page's request to leave full screen is done the Back
+    // way, its full-screen view first and then the browser's full screen.
+    window.__appExits = 0;
+    const bridge = window.SGNative;
+    if (bridge) {
+      window.SGNative = { postMessage: m => {
+        bridge.postMessage(m);
+        if (JSON.parse(m).action !== 'fullVideoExitRequest' || !window.__fsEl) return;
+        window.__appExits++;
+        window.__fsEl = null;
+        document.dispatchEvent(new Event('fullscreenchange'));
+      } };
+    }
   }, !!already);
 }
 const fv = page => page.evaluate(() => window.__sg.stats.diag.fullVideo);
@@ -215,16 +228,18 @@ test('R8: in full screen a swipe up or down returns; a tap pauses or plays', asy
   assert.deepEqual(await page.evaluate(() => [window.__plays, window.__pauses, window.__igTaps]), [1, 1, 0]);
   // A sideways swipe stays in full screen; a vertical one leaves.
   await drag(page, [350, 400], [60, 420]);
-  assert.equal(await page.evaluate(() => window.__fsExit), 0);
+  assert.equal(await page.evaluate(() => window.__appExits), 0);
   await drag(page, [200, 700], [200, 300]);
-  assert.equal(await page.evaluate(() => window.__fsExit), 1);
+  // B25: the app leaves full screen the Back way; the page doesn't do it itself.
+  assert.deepEqual(await page.evaluate(() => [window.__appExits, window.__fsExit]), [1, 0]);
+  assert.deepEqual((await sent(page, 'fullVideoExitRequest')).map(m => m.why), ['swipe']);
   assert.equal(await page.evaluate(() => document.getElementById('v').dataset.sgFull), undefined);
   assert.equal(await page.evaluate(() => window.scrollY), 0, 'nothing scrolled under the full-screen video');
   // And again, leaving with a swipe down.
   await drag(page, [200, 200], [200, 400]);
   await drag(page, [200, 300], [200, 700]);
   const s = await fv(page);
-  assert.deepEqual([s.r8, s.exits, await page.evaluate(() => window.__fsExit)], [2, 2, 2]);
+  assert.deepEqual([s.r8, s.exits, await page.evaluate(() => window.__appExits), await page.evaluate(() => window.__fsExit)], [2, 2, 2, 0]);
   // Back in the app ends the full-screen view itself: counted as a return too.
   await drag(page, [200, 200], [200, 400]);
   await page.evaluate(() => { window.__fsEl = null; document.dispatchEvent(new Event('fullscreenchange')); });
@@ -473,6 +488,23 @@ test('R9: a swipe up on a Story that shares a Reel plays the Reel full screen; t
   // The Story's own gestures work again straight away.
   await drag(page, [100, 500], [330, 510], { steps: 3 });
   assert.equal(await page.evaluate(() => window.__story.prev), 1);
+});
+
+test('B25: R9\'s Reel layer holds the page still with a blocking touchmove, never with touch-action', async () => {
+  const page = await openStory([sharingItem('424242', REEL_STICKER)]);
+  await drag(page, [200, 600], [205, 250], { steps: 4 });
+  await page.waitForFunction(() => document.getElementById('sg-reel'));
+  // A touch-action surface touched while the web engine believes a finger is
+  // down switches vertical scrolling off for good; a held-still move doesn't.
+  assert.equal(await page.evaluate(() => getComputedStyle(document.getElementById('sg-reel')).touchAction), 'auto');
+  await page.evaluate(() => {
+    window.__boxMoves = [];
+    document.getElementById('sg-reel').addEventListener('touchmove', e => window.__boxMoves.push(e.defaultPrevented), { passive: true });
+  });
+  await drag(page, [100, 500], [300, 530], { steps: 5 });          // sideways: the layer stays
+  const moves = await page.evaluate(() => window.__boxMoves);
+  assert.ok(moves.length >= 4 && moves.every(Boolean), JSON.stringify(moves));
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), true);
 });
 
 test('R9: Back (from the app) and a swipe up also return; a tap pauses the Reel', async () => {

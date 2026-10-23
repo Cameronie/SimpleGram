@@ -490,6 +490,57 @@ test('R4: a long grid stays light: thumbnails load near the screen and are let g
   assert.ok(h.every(x => x > 100), JSON.stringify(h));
 });
 
+// The search part of B25's diagnostics (counts only).
+async function searchDiag(page) {
+  await page.evaluate(() => window.__sg.onNative({ type: 'status' }));
+  return page.evaluate(() => window.__sg.stats.b25.search);
+}
+
+test('B25 hygiene: a grid that is replaced lets go of its picture watcher', async () => {
+  const s = placeSite(after => placePage(codes('W' + (after || 'a'), 24), after ? null : 'c1'));
+  const page = await openPlaceWith(s);
+  await waitCells(page, 24);
+  assert.deepEqual(await searchDiag(page), { open: true, leaving: false, cells: 24, liveObservers: 1 });
+  // Back to the results (the whole screen drawn again): 1.3 kept the old grid's watcher.
+  await page.evaluate(() => window.__sg.back());
+  await waitText(page, 'Hyatt Regency');
+  assert.equal((await searchDiag(page)).liveObservers, 0);
+  await openPlace(page);
+  await waitCells(page, 24);
+  await shadowClick(page, 'Most recent');
+  await waitIdle(page);
+  await shadowClick(page, 'Top');
+  await waitCells(page, 24);
+  assert.equal((await searchDiag(page)).liveObservers, 1);
+  // A new search while the grid is up.
+  await page.evaluate(() => window.__sg.back());
+  await query(page, 'hyatt regency');
+  await waitIdle(page);
+  assert.equal((await searchDiag(page)).liveObservers, 0);
+});
+
+test('B25 rebuild: the search screen is read before the app rebuilds the page view and handed to the new page', async () => {
+  const s = placeSite(after => placePage(codes('R' + (after || 'a'), 24), after ? null : 'c1'));
+  const page = await openPlaceWith(s);
+  await waitCells(page, 24);
+  await page.evaluate(() => { document.getElementById('sg-search').shadowRoot.querySelector('.body').scrollTop = 400; });
+  const saved = JSON.parse(await page.evaluate(() => window.__sg.searchState()));
+  assert.deepEqual([saved.open, saved.view.kind, saved.view.name, saved.grid.media.length, saved.scroll > 0], [true, 'place', 'Hyatt Regency Waikiki', 24, true]);
+  // The new page view: a fresh document of the same page, then the app's hand-back.
+  const fresh = await open('https://www.instagram.com/', NAVPAGE, { api: s.api });
+  assert.equal(await fresh.evaluate(() => window.__sg.searchState()), null);
+  const before = s.log.length;
+  await fresh.evaluate(st => window.__sg.onNative({ type: 'searchRestore', state: st }), saved);
+  await waitCells(fresh, 24);
+  assert.ok((await searchText(fresh)).includes('Hyatt Regency Waikiki'));
+  assert.equal(s.log.length, before, 'the grid came back without asking Instagram again');
+  assert.deepEqual((await waitSent(fresh, 'search')).pop(), { action: 'search', open: true });
+  // Nothing to hand back when search was closed.
+  await fresh.evaluate(() => window.__sg.back());
+  assert.equal(await fresh.evaluate(() => window.__sg.back()), true);
+  assert.equal(await fresh.evaluate(() => window.__sg.searchState()), null);
+});
+
 test('R4: Posts & Reels has no cap either; SimpleGram\'s own pages never count toward the fallback page\'s stop', async () => {
   const s = site({ users: [NBA], keyword: codes('K0X', 24), keywordMore: 'k1',
     answers: { PolarisKeywordSearchExplorePageRelayPaginationQuery: v => {
