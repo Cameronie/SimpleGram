@@ -432,6 +432,7 @@ test('R7 required stop: about 200 Following posts in one page load, then Home en
   assert.equal(s.hasNext, false);
   assert.equal(lastEnd(s).on, true);
   assert.equal(lastEnd(s).cont, 'limit');
+  assert.equal(lastEnd(s).contWhy, 'posts', 'the card names the 200 posts');
   assert.ok(own(S).length <= 20, 'about one request per 12 posts: ' + own(S).length);
   // A reload in the same page load stays ended at its marker (no new start).
   const n = own(S).length;
@@ -460,6 +461,7 @@ test('R7 pacing: own requests stay within 20 a minute across the whole page load
   assert.equal(s.cont.stats.state, 'limit');
   assert.equal(s.cont.stats.reason, 'requests');
   assert.equal(lastEnd(s).cont, 'limit');
+  assert.equal(lastEnd(s).contWhy, 'requests', 'the card makes no claim about 200 posts');
   await context.close();
 });
 

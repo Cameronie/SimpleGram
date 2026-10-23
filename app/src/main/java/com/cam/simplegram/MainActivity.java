@@ -242,12 +242,22 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         return prefs.getBoolean("continueHome", true);
     }
 
-    /** The menu switch: takes effect on the next load of Home (the page script reads it at start). */
+    /**
+     * The menu switch: registered for the next page load, and told to the page
+     * already loaded (Instagram's Home tab refreshes inside it). Off ends a run
+     * at once with the Following card; on starts at Home's next "caught up".
+     */
     private void toggleContinueHome() {
         boolean on = !continueHome();
         prefs.edit().putBoolean("continueHome", on).apply();
         for (Script s : scripts) registerScript(s);
-        toast("Continue Home into Following: " + (on ? "on" : "off") + ". Takes effect when Home next loads.");
+        try {
+            js(new JSONObject().put("type", "contSet").put("on", on));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+        toast(on ? "Continue Home into Following: on. Starts the next time Home reaches \u201Ccaught up\u201D."
+                : "Continue Home into Following: off. Home now stops at \u201Ccaught up\u201D.");
     }
 
     private void install(WebView w, String role) {
@@ -558,11 +568,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     // The end-of-Home card belongs to Home only, whatever the page asks;
                     // never while Home is going on into Following (unless it stalled).
                     String cont = m.optString("cont", "off");
+                    String contWhy = m.optString("contWhy", "");
                     boolean stalled = m.optBoolean("stalled");
                     feedWanted = m.optBoolean("on") && !onOtherFeed() && !("running".equals(cont) && !stalled);
                     if (feedWanted) {
                         String subtitle = m.optBoolean("caughtUp") && !m.isNull("subtitle") ? m.optString("subtitle", "").trim() : "";
-                        setFeedText(stalled, subtitle.length() > 200 ? subtitle.substring(0, 200) : subtitle, cont);
+                        setFeedText(stalled, subtitle.length() > 200 ? subtitle.substring(0, 200) : subtitle, cont, contWhy);
                     }
                     updateFeedBar();
                 }
@@ -732,7 +743,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         // Following or Favorites opened from the card; or Home itself while it goes on
         // into Following and is still passing posts you saw (R7, homeSkipping).
         boolean home = "homeSkipping".equals(skipKind);
-        boolean show = !skipKind.isEmpty() && "home".equals(route) && (home ? !onOtherFeed() : onFollowingOrFavorites())
+        // Never on top of the end card (they share the bottom of the screen).
+        boolean show = !skipKind.isEmpty() && "home".equals(route) && (home ? !onOtherFeed() && !feedWanted : onFollowingOrFavorites())
                 && !screenshotMode && !comments.isOpen() && !searchOpen && customView == null;
         if (show) {
             skipChip.setText("nothingNew".equals(skipKind) ? "Nothing new since Home"
@@ -770,7 +782,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bar.addView(sub);
         feedTitle = title;
         feedSub = sub;
-        setFeedText(false, "", "off");
+        setFeedText(false, "", "off", "");
 
         // Following only: Favorites stays in the ⋮ menu.
         bar.addView(feedButton("Following", "following"));
@@ -806,10 +818,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
      * At the end of Home, Instagram's own line ("You've seen all new posts from
      * the past 3 days.") when it sent one; when nothing has loaded for a while, says so.
      * With Home going on into Following (R7, cont): nothing while it runs; this
-     * card if it failed or stalled; its own words when Following has nothing
-     * new (done) or at the required stop after about 200 posts (limit).
+     * card if it failed, stalled or Instagram stopped paging first (stopped);
+     * its own words when Following has nothing new (done) or at the required
+     * stop (limit), which names the 200 posts only when that was the reason
+     * (contWhy "posts"; "requests" makes no claim about a count).
      */
-    private void setFeedText(boolean stalled, String subtitle, String cont) {
+    private void setFeedText(boolean stalled, String subtitle, String cont, String contWhy) {
         String keepGoing = "Keep going, newest first, without repeats:";
         if (stalled) {
             feedTitle.setText("Home isn't loading more");
@@ -819,7 +833,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             feedSub.setText("Older posts, newest first, without repeats:");
         } else if ("limit".equals(cont)) {
             feedTitle.setText("Keep going in Following");
-            feedSub.setText("Home stops here after about 200 posts from people you follow.\nNewest first, without repeats:");
+            feedSub.setText("posts".equals(contWhy)
+                    ? "Home stops here after about 200 posts from people you follow.\nNewest first, without repeats:"
+                    : "Newest first, without repeats:");
         } else {
             feedTitle.setText("You're all caught up on Home");
             feedSub.setText(subtitle.isEmpty() ? keepGoing : subtitle + "\n" + keepGoing);

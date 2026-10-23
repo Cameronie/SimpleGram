@@ -791,10 +791,18 @@
       if (why === undefined) why = 'error';
       if (why) {
         cont.heads++;
-        safe(contReset)();
+        // A refresh sends two head loads: the second one, within 2 s of the
+        // first one's reset and from the same tap or jump to the top (made
+        // before that reset), is the same reload: one reset, one start. Only
+        // one is merged, so a real reset loop still counts every time.
+        const merge = !fs.contMerged && !!fs.contReset && Date.now() - fs.resetAt < 2000 &&
+          ((tap && tapAt <= fs.resetAt) || (jump && topJumpAt <= fs.resetAt));
+        safe(contReset)(merge);
         feedStates.set(fs.key, fs = freshFeed(fs.key));
         fs.lastPageAt = fs.resetAt = Date.now();
-        stats.feed.refreshes = (stats.feed.refreshes || 0) + 1;
+        fs.contReset = true;
+        fs.contMerged = merge;
+        if (!merge) stats.feed.refreshes = (stats.feed.refreshes || 0) + 1;
         tr.hw = why;
       } else {
         fs.lastCursor = cursor;
@@ -806,6 +814,7 @@
           safe(contFail)('error');
           list.splice(0, list.length, ...list.filter(x => safe(followedPost)(x) && !homeSeen.has(edgeCode(x))));
           stopPagination(owner);
+          fs.contStopped = true;
           endFeed(fs, true);
         }
         return;
@@ -842,7 +851,10 @@
     }
     // A refresh sends two head loads and Instagram keeps the one that lands
     // last: a Home page right after a refresh reset is a first page too.
-    const first = !fs.shownAny || (home && Date.now() - fs.resetAt < 2000);
+    // After a reset of the continuation (R7) only a real head counts (a jump
+    // to the top, a passed Home-tab tap): the marker page that follows a
+    // short head lands within seconds and must stay cut, never anchored.
+    const first = !fs.shownAny || (home && (fs.contReset ? jump || tap : Date.now() - fs.resetAt < 2000));
     const prevCursor = fs.lastCursor;
     fs.lastCursor = cursor;
     const cut = home ? endHome(owner, list, fs, ctx, first) : null;
@@ -906,12 +918,13 @@
       if (ctx) noteUnit(list[i], x.drop ? x.reason : x.reason === 'anchor' ? 'anchor' : 'kept', ctx);
     });
     if (anchor && anchor.kind === 'marker') kept.push(anchor.edge);
-    else if (!anchor && cut && !kept.length && (!fs.cont || jump || tap || Date.now() - fs.resetAt < 10000)) {
+    else if (!anchor && cut && !kept.length && (!fs.cont || fs.shownCount === 0 || jump || tap)) {
       // Home cut to nothing at its marker: this may be a head load that
       // replaces the list, so the neutralised marker stays, never [].
       // While Home goes on into Following (R7), an ordinary page appended at
       // the marker stays cut (Following's own line marks the place) unless
-      // it may be a reload's head (just after a reset, a jump to the top, a tap).
+      // nothing shows yet or it may be a reload's head (a jump to the top, a
+      // tap). Never by time alone: Instagram's line would stay mid-feed.
       anchor = keepMarker(fs, owner, cut);
       kept.push(cut);
       bump(stats.feed, 'markerKept');
@@ -1318,6 +1331,10 @@
    * appends them to Home's list, so Instagram draws them like any Home
    * post. Posts Home showed are skipped. Anything unexpected ends Home with
    * the app's card (Following), as without the continuation.
+   * States (cont.state, sent as feedEnd.cont): off, running, done (Following
+   * used up), stopped (Instagram stopped paging first), limit (the required
+   * stop; cont.reason posts or requests, sent as contWhy), failed (no more
+   * starts this page load). A reload resets done and stopped to off.
    * ------------------------------------------------------------------ */
   const CONT_ROOT = 'PolarisFeedTimelineRootV2Query';
   const CONT_NEXT = 'PolarisFeedRootPaginationCachedQuery_subscribe';
@@ -1329,8 +1346,11 @@
   const CONT_MAX_HANDED = 200;  // Following posts handed in one page load, then Home stops
   const CONT_MAX_OWN = 25;      // own requests in one page load, then Home stops
   const CONT_NOTE_MS = 3000;    // the app's "Skipping posts you saw in Home…" after this long
+  const CONT_READ_MS = 20000;   // an own read that has not answered by then has failed (Instagram's own: 60 s)
   // Shapes and counts only (Filter status, Copy details). headWhy: why a page
-  // was taken for Home's first page again; igKept: Instagram's own followed
+  // was taken for Home's first page again (resets: one per reload, its two
+  // heads merged); recsAnchors: hidden suggestions kept so a reload's list is
+  // never empty; igKept: Instagram's own followed
   // posts kept in a handover; keptBuffer: posts read but not shown, kept at
   // the last reset; startsMin: starts in the last minute; peakMin: most own
   // requests in a minute; repeats: handovers holding a post Home already
@@ -1339,21 +1359,23 @@
   // line; hand: per handover, posts and the page height in screens before
   // and 1.5 s after (growth: appended; shrink: replaced).
   const cont = (stats.cont = { on: CFG.continueHome === true, state: 'off', reason: '', own: 0, ownFail: 0, pages: 0,
-    swaps: 0, handed: 0, empty: 0, skippedSeen: 0, heads: 0, anchors: 0, nudges: 0,
+    swaps: 0, handed: 0, empty: 0, skippedSeen: 0, heads: 0, anchors: 0, recsAnchors: 0, nudges: 0,
     headWhy: { marker: 0, seen: 0, jump: 0, tap: 0, ended: 0 }, igKept: 0, resets: 0, keptBuffer: 0,
     startsMin: 0, peakMin: 0, repeats: 0, notes: 0, modules: null, runs: [], hand: [] });
   let cs = null;                 // the current run (from one marker on)
   let contGen = 0;               // one counter for the page load: a reset makes every answer on its way stale
   let contInFlight = false;      // one own request at a time, across restarts
-  let contAnsweredAt = 0;
+  let contAnsweredAt = 0, contFetchAt = 0;
   let contResumeAt = null;       // what a reset kept: where Following had got to, and posts read but not shown
   let contSeenPassed = 0;        // seen posts passed in this page load
   const contOwnAt = [], contStarts = [], labelCodes = [];
   // Instagram's refresh paths call window.scrollTo(0, 0) right before they
   // reload Home's first page (twice from the Home tab on mobile: b314
   // usePolarisOnHomeClick, b344 PolarisFeed.react and PolarisFeedWrapper).
-  let topJumpAt = 0, jumpPages = 0, tapAt = 0, tapPages = 0;
-  if (cont.on && CFG.role === 'main') {
+  let topJumpAt = 0, jumpPages = 0, tapAt = 0, tapPages = 0, scrollWrapped = false;
+  function contWatchJumps() {
+    if (scrollWrapped || !cont.on || CFG.role !== 'main') return;
+    scrollWrapped = true;
     try {
       const nativeScrollTo = window.scrollTo;
       window.scrollTo = function scrollTo(a, b) {
@@ -1364,6 +1386,21 @@
         return nativeScrollTo.apply(this, arguments);
       };
     } catch (e) { /* leave scrollTo alone */ }
+  }
+  contWatchJumps();
+  // The ⋮ menu's switch, in this document too (the app also registers it for
+  // the next load). Off: a run ends here with the Following card, and no new
+  // one starts. On: Home goes on from the next time it reaches its marker.
+  function contSet(on) {
+    if (CFG.role !== 'main' || on === cont.on) return;
+    CFG.continueHome = on;
+    cont.on = on;
+    if (on) {
+      if (cont.state === 'failed' && cont.reason === 'switchedOff') { cont.state = 'off'; cont.reason = ''; }
+      contWatchJumps();
+    } else {
+      contFail('switchedOff');
+    }
   }
   // Called once for every Home page: the first two within 6 s of a jump to
   // the top, with you less than 2 screens down, are Instagram's reloads (in
@@ -1421,25 +1458,30 @@
     if (!cont.modules.root || !cont.modules.next) { cont.state = 'failed'; cont.reason = 'modules'; return false; }
     fs.cont = true;
     fs.caughtUp = true;
-    contStart();
+    contStart(!!fs.contMerged);
     if (cont.state === 'running') return true;
     fs.cont = false;
     return false;
   }
   function contAlive() { return !!cs && cont.state === 'running'; }
-  // An own read on its way or just answered: Home is not stalled.
+  // An own read on its way (never longer than it may take), one waiting for
+  // its turn (pacing, a jump to the top) or just answered: Home is not stalled.
   function contReading() {
-    return contAlive() && (contInFlight || Date.now() - contAnsweredAt < STALL_MS);
+    if (!contAlive()) return false;
+    const now = Date.now();
+    return (contInFlight && now - contFetchAt < CONT_READ_MS) || !!(cs.timer && cs.more) || now - contAnsweredAt < STALL_MS;
   }
-  function contStart() {
+  // merged: the second head of the same reload (counted once).
+  function contStart(merged) {
     const now = Date.now();
     while (contStarts.length && now - contStarts[0] > 60000) contStarts.shift();
-    contStarts.push(now);
+    if (!merged || !contStarts.length) contStarts.push(now);
     cont.startsMin = contStarts.length;
     const carry = contResumeAt && now - contResumeAt.at < 30 * 60000 ? contResumeAt : null;
     contResumeAt = null;
     cs = { gen: ++contGen, cursor: null, more: true, buffer: [], fetching: false, timer: 0, shown: new Set(),
-      firstCode: null, waiting: false, resume: carry, startedAt: now, firstMs: -1, capped: false, noteTimer: 0, note: false };
+      firstCode: null, waiting: false, resume: carry, startedAt: now, firstMs: -1, capped: false, noteTimer: 0, note: false,
+      seenAt0: contSeenPassed };
     cont.state = 'running';
     cont.reason = '';
     if (contStarts.length > CONT_STARTS) { contFail('restarts'); return; }
@@ -1448,7 +1490,7 @@
   // Home starts over (a reload replaces Instagram's list). Kept for the next
   // run: the cursor of the page in flight (or the next one), and the posts
   // read but not shown, so Following has no gaps and nothing repeats.
-  function contReset() {
+  function contReset(merged) {
     contGen++;
     contNote(false);
     if (cs) {
@@ -1458,10 +1500,10 @@
       const buffer = cs.buffer.concat(prev ? prev.buffer : []);
       contResumeAt = { cursor: own ? cs.cursor : prev.cursor, more: own ? cs.more : prev.more, buffer: buffer, at: Date.now() };
       cont.keptBuffer = buffer.length;
-      cont.resets++;
+      if (!merged) cont.resets++;
     }
     cs = null;
-    if (cont.state === 'running' || cont.state === 'done') cont.state = 'off';
+    if (cont.state === 'running' || cont.state === 'done' || cont.state === 'stopped') cont.state = 'off';
   }
   // Following can't go on: Home ends here (once the posts already read are
   // shown), and the card offers Following as before. No retries.
@@ -1470,7 +1512,8 @@
     cont.state = 'failed';
     cont.reason = reason;
     contNote(false);
-    if (cs) { cs.more = false; clearTimeout(cs.timer); cs.timer = 0; }
+    // What a reset kept is given up too, so the next handover stops Instagram's paging.
+    if (cs) { cs.more = false; clearTimeout(cs.timer); cs.timer = 0; cs.resume = null; }
     const fs = feedStates.get('home');
     if (fs && fs.cont && !fs.ended && !(cs && cs.buffer.length)) endFeed(fs, true);
     setTimeout(safe(checkFeedEnd), 0);
@@ -1482,7 +1525,7 @@
     cont.state = state;
     cont.reason = reason;
     contNote(false);
-    if (cs) { cs.more = false; clearTimeout(cs.timer); cs.timer = 0; }
+    if (cs) { cs.more = false; clearTimeout(cs.timer); cs.timer = 0; cs.resume = null; }
     const fs = feedStates.get('home');
     if (fs && fs.cont && !fs.ended) endFeed(fs, true);
     setTimeout(safe(checkFeedEnd), 0);
@@ -1532,13 +1575,13 @@
     const run = cs, gen = contGen, after = run.cursor;
     contInFlight = true;
     run.fetching = true;
-    const t0 = Date.now();
+    const t0 = contFetchAt = Date.now();
     contOwnAt.push(t0);
     cont.peakMin = Math.max(cont.peakMin, contOwnAt.length);
     cont.own++;
     const q = followingQuery(after);
     let c = null;
-    try { c = await igGraphQL(q.name, q.vars, CONT_CONN, { feed: true }); } catch (e) { c = null; }
+    try { c = await igGraphQL(q.name, q.vars, CONT_CONN, { feed: true, timeout: CONT_READ_MS }); } catch (e) { c = null; }
     contInFlight = false;
     run.fetching = false;
     contAnsweredAt = Date.now();
@@ -1579,6 +1622,10 @@
     // Each post comes once in Following: once well past all of Home's, stop looking.
     if (!fresh && contSeenPassed > homeSeen.size + 36) { cs.more = false; cont.reason = 'seenBound'; }
     if (!cs.more && !cs.buffer.length) { contEnd('done', cont.reason || 'followingEnd'); return; }
+    // Posts are ready: the note goes now, even if Instagram is not asked yet
+    // (you are well above the end). Seen posts passed while it waits: the note.
+    if (cs.buffer.length) contNote(false);
+    else if (cs.waiting && contSeenPassed > cs.seenAt0) contNote(true);
     if (cs.buffer.length && cs.waiting) { cont.nudges++; scheduleNudge(true); }
     contFill();
   }
@@ -1602,6 +1649,11 @@
     run.noteTimer = setTimeout(safe(() => {
       run.noteTimer = 0;
       if (run !== cs || !contAlive() || run.buffer.length || !run.waiting || route() !== 'home') return;
+      // Only when this run did pass posts you saw (not a slow or hung read),
+      // and only with you near the end (not a page Instagram fetched ahead).
+      if (contSeenPassed <= run.seenAt0) return;
+      const se = document.scrollingElement || document.documentElement;
+      if (se.scrollHeight - (se.scrollTop + innerHeight) > innerHeight) return;
       run.note = true;
       cont.notes++;
       post('skipStatus', { on: true, kind: 'homeSkipping', n: 0 });
@@ -1657,6 +1709,15 @@
     }
     if (out.some(e => homeSeen.has(edgeCode(e)))) cont.repeats++;   // guard: never happens
     const handed = out.length - igKept;
+    // Never an empty list (as after the end without R7): if this is a reload
+    // that replaces Home's whole list, one hidden suggestion stays: once
+    // Home's paging was stopped here (any page then is a reload), or while
+    // Following runs on a page not labelled as Instagram's suggestions paging
+    // (feed_recs is always a next page), a few at most (the style rule holds 40).
+    const anchorOk = !out.length && (cont.state !== 'running' ? !!fs.contStopped
+      : owner.pagination_source !== 'feed_recs' && cont.recsAnchors < 10);
+    const anchorAt = anchorOk ? recsAnchorAt(list) : -1;
+    const anchorEdge = anchorAt >= 0 ? list[anchorAt] : null;
     out.forEach((e, i) => {
       const code = edgeCode(e);
       noteHomeShown(code, i < igKept);
@@ -1681,17 +1742,32 @@
     if (!igMore || drained || limit) {
       ended = true;
       stopPagination(owner);
+      fs.contStopped = true;
       endFeed(fs, true);
       contNote(false);
       if (cont.state === 'running') {
-        if (limit && igMore) { cont.state = 'limit'; cont.reason = cont.handed >= CONT_MAX_HANDED ? 'posts' : 'requests'; }
-        else { cont.state = 'done'; cont.reason = cont.reason || (igMore ? 'followingEnd' : 'homeEnd'); }
+        // 'done' only when Following itself is used up; Instagram stopping
+        // its paging first is 'stopped' (the Following card, never "everything").
+        if (limit) { cont.state = 'limit'; cont.reason = cont.handed >= CONT_MAX_HANDED ? 'posts' : 'requests'; }
+        else if (drained) { cont.state = 'done'; cont.reason = cont.reason || 'followingEnd'; }
+        else { cont.state = 'stopped'; cont.reason = 'homeEnd'; }
+        // The run keeps where Following got to: a later reload goes on from there.
+        if (run) { clearTimeout(run.timer); run.timer = 0; }
       }
     } else if (out.length <= 2) {
       if (run) run.waiting = true;           // ask Instagram again once posts are ready
       if (out.length) scheduleNudge(false);
       else if (run && run.more) contNote(true);
     }
+    if (anchorEdge && hideAnchor(anchorEdge)) {
+      list.push(anchorEdge);
+      cont.recsAnchors++;
+      fs.handed++;
+      countAnchor('recs');
+      bump(stats.feed, 'anchorAfterEnd');
+    }
+    // Stage 1's scroll room under a recs-anchored first page goes once posts show.
+    safe(syncRoom)(fs, !ended);
     contFill();
     safe(pushTrail)(Object.assign(tr, { out: out.length, k: out.length, ik: igKept, cf: handed, nx1: !ended, an: '', first: false, ae: false }));
     setTimeout(safe(checkFeedEnd), 300);
@@ -1792,8 +1868,9 @@
     }
     endRoom(onHome && (fs.ended || stalled));
     const end = fs.caughtUp && fs.endText;
+    // contWhy: why the continuation ended (the card's words for 'limit' depend on it).
     const msg = { on: show, caughtUp: !!fs.caughtUp, stalled: stalled, cont: fs.key === 'home' ? cont.state : 'off',
-      title: end ? fs.endText.title : '', subtitle: end ? fs.endText.subtitle : '' };
+      contWhy: fs.key === 'home' ? cont.reason : '', title: end ? fs.endText.title : '', subtitle: end ? fs.endText.subtitle : '' };
     const key = JSON.stringify(msg);
     if (key !== feedEndSent || force) {
       feedEndShown = show;
@@ -3431,12 +3508,20 @@
           if (/^__relay_internal__pv__/.test(k)) note.providers[k.replace(/^__relay_internal__pv__|relayprovider$/g, '')] = vars[k];
         }
         const t0 = Date.now();
-        let res = null, text = '', data = null;
+        let res = null, text = '', data = null, timer = 0;
         try {
           if (feed) {
             const r = feedRequest(name, id, vars, params, lsd, dtsg, path);
             note.fid = r.fid;
             note.hdr = r.hdr;
+            // A read that never answers (a connection gone quiet) is given up
+            // in time, answer included, like Instagram's own (60 s): it fails.
+            const ms = opts && opts.timeout;
+            if (ms > 0 && typeof AbortController === 'function') {
+              const ac = new AbortController();
+              r.init.signal = ac.signal;
+              timer = setTimeout(() => { note.timedOut = true; try { ac.abort(); } catch (e) { /* none */ } }, ms);
+            }
             res = await nativeFetch.call(window, path, r.init);
           } else {
             res = await fetch(path, {
@@ -3453,7 +3538,7 @@
           }
           note.status = res.status;
           if (res.ok) { text = await res.text(); data = parseIg(text); }
-        } catch (e) { note.message = 'network error'; }
+        } catch (e) { note.message = note.timedOut ? 'timed out' : 'network error'; } finally { clearTimeout(timer); }
         note.ms = Date.now() - t0;
         if (res && (res.status === 429 || res.status === 401 || res.status === 403)) {
           note.message = 'refused (HTTP ' + res.status + ')';
@@ -5089,6 +5174,7 @@
         post('status', { stats: stats, route: route(), version: CFG.version });
         break;
       case 'tidy': queueTidy(); break;
+      case 'contSet': if (typeof cmd.on === 'boolean') contSet(cmd.on); break;
       default: break;
     }
   });

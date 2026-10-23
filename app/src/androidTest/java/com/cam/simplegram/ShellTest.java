@@ -334,10 +334,43 @@ public class ShellTest {
             assertTrue(text, text.contains("That's everything new from people you follow") && !text.contains("past 3 days")
                     && text.contains("Following"));
             // The required stop after about 200 posts.
-            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "limit").toString());
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "limit")
+                    .put("contWhy", "posts").toString());
             idle();
             text = textOf(feedCard(act.get()));
-            assertTrue(text, text.contains("Keep going in Following"));
+            assertTrue(text, text.contains("Keep going in Following") && text.contains("about 200 posts"));
+            // The stop after about 25 requests: no claim about a count of posts.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "limit")
+                    .put("contWhy", "requests").toString());
+            idle();
+            text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("Keep going in Following") && !text.contains("200"));
+            // Instagram stopped paging while Following still had posts: the Following card, never "everything".
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "stopped")
+                    .put("contWhy", "homeEnd").toString());
+            idle();
+            text = textOf(feedCard(act.get()));
+            assertTrue(text, text.contains("You're all caught up on Home") && !text.contains("That's everything")
+                    && text.contains("Following"));
+        }
+    }
+
+    @Test
+    public void homeSkipNoteNeverShowsOverTheEndCard() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", true).put("kind", "homeSkipping").toString());
+            idle();
+            assertNotNull(visibleChild(act.get(), "Skip status"));
+            // A stalled card while the note is on: the card only.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("stalled", true).put("cont", "running").toString());
+            SystemClock.sleep(400);
+            idle();
+            assertNotNull(visibleChild(act.get(), "End of Home"));
+            assertNull(visibleChild(act.get(), "Skip status"));
         }
     }
 
