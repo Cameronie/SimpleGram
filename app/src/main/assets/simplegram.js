@@ -5600,8 +5600,8 @@
   const BAR_THIN = 2, BAR_THICK = 6, BAR_KNOB = 14;
   const BAR_CSS = ':host{all:initial;display:block;position:absolute;z-index:2147483600;pointer-events:auto;' +
     'contain:layout style;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}' +
-    '.track{position:absolute;left:0;right:0;bottom:var(--sg-line);height:' + BAR_THIN + 'px;background:rgba(0,0,0,.4);' +
-      'transition:height .1s ease-out}' +
+    '.track{position:absolute;left:0;right:0;bottom:var(--sg-line);height:' + BAR_THIN + 'px;background:var(--sg-rest,rgba(0,0,0,.4));' +
+      'box-shadow:var(--sg-rest-edge,none);transition:height .1s ease-out}' +
     '.fill{position:absolute;left:0;top:0;bottom:0;width:100%;background:#fff;transform-origin:0 50%;transform:scaleX(0)}' +
     '.knob{position:absolute;left:0;bottom:calc(var(--sg-line) + ' + (BAR_THICK - BAR_KNOB) / 2 + 'px);width:' + BAR_KNOB + 'px;' +
       'height:' + BAR_KNOB + 'px;margin-left:-' + BAR_KNOB / 2 + 'px;border-radius:50%;background:#fff;' +
@@ -5634,9 +5634,14 @@
     // Docked: a 44 px touch strip whose line sits 16 px up from its bottom, the
     // strip 12 px above the screen's edge (clear of the system's gesture area).
     // Following: an 18 px strip, the line on the video's bottom edge.
+    // Docked, the line usually falls in the black band under a letterboxed
+    // video (object-fit:contain on #000), where a dark rest would not show:
+    // there the rest is a light translucent grey, with a faint dark edge so it
+    // still reads over bright footage.
     el.style.cssText = follow
       ? 'position:absolute;left:0;top:0;width:0;height:18px;--sg-line:6px;visibility:hidden'
-      : 'position:absolute;left:0;right:0;bottom:calc(12px + env(safe-area-inset-bottom, 0px));height:44px;--sg-line:16px';
+      : 'position:absolute;left:0;right:0;bottom:calc(12px + env(safe-area-inset-bottom, 0px));height:44px;--sg-line:16px;' +
+        '--sg-rest:rgba(255,255,255,.3);--sg-rest-edge:0 0 1px rgba(0,0,0,.5)';
     const root = el.attachShadow({ mode: 'open' });
     root.innerHTML = '<style>' + BAR_CSS + '</style><div class="track"><div class="fill"></div></div>' +
       '<div class="knob"></div><div class="time"></div>';
@@ -5759,7 +5764,7 @@
       // A video as tall as the screen (a Reel viewer): the line at the bottom of what shows of it.
       const y = vr.height >= innerHeight * 0.8 ? Math.min(vr.bottom, innerHeight - nav) : vr.bottom;
       const show = video.isConnected && vr.width >= 100 && vr.height >= 100 && y > 40 && y <= innerHeight - nav + 1 &&
-        !coveredOver(video);
+        !coveredOver(video) && !video.closest('[data-sg-dm-hide]');
       el.style.visibility = show ? '' : 'hidden';
       if (!show) return;
       const o = barOrigin(el);
@@ -5825,7 +5830,8 @@
       if (fs && !fs.contains(v)) continue;
       const a = onScreenArea(v);
       if (a < least || v.getBoundingClientRect().width < innerWidth * 0.6) continue;
-      if (v.closest('[data-sg-hidden]')) continue;
+      // B24: a suggested Reel SimpleGram hid in the DM viewer gets no bar either.
+      if (v.closest('[data-sg-hidden],[data-sg-dm-hide]')) continue;
       if (a > area) { best = v; area = a; }
     }
     return best;

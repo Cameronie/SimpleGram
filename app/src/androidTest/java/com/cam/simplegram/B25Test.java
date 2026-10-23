@@ -49,7 +49,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * with a made-up view does not reproduce the bug. Only local pages are loaded
  * (loadDataWithBaseURL); nothing is fetched.
  *
- * Regression cases (y1, y2, y3, r3, r3b, x1, h1) must keep scrolling after
+ * Regression cases (y1, y2, y3, r3, r3b, x1, h1, h2) must keep scrolling after
  * tapping the none/pan-x probes; b1, c0 and r0 are controls that always did.
  * The repair cases make the stuck state on purpose and check the chip, that
  * the quiet reset alone doesn't fix it, and that rebuilding the WebView does.
@@ -498,6 +498,105 @@ public class B25Test {
         assertStillScrolls();
     }
 
+    /** A touchscreen event with several fingers (pointer ids 0..n-1), through the real input path. */
+    void sendFingers(long down, int action, float[][] pts) {
+        int n = pts.length;
+        MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[n];
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[n];
+        for (int i = 0; i < n; i++) {
+            props[i] = new MotionEvent.PointerProperties();
+            props[i].id = i;
+            props[i].toolType = MotionEvent.TOOL_TYPE_FINGER;
+            coords[i] = new MotionEvent.PointerCoords();
+            coords[i].x = pts[i][0];
+            coords[i].y = pts[i][1];
+            coords[i].pressure = 1f;
+            coords[i].size = 1f;
+        }
+        MotionEvent e = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, n, props, coords, 0, 0, 1f, 1f, 0, 0,
+                InputDevice.SOURCE_TOUCHSCREEN, 0);
+        inst.sendPointerSync(e);
+        e.recycle();
+    }
+
+    /**
+     * A Story outside full screen held with one finger while another taps ⋮:
+     * the menu's own press must not land on top of the finger already on the
+     * page (the web engine would keep counting one of them down for good).
+     */
+    @Test
+    public void h2_menuTappedWhileAFingerHoldsTheStory() throws Exception {
+        name = "h2_menuTappedWhileAFingerHoldsTheStory";
+        loadPage(PLAIN_BASE);
+        baseline();
+        Field route = MainActivity.class.getDeclaredField("route");
+        route.setAccessible(true);
+        inst.runOnMainSync(() -> {
+            try {
+                route.set(act, "story");
+            } catch (IllegalAccessException e) {
+                throw new RuntimeException(e);
+            }
+        });
+        View tab = (View) field("menuButton");
+        int[] tl = new int[2];
+        inst.runOnMainSync(() -> tab.getLocationOnScreen(tl));
+        float tx = tl[0] + tab.getWidth() / 2f, ty = tl[1] + tab.getHeight() / 2f;
+        float x = midX(), y = yAt(0.7f);
+        long d = SystemClock.uptimeMillis();
+        send(d, MotionEvent.ACTION_DOWN, x, y);              // finger 1 presses the Story
+        SystemClock.sleep(200);
+        sendFingers(d, MotionEvent.ACTION_MOVE, new float[][]{{x, y + 2}});
+        SystemClock.sleep(100);
+        int second = 1 << MotionEvent.ACTION_POINTER_INDEX_SHIFT;
+        sendFingers(d, MotionEvent.ACTION_POINTER_DOWN | second, new float[][]{{x, y + 2}, {tx, ty}});
+        SystemClock.sleep(60);
+        sendFingers(d, MotionEvent.ACTION_POINTER_UP | second, new float[][]{{x, y + 2}, {tx, ty}});
+        boolean opened = waitFor(() -> (Boolean) field("menuOpen"), 4000, "menu");
+        SystemClock.sleep(500);
+        log("menu open " + opened + " holding " + zoom().isHolding() + " " + counts());
+        assertTrue("the second finger's tap opened the menu", opened);
+        assertTrue("the menu holds the Story", zoom().isHolding());
+        sendFingers(d, MotionEvent.ACTION_MOVE, new float[][]{{x, y + 4}});
+        SystemClock.sleep(100);
+        inst.getUiAutomation().performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+        waitFor(() -> !(Boolean) field("menuOpen"), 4000, "menu closed");
+        SystemClock.sleep(300);
+        send(d, MotionEvent.ACTION_UP, x, y + 4);          // finger 1 lifts after the menu
+        SystemClock.sleep(500);
+        log("after: holding " + zoom().isHolding() + " " + counts());
+        assertFalse("the hold was let go", zoom().isHolding());
+        inst.runOnMainSync(() -> {
+            try {
+                route.set(act, "other");
+            } catch (IllegalAccessException e) {
+                throw new RuntimeException(e);
+            }
+        });
+        assertStillScrolls();
+    }
+
+    /** Taps an item of the dialog showing now (through accessibility, as a finger would pick it). */
+    boolean pickMenuItem(String label) {
+        long end = SystemClock.uptimeMillis() + 4000;
+        while (SystemClock.uptimeMillis() < end) {
+            android.view.accessibility.AccessibilityNodeInfo root = inst.getUiAutomation().getRootInActiveWindow();
+            if (root != null) {
+                for (android.view.accessibility.AccessibilityNodeInfo n : root.findAccessibilityNodeInfosByText(label)) {
+                    if (n.getText() == null || !label.contentEquals(n.getText())) continue;
+                    android.view.accessibility.AccessibilityNodeInfo c = n;
+                    while (c != null && !c.isClickable()) c = c.getParent();
+                    boolean ok = (c != null ? c : n).performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK);
+                    log("menu item '" + label + "' clicked " + ok);
+                    return ok;
+                }
+            }
+            SystemClock.sleep(100);
+        }
+        log("menu item '" + label + "' not found");
+        return false;
+    }
+
     /* ---------------- With SimpleGram's page script and R8 ---------------- */
 
     static final String REEL = "<!doctype html><html><head>"
@@ -808,7 +907,9 @@ public class B25Test {
         WebView commentsWeb = panel.web();
         ZoomFrame z = zoom();
         int allBefore = intField("startsAll"), appBefore = intField("startsLoadUrl");
-        call("fixScrolling");
+        // Where the diagnosis's recovery steps send Cam: straight in the ⋮ menu.
+        call("showMenu");
+        assertTrue("⋮ lists Fix scrolling", pickMenuItem("Fix scrolling"));
         assertTrue("rebuilt", waitFor(() -> web() != old, 5000, "rebuild"));
         SystemClock.sleep(800);
         WebView fresh = web();

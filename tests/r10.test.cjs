@@ -609,6 +609,9 @@ const barState = (page, sel = '[data-sg-bar]') => page.evaluate(s => {
     time: { opacity: cs(q('.time')).opacity, text: q('.time').textContent },
     touchAction: [host, q('.track'), q('.fill'), q('.knob'), q('.time')].map(e => cs(e).touchAction) };
 }, sel);
+// How bright a bar's track colour shows over the black band under a letterboxed
+// video (0-255): R11's line must be seen there even before anything has played.
+const overBlack = bg => { const m = bg.match(/[\d.]+/g).map(Number); return Math.max(m[0], m[1], m[2]) * (m.length > 3 ? m[3] : 1); };
 
 test('R11: the post view\'s bar: a thin white-on-dark line on the video\'s bottom edge; touch thickens it, shows the handle and the time', async () => {
   const page = await openFeed(POST_URL);
@@ -731,6 +734,7 @@ test('R11: in full screen the bar is docked over the bottom of the video, above 
   const b = await barState(page, '[data-sg-bar="full"]');
   assert.deepEqual([b.visible, b.host, b.track.width, b.track.height], [true, [0, 412], 412, 2]);
   assert.ok(b.track.bottom > 915 - 40 && b.track.bottom < 915 - 20, 'near the bottom, clear of the system gesture edge: ' + b.track.bottom);
+  assert.ok(overBlack(b.track.bg) >= 50, 'the unplayed line shows on the black under the video: ' + b.track.bg);
   const hit = await page.evaluate(y => { const e = document.elementFromPoint(200, y); return e && e.dataset ? e.dataset.sgBar : null; }, b.track.bottom - 2);
   assert.equal(hit, 'full', 'drawn and touched above the lifted video');
   const playing = await page.evaluate(() => !document.getElementById('v').paused);
@@ -775,6 +779,7 @@ test('R11: the bar in Instagram\'s DM Reel viewer (only there in DMs), and no wi
   const b = await barState(page, '[data-sg-bar="dm"]');
   assert.equal(b.visible, true);
   assert.ok(Math.abs(b.track.bottom - 915) < 1, 'at the bottom of the viewer: ' + b.track.bottom);
+  assert.equal(b.track.bg, 'rgba(0, 0, 0, 0.4)', 'on the video itself the rest stays dark translucent');
   assert.equal(await page.evaluate(() => document.querySelectorAll('[data-sg-bar]').length), 1, 'none on the small video in the chat');
   assert.ok(await page.evaluate(() => window.__blocking.size <= (window.__sg.dmReelOpen && window.__sg.dmReelOpen() ? 1 : 0)), 'the bar adds no window-level blocking listener (only B24\'s swipe block while the viewer is open)');
   await tapAt(page, 206, 913, 150);
@@ -827,6 +832,7 @@ test('R11: the bar over R9\'s Story Reel; its touches neither close the Reel nor
   await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v && v.readyState >= 1 && !v.paused; }, null, { timeout: 4000 });
   const b = await barState(page, '#sg-reel [data-sg-bar="story"]');
   assert.ok(b && b.visible && b.host[1] === 412, JSON.stringify(b));
+  assert.ok(overBlack(b.track.bg) >= 50, 'the unplayed line shows on the black under the Reel: ' + b.track.bg);
   const y = b.track.bottom - 2;
   await drag(page, [200, y], [200, y - 400]);       // a swipe up from the bar
   await tapAt(page, 100, y, 200);                   // a tap on the bar
