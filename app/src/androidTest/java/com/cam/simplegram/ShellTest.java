@@ -424,6 +424,39 @@ public class ShellTest {
     }
 
     @Test
+    public void homeLoadingNoteShowsOnHomeOnlyNeverOverTheCard() throws Exception {
+        // B22: the quiet note while Home waits at the bottom for more from Following.
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/").toString());
+            message(s, new JSONObject().put("action", "skipStatus").put("on", true).put("kind", "homeLoading").toString());
+            idle();
+            View chip = visibleChild(act.get(), "Skip status");
+            assertNotNull("loading note on Home", chip);
+            assertTrue(String.valueOf(((android.widget.TextView) chip).getText()).contains("Loading more from people you follow"));
+            // While Home goes on into Following (not stalled), no card.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("cont", "running").toString());
+            idle();
+            assertNull(visibleChild(act.get(), "End of Home"));
+            assertNotNull(visibleChild(act.get(), "Skip status"));
+            // The card (the continuation failed): the card only.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", true).put("caughtUp", true).put("cont", "failed").toString());
+            SystemClock.sleep(400);
+            idle();
+            assertNotNull(visibleChild(act.get(), "End of Home"));
+            assertNull(visibleChild(act.get(), "Skip status"));
+            // Not on Following.
+            message(s, new JSONObject().put("action", "feedEnd").put("on", false).put("cont", "running").toString());
+            message(s, new JSONObject().put("action", "route").put("route", "home")
+                    .put("url", "https://www.instagram.com/?variant=following").toString());
+            idle();
+            assertNull(visibleChild(act.get(), "Skip status"));
+        }
+    }
+
+    @Test
     public void skipStatusShowsOnFollowingOnlyNeverAsTheCard() throws Exception {
         try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
             AtomicReference<MainActivity> act = new AtomicReference<>();

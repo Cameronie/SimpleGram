@@ -189,7 +189,9 @@ test('R7-5 Home tab reload during the continuation (B16): Instagram\'s head repl
   assert.ok(shownBefore.length >= 8);
   S.caughtUpTap = true;
   // More than 30 s since the last head load: Instagram's Home tab reloads twice and scrolls to the top.
-  await tapHome(pg);
+  // Where Following had got to is read at the tap itself: with two pages read ahead (B22) a read
+  // can land between the snapshot above and the tap.
+  const cursorAtTap = await pg.evaluate(() => { const c = window.__sg.cont().cursor; window.__ig.lastHeadLoad -= 31000; document.getElementById('home').click(); return c; });
   await pg.waitForTimeout(900);
   const mid = await snap(pg);
   assert.deepEqual(mid.codes, ['NEW01'], 'Instagram\'s own reload: its head (cut at the marker), not Following');
@@ -206,9 +208,9 @@ test('R7-5 Home tab reload during the continuation (B16): Instagram\'s head repl
   assert.equal(again[0], unseen(range(1, 400)).filter(c => !shownBefore.includes(c))[0]);
   const tapAt = S.log.findIndex((e, i) => i > 0 && e.who === 'ig' && e.after == null);
   const sgAfter = S.log.slice(tapAt).filter(e => e.who === 'sg').map(e => e.after);
-  assert.deepEqual(sgAfter.slice(0, 2), [null, before.cont.cursor], 'the newest page, then on from the saved cursor');
+  assert.deepEqual(sgAfter.slice(0, 2), [null, cursorAtTap], 'the newest page, then on from the saved cursor');
   const n = c => Number(String(c).slice(1));
-  assert.deepEqual(sgAfter.filter(c => c && n(c) < n(before.cont.cursor)), [], 'nothing re-read');
+  assert.deepEqual(sgAfter.filter(c => c && n(c) < n(cursorAtTap)), [], 'nothing re-read');
   assert.equal(s.cont.stats.repeats, 0);
   await context.close();
 });
@@ -424,6 +426,8 @@ test('R7 required stop: about 200 Following posts in one page load, then Home en
   const { pg, S, context } = await openIG({ home: phoneHome(), follow: range(1, 400) }, { sgCfg: ON });
   await readToEnd(pg, 6, 300);
   for (let i = 0; i < 12 && (await snap(pg)).cont.stats.state === 'running'; i++) await readToEnd(pg, 6, 300);
+  // To the bottom once more: the stop can come with the last swipe, before you are at the end again.
+  await readToEnd(pg, 2, 300);
   const s = await snap(pg);
   assert.equal(s.cont.stats.state, 'limit');
   assert.equal(s.cont.stats.reason, 'posts');

@@ -104,6 +104,8 @@ function makeServer(cfg) {
       } else {
         // Instagram's suggestions after the marker: explore_story units and ads.
         const n = ++S.recsN;
+        // cfg.delay.recs: Instagram's own after-marker pages (a number, or a function of the page number).
+        if (cfg.delay && cfg.delay.recs != null) delay = typeof cfg.delay.recs === 'function' ? cfg.delay.recs(n) : cfg.delay.recs;
         out = page([recs('XR' + n + 'A'), recs('XR' + n + 'B'), ad('AR' + n), recs('XR' + n + 'C'), recs('XR' + n + 'D'), ad('AS' + n)],
           'r' + n, { ps: cfg.recsPs === undefined ? 'feed_recs' : cfg.recsPs, more: cfg.recsMore !== false });
       }
