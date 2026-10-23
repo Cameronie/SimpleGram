@@ -4012,6 +4012,14 @@
     togglePlay(r8El);
   }), true);
 
+  // In full screen the video is SimpleGram's: none of a touch on it reaches
+  // Instagram's page (a double tap's like, its tap layer, a carousel it sits in).
+  // SimpleGram's own listeners here on the window still see it all.
+  ['touchstart', 'touchmove', 'touchend', 'touchcancel', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel']
+    .forEach(type => window.addEventListener(type, e => {
+      if (r8On && r8El && e.target === r8El && fullVideoOn()) e.stopPropagation();
+    }, { capture: true, passive: true }));
+
   // SimpleGram's full-screen video is showing (either way it is shown).
   function fullVideoOn() {
     const fs = document.fullscreenElement;
@@ -4393,7 +4401,7 @@
     menuArm = null;
     e.stopImmediatePropagation();
     e.preventDefault();
-    if (!m.v.isConnected || document.fullscreenElement || fullScreenSettling()) { fvStats.r10Skipped++; return true; }
+    if (!m.v.isConnected || document.fullscreenElement || fullScreenSettling() || staleTouch(e)) { fvStats.r10Skipped++; return true; }
     fvStats.r10Menu++;
     r10Snap = stillOf(m.v);
     if (!enterR8(m.v, 'menu')) r10Snap = null;

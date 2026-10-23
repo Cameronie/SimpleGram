@@ -361,6 +361,25 @@ test('R10: an engine without popovers falls back to the video\'s own full screen
   assert.equal(await page.evaluate(() => document.getElementById('v').muted), true);
 });
 
+test('R10: in full screen the video\'s touches stay SimpleGram\'s: Instagram\'s page under it sees none (no like, no carousel)', async () => {
+  const page = await openFeed();
+  await page.evaluate(() => {
+    window.__rootTouches = 0;
+    for (const t of ['touchstart', 'touchend', 'pointerdown']) document.getElementById('mount').addEventListener(t, () => window.__rootTouches++);
+  });
+  await tapAt(page, 200, 300, 600);
+  assert.equal(await lifted(page), 'v');
+  const before = await page.evaluate(() => [window.__rootTouches, window.__sg.stats.b25.touchSeq.starts]);
+  await drag(page, [380, 400], [40, 420]);                // sideways: stays full screen
+  await tapAt(page, 200, 400);
+  await page.waitForTimeout(100);
+  await tapAt(page, 204, 404, 500);                       // a double tap: two pauses, no like
+  const after = await page.evaluate(() => [window.__rootTouches, window.__sg.stats.b25.touchSeq.starts]);
+  assert.equal(after[0], before[0], 'none reached Instagram\'s page');
+  assert.equal(after[1], before[1] + 3, 'SimpleGram\'s own touch bookkeeping saw them all');
+  assert.deepEqual([(await ig(page)).likes, await page.evaluate(() => !!window.__fsEl)], [0, true]);
+});
+
 test('R10: if Instagram takes the video out of the page while it is full screen, full screen ends (the app\'s way)', async () => {
   const page = await openFeed();
   await tapAt(page, 200, 300, 600);
