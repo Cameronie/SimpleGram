@@ -674,7 +674,7 @@ test('nudges: at most 10 a minute', async () => {
 test('nudges: the extra room below is removed even when frames stop', async () => {
   const pg = await open('https://www.instagram.com/', BLANK);
   await pg.evaluate(() => { window.requestAnimationFrame = () => 0; });
-  await parse(pg, page([stranger('STRANG1')])); // nothing kept: a hard nudge on a page too short to scroll
+  await parse(pg, page([adUnit('ADPOST1')])); // nothing kept (an ad is never the anchor): a hard nudge on a page too short to scroll
   await pg.waitForTimeout(1000);
   assert.equal((await feedStats(pg)).nudges, 1);
   const pads = await pg.evaluate(() => Array.from(document.body.children).filter(el => el.style.height === innerHeight * 3 + 'px').length);
