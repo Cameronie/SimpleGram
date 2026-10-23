@@ -27,7 +27,10 @@ import org.json.JSONObject;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -1367,6 +1370,9 @@ public class ShellTest {
             AtomicReference<MainActivity> act = new AtomicReference<>();
             s.onActivity(act::set);
             MainActivity a = act.get();
+            // The launch's own load (instagram.com) would reset the Reel layer
+            // (onPageStarted, 'ready') mid-test: a local blank page instead.
+            blankPage(s);
             CommentsPanel panel = panelOf(a);
             ZoomFrame z = zoomOf(a);
             boolean[] hidden = new boolean[1];
@@ -1393,6 +1399,7 @@ public class ShellTest {
             SystemClock.sleep(500);
             idle();
             assertTrue(panel.isOpen());
+            assertTrue("over the Reel", (Boolean) fieldOf(s, "commentsOverFull"));
             assertEquals(View.VISIBLE, panel.getVisibility());
             assertFalse("the page under the Story isn't split", z.isSplit());
             assertTrue("the sheet is above the full-screen view", panel.getZ() > story.getZ());
@@ -1419,10 +1426,12 @@ public class ShellTest {
             assertFalse(hidden[0]);
             assertEquals(View.GONE, menuTab(a).getVisibility());
             // Open again; the Reel closing (fullVideo off) takes the comments with it.
+            message(s, on);
             message(s, open);
             SystemClock.sleep(400);
             idle();
             assertTrue(panel.isOpen());
+            assertTrue("over the Reel", (Boolean) fieldOf(s, "commentsOverFull"));
             message(s, new JSONObject().put("action", "fullVideo").put("on", false).toString());
             SystemClock.sleep(400);
             idle();
@@ -1434,6 +1443,7 @@ public class ShellTest {
             SystemClock.sleep(400);
             idle();
             assertTrue(panel.isOpen());
+            assertTrue("over the Reel", (Boolean) fieldOf(s, "commentsOverFull"));
             s.onActivity(x -> {
                 try {
                     chromeOf(x).onHideCustomView();
@@ -1445,6 +1455,131 @@ public class ShellTest {
             idle();
             assertFalse(panel.isOpen());
         }
+    }
+
+    /**
+     * R12: a Story that isn't in Instagram's full screen (one reached by a full
+     * load can't ask for it): R9's layer is over the page with no custom view.
+     * The comment tap (no rect) still brings the comments up over the Reel, the
+     * page isn't split and is told where the panel's top is; Back closes the
+     * comments first and leaves the Reel; the Reel closing takes them with it.
+     */
+    @Test
+    public void commentsOverAStoryReelWithoutFullScreen() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            MainActivity a = act.get();
+            blankPage(s);
+            CommentsPanel panel = panelOf(a);
+            ZoomFrame z = zoomOf(a);
+            String on = new JSONObject().put("action", "fullVideo").put("on", true).toString();
+            String open = new JSONObject().put("action", "comments").put("code", "REELCODE1")
+                    .put("url", "https://www.instagram.com/p/REELCODE1/comments/").put("rect", JSONObject.NULL)
+                    .put("dpr", 2.625).toString();
+            message(s, on);
+            message(s, open);
+            SystemClock.sleep(500);
+            idle();
+            assertNull(fieldOf(s, "customView"));
+            assertTrue(panel.isOpen());
+            assertTrue("over the Reel", (Boolean) fieldOf(s, "commentsOverFull"));
+            assertFalse("the page isn't split", z.isSplit());
+            assertTrue("raised over the page", panel.getTranslationZ() > 0f);
+            String got = pageJs(s, "String(window.__got||'')");
+            assertTrue(got, got != null && got.contains("commentsOver:true"));
+            // Back: the comments first; the Reel stays (no fullVideoExit to the page).
+            s.onActivity(MainActivity::onBackPressed);
+            SystemClock.sleep(400);
+            idle();
+            assertFalse(panel.isOpen());
+            assertFalse((Boolean) fieldOf(s, "commentsOverFull"));
+            assertTrue("the Reel stays", (Boolean) fieldOf(s, "pageVideo"));
+            got = pageJs(s, "String(window.__got||'')");
+            assertFalse(got, got != null && got.contains("fullVideoExit"));
+            // A second Back is the Reel's.
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertFalse((Boolean) fieldOf(s, "pageVideo"));
+            // Again, and the Reel closing (a swipe: fullVideo off) takes the comments.
+            message(s, on);
+            message(s, open);
+            SystemClock.sleep(400);
+            idle();
+            assertTrue(panel.isOpen());
+            message(s, new JSONObject().put("action", "fullVideo").put("on", false).toString());
+            SystemClock.sleep(400);
+            idle();
+            assertFalse(panel.isOpen());
+            assertFalse(z.isSplit());
+        }
+    }
+
+    private static Object fieldOf(ActivityScenario<MainActivity> s, String name) {
+        Object[] r = new Object[1];
+        s.onActivity(x -> {
+            try {
+                Field f = MainActivity.class.getDeclaredField(name);
+                f.setAccessible(true);
+                r[0] = f.get(x);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        return r[0];
+    }
+
+    /** Runs `code` in the main WebView and returns its JSON result (null after 10 s). */
+    private static String pageJs(ActivityScenario<MainActivity> s, String code) {
+        CountDownLatch l = new CountDownLatch(1);
+        String[] r = new String[1];
+        s.onActivity(x -> {
+            try {
+                Field f = MainActivity.class.getDeclaredField("web");
+                f.setAccessible(true);
+                ((WebView) f.get(x)).evaluateJavascript(code, v -> {
+                    r[0] = v;
+                    l.countDown();
+                });
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        try {
+            l.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+            // The caller sees null.
+        }
+        return r[0];
+    }
+
+    /**
+     * Swaps the launch's own load for a local blank page (nothing fetched, no
+     * page script, no 'ready'), waits for it to settle, and stubs the page's
+     * side so the test can read what the app told it.
+     */
+    private static void blankPage(ActivityScenario<MainActivity> s) {
+        s.onActivity(x -> {
+            try {
+                Field f = MainActivity.class.getDeclaredField("web");
+                f.setAccessible(true);
+                WebView w = (WebView) f.get(x);
+                w.stopLoading();
+                w.loadDataWithBaseURL("https://sg.test/", "<!doctype html><title>t</title><body></body>",
+                        "text/html", "utf-8", null);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        long end = SystemClock.uptimeMillis() + 10000;
+        while (SystemClock.uptimeMillis() < end
+                && !"\"sg.test complete\"".equals(pageJs(s, "location.host + ' ' + document.readyState"))) {
+            SystemClock.sleep(50);
+        }
+        SystemClock.sleep(500);
+        idle();
+        pageJs(s, "window.__sg = { onNative: function (c) { (window.__got = window.__got || [])"
+                + ".push(c.type + (c.type === 'commentsOver' ? ':' + c.on : '')); } }; 1");
     }
 
     private static float dpOf(MainActivity a, int v) {

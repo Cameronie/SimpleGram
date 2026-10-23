@@ -119,9 +119,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // The comments panel was up when a full screen started: it goes for the full
     // screen (it would be drawn over the video and take its touches) and comes back after.
     private boolean fullHidComments;
-    // R12: the comments panel is up over a Story's full screen, for the Reel the
-    // page plays over it (R9). Raised above the full-screen view by its Z only:
-    // no view is moved in the tree, so no touch that is down loses its end (B25).
+    // R12: the comments panel is up for the Reel the page plays over a Story (R9),
+    // in the Story's full screen or not. Raised above the full-screen view (or the
+    // unsplit page) by its Z only: no view is moved in the tree, so no touch that
+    // is down loses its end (B25).
     private boolean commentsOverFull;
     private int commentsOverOpens;
     // R10 from the menu: the taps the app made on the page's video for it, and the ones it held back.
@@ -580,7 +581,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 menuButton.setVisibility(View.GONE);
                 zoomChip.setVisibility(View.GONE);
             }
-            if (comments.isOpen() && comments.getVisibility() == View.VISIBLE) {
+            // Comments over R9's Reel are raised above any full-screen view: they stay.
+            if (comments.isOpen() && comments.getVisibility() == View.VISIBLE && !commentsOverFull) {
                 fullHidComments = true;
                 comments.setVisibility(View.GONE);
             }
@@ -1068,7 +1070,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private void openComments(JSONObject m) {
         String url = Links.commentsUrl(m.optString("code"));
         if (url == null) return;
-        if (customView != null && pageVideo) {
+        // R12: R9's Reel layer is up (in the Story's full screen or, for a Story
+        // that isn't full screen, over the page): the comments are the Reel's.
+        if (pageVideo) {
             openCommentsOverFull(url, (float) m.optDouble("dpr", density));
             return;
         }
@@ -1098,15 +1102,24 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     /**
-     * R12: comments for the Reel shown over a Story. The Story is in Instagram's
-     * full screen (the app's full-screen view), so the page underneath can't be
-     * split: the panel comes up over the full-screen view instead, raised by its
-     * Z (drawn and touched above it), and the page fits the Reel into the part
-     * above it. The Story stays paused under the Reel. Nothing switches full
-     * screen and no view moves in the tree, so no touch is split.
+     * R12: comments for the Reel shown over a Story (R9's layer). The Story may
+     * be in Instagram's full screen (the app's full-screen view) or not (a Story
+     * reached by a full load can't ask for one): either way the page isn't
+     * split. The panel comes up over whatever is on top, raised by its Z (drawn
+     * and touched above it), and the page fits the Reel into the part above it.
+     * The Story stays paused under the Reel. Back closes the comments first, and
+     * they go when the Reel does. Nothing switches full screen and no view moves
+     * in the tree, so no touch is split.
      */
     private void openCommentsOverFull(String url, float dpr) {
         if (screenshotMode) exitScreenshot();
+        if (comments.isOpen() && !commentsOverFull) {
+            // An ordinary split from before the Reel: the page goes back to full size.
+            zoom.hideSplit();
+            ViewGroup.LayoutParams lp = zoom.getLayoutParams();
+            lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+            zoom.setLayoutParams(lp);
+        }
         splitCss = null;
         splitDpr = dpr > 0 ? dpr : density;
         fullHidComments = false;
@@ -1998,7 +2011,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     public void onBackPressed() {
         if (screenshotMode) {
             exitScreenshot();
-        } else if (commentsOverFull && comments.isOpen()) {
+        } else if ((commentsOverFull || pageVideo) && comments.isOpen()) {
             // R12: the comments over a Story's Reel close first; the Reel stays.
             if (!comments.goBack()) closeComments();
         } else if (pageVideo) {

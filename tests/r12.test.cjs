@@ -67,8 +67,10 @@ function reelItem(extra = {}, user = creator()) {
 const STICKER = { x: 0.5, y: 0.5, width: 0.6, height: 0.5, rotation: 0, media_code: 'REELCODE1', media_id: REEL_PK + '_' + CREATOR_ID, product_type: 'clips', id: 's1' };
 
 // Opens the Story with the page script, answering `api` paths locally. Each
-// handler gets (url, request) and returns { status, body, delay }.
-async function openStory({ item = reelItem(), api = {}, init = null, url = STORY_URL, html = STORY } = {}) {
+// handler gets (url, request) and returns { status, body, raw, delay } (raw: the
+// answer's text as it is, for numbers JSON.stringify can't write). `full: false`
+// leaves the Story out of full screen (one reached by a full load).
+async function openStory({ item = reelItem(), api = {}, init = null, url = STORY_URL, html = STORY, cfg = {}, full = true } = {}) {
   const context = await browser.newContext({
     viewport: { width: 412, height: 915 }, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true,
   });
@@ -86,7 +88,7 @@ async function openStory({ item = reelItem(), api = {}, init = null, url = STORY
         page.reqs.push({ key: key, path: u.pathname, method: req.method(), headers: req.headers(), body: req.postData() || '' });
         const r = handlers[key](u, req) || {};
         if (r.delay) await new Promise(res => setTimeout(res, r.delay));
-        return route.fulfill({ status: r.status || 200, contentType: 'application/json', body: JSON.stringify(r.body || {}) });
+        return route.fulfill({ status: r.status || 200, contentType: 'application/json', body: r.raw != null ? r.raw : JSON.stringify(r.body || {}) });
       }
     }
     if (u.pathname === new URL(url).pathname) return route.fulfill({ status: 200, contentType: 'text/html', body: html });
@@ -101,17 +103,17 @@ async function openStory({ item = reelItem(), api = {}, init = null, url = STORY
     window.SGNative = { postMessage: m => window.__sent.push(JSON.parse(m)) };
     try { document.cookie = 'csrftoken=csrf-tok; path=/'; } catch (e) { /* ignore */ }
   });
-  await page.addInitScript(`window.__sgCfg=${JSON.stringify({ role: 'main', version: 'test', searchPages: 3, viewerId: ME })};\n${SCRIPT}`);
+  await page.addInitScript(`window.__sgCfg=${JSON.stringify(Object.assign({ role: 'main', version: 'test', searchPages: 3, viewerId: ME }, cfg))};\n${SCRIPT}`);
   await page.goto(url);
   if (url !== STORY_URL) return page;
   // Instagram's Story data, with the shared Reel's sticker.
   const story = media('STORYX424242', { pk: '777', username: 'friend', friendship_status: { following: true } },
     { pk: '424242', id: '424242_777', story_feed_media: [STICKER] });
   await page.evaluate(p => JSON.parse(JSON.stringify(p)), { data: { xdt_api__v1__feed__reels_media: { reels_media: [{ id: '777', items: [story] }] } } });
-  await page.evaluate(() => {
-    window.__fsEl = document.body;
+  await page.evaluate(f => {
+    window.__fsEl = f ? document.body : null;
     Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => window.__fsEl });
-  });
+  }, full);
   return page;
 }
 async function drag(page, from, to, { steps = 6 } = {}) {
@@ -479,10 +481,9 @@ test('R12: the overlay\'s touches neither close nor pause the Reel nor reach the
     document.getElementById('sg-reel').addEventListener('touchmove', e => window.__boxMoves.push(e.defaultPrevented), { passive: true });
     return window.__story.starts;
   });
-  // A swipe down and a swipe up starting on the caption; taps on the caption and the counts.
+  // Taps on the caption, the counts and a short drag (not a swipe) on the caption.
   const [cx, cy] = await spot(page, '.cap');
-  await drag(page, [cx, cy], [cx, cy + 300]);
-  await drag(page, [cx, cy], [cx, cy - 400]);
+  await drag(page, [cx, cy], [cx, cy - 30]);
   await tapAt(page, cx, cy);
   const [nx, ny] = await spot(page, '.like .n');
   await tapAt(page, nx, ny - 30);
@@ -572,4 +573,282 @@ test('R12: R10\'s full screen stays clean: a post\'s video full screen has no de
   await page.waitForFunction(() => document.getElementById('sg-fullbar'), null, { timeout: 3000 });
   assert.equal(await page.evaluate(() => !!document.getElementById('sg-reelinfo')), false);
   assert.equal((await r12(page)).shown, 0);
+});
+
+/* ---------------- Review fixes ---------------- */
+
+const closeReel = page => drag(page, [200, 300], [200, 650], { steps: 4 });
+const toasts = page => page.evaluate(() => window.__sent.filter(m => m.action === 'toast').map(m => m.message));
+
+test('R12: a Story that isn\'t in full screen: the layer is over the page, comments come up over the Reel', async () => {
+  const page = await openStory({ full: false });
+  await openReel(page);
+  assert.equal(await page.evaluate(() => document.getElementById('sg-reel').parentElement.tagName), 'BODY');
+  assert.deepEqual((await sent(page, 'fullVideo')).map(m => m.on), [true]);
+  await tapOn(page, '.comment');
+  const [c] = await waitSent(page, 'comments');
+  assert.deepEqual([c.code, c.rect], ['REELCODE1', null], 'the app takes it as the Reel\'s (it is in its Reel mode)');
+  // The app's panel over the page: the Reel fits above it, its details and bar step aside.
+  await page.evaluate(() => window.__sg.onNative({ type: 'commentsOver', on: true, top: 384 }));
+  const g = await page.evaluate(() => ({ v: document.querySelector('#sg-reel video').getBoundingClientRect().height,
+    info: getComputedStyle(document.getElementById('sg-reelinfo')).visibility,
+    bar: getComputedStyle(document.querySelector('#sg-reel [data-sg-bar="story"]')).visibility, story: window.__story.paused }));
+  assert.deepEqual(g, { v: 384, info: 'hidden', bar: 'hidden', story: true });
+  await page.evaluate(() => window.__sg.onNative({ type: 'splitClosed' }));
+  assert.equal(await page.evaluate(() => document.querySelector('#sg-reel video').getBoundingClientRect().height), 915);
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), true);
+});
+
+test('R12: a Reel saved into a collection isn\'t unsaved by one tap (the website asks first); an ordinary save still is', async () => {
+  const mods = fakeModules(`{
+    PolarisAPIUnsavePost: { unsavePost: id => { window.__calls.push(['unsave', id]); return Promise.resolve({}); } },
+  }`);
+  const page = await openStory({ init: mods, item: reelItem({ has_viewer_saved: true, saved_collection_ids: ['17900000000000001'] }) });
+  await openReel(page);
+  assert.equal((await ui(page)).save.on, true);
+  await tapOn(page, '.save');
+  await page.waitForTimeout(150);
+  assert.deepEqual(await page.evaluate(() => window.__calls), []);
+  assert.equal(page.hits['/api/graphql'], undefined);
+  assert.equal((await ui(page)).save.on, true, 'still saved');
+  assert.match((await toasts(page))[0], /in one of your collections/);
+  assert.equal((await r12(page)).inCollection, 1);
+  // Saved, but in no collection: one tap unsaves.
+  for (const extra of [{ has_viewer_saved: true, saved_collection_ids: [] }, { has_viewer_saved: true }]) {
+    const p2 = await openStory({ init: mods, item: reelItem(extra) });
+    await openReel(p2);
+    await tapOn(p2, '.save');
+    await p2.waitForTimeout(150);
+    assert.deepEqual(await p2.evaluate(() => window.__calls), [['unsave', REEL_PK]]);
+    assert.equal((await ui(p2)).save.on, false);
+  }
+});
+
+test('R12: comments limited for you can still be read: the panel opens; turned off for everyone, they can\'t', async () => {
+  const page = await openStory({ item: reelItem({ commenting_disabled_for_viewer: true, comment_count: 900 }) });
+  await openReel(page);
+  assert.equal((await ui(page)).comment.n, '900');
+  await tapOn(page, '.comment');
+  const [c] = await waitSent(page, 'comments');
+  assert.equal(c.code, 'REELCODE1');
+  assert.deepEqual(await toasts(page), []);
+});
+
+test('R12: an action on its way belongs to the Reel: closed and opened again, a tap sends nothing more; a late refusal shows on the open one', async () => {
+  let refuse = false;
+  const page = await openStory({ api: {
+    '/api/graphql': () => refuse ? { body: { errors: [{ message: 'no', code: 1357004 }], data: null }, delay: 1200 }
+      : { body: { data: { xig_media_like: { media: { id: REEL_PK } } } }, delay: 1200 },
+  } });
+  await openReel(page);
+  await tapOn(page, '.like');
+  await closeReel(page);
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), false);
+  await openReel(page);
+  let s = await ui(page);
+  assert.deepEqual([s.like.on, s.like.n], [true, '1,235'], 'the opened-again Reel shows the like on its way');
+  await tapOn(page, '.like');
+  await page.waitForTimeout(1300);
+  assert.equal(page.hits['/api/graphql'], 1, 'one request at a time for the Reel');
+  assert.equal((await r12(page)).busy, 1);
+  s = await ui(page);
+  assert.deepEqual([s.like.on, s.like.n], [true, '1,235']);
+  // Refused after the Reel was opened again: the open overlay is put back.
+  refuse = true;
+  const p2 = await openStory({ api: { '/api/graphql': () => ({ body: { errors: [{ message: 'no', code: 1357004 }], data: null }, delay: 1200 }) } });
+  await openReel(p2);
+  await tapOn(p2, '.like');
+  await closeReel(p2);
+  await openReel(p2);
+  await p2.waitForFunction(() => window.__sent.some(m => m.action === 'toast'), null, { timeout: 4000 });
+  s = await ui(p2);
+  assert.deepEqual([s.like.on, s.like.n], [false, '1,234']);
+  assert.equal(p2.hits['/api/graphql'], 1);
+  // A follow refused after the Reel was opened again: Follow is back on the open one.
+  const p3 = await openStory({ api: { '/api/v1/friendships/*': () => ({ status: 400, body: { status: 'fail', message: 'oops' }, delay: 1200 }) } });
+  await openReel(p3);
+  await tapOn(p3, '.follow');
+  await closeReel(p3);
+  await openReel(p3);
+  assert.equal((await ui(p3)).follow, 'Following', 'on its way: shown as Following');
+  await tapOn(p3, '.follow');
+  await p3.waitForFunction(() => window.__sent.some(m => m.action === 'toast'), null, { timeout: 4000 });
+  assert.equal((await ui(p3)).follow, 'Follow');
+  assert.equal(p3.hits['/api/v1/friendships/*'], 1);
+});
+
+test('R12: a tap that began on the loading Reel and lifts after the details came is the video\'s, never a follow or a like', async () => {
+  // Where the buttons are, from a Reel that is already showing.
+  const p0 = await openStory();
+  await openReel(p0);
+  const at = { follow: await spot(p0, '.follow'), like: await spot(p0, '.like'), name: await spot(p0, '.name') };
+  for (const k of Object.keys(at)) {
+    const page = await openStory({ api: {
+      '/api/v1/media/*': () => ({ body: { status: 'ok', items: [reelItem()] }, delay: 700 }),
+      '/api/graphql': () => ({ body: { data: { xig_media_like: {} } } }),
+      '/api/v1/friendships/*': () => ({ body: { status: 'ok', friendship_status: { following: true } } }),
+    } });
+    await drag(page, [200, 600], [205, 250], { steps: 4 });
+    const c = await page.context().newCDPSession(page);
+    await c.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: at[k][0], y: at[k][1] }] });
+    await page.waitForFunction(() => document.getElementById('sg-reelinfo'), null, { timeout: 4000 });
+    await page.waitForTimeout(30);
+    await c.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await c.detach();
+    await page.waitForTimeout(250);
+    assert.equal(page.hits['/api/v1/friendships/*'], undefined, k);
+    assert.equal(page.hits['/api/graphql'], undefined, k);
+    assert.equal(page.url(), STORY_URL, k);
+    assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), true, k);
+    assert.equal((await r12(page)).strayTaps, 1, k);
+    if (k !== 'follow') continue;
+    // A tap that starts on the details acts.
+    await tapOn(page, '.follow');
+    await page.waitForTimeout(150);
+    assert.equal(page.hits['/api/v1/friendships/*'], 1);
+    assert.equal((await ui(page)).follow, 'Following');
+  }
+  // A click with no touch (TalkBack) acts.
+  const p2 = await openStory({ api: { '/api/graphql': () => ({ body: { data: { xig_media_like: {} } } }) } });
+  await openReel(p2);
+  await p2.evaluate(() => document.getElementById('sg-reelinfo').shadowRoot.querySelector('.like').click());
+  await p2.waitForTimeout(150);
+  assert.equal(p2.hits['/api/graphql'], 1);
+});
+
+test('R12: while the bar is in use the faded details take no taps: a tap there pauses or plays the video', async () => {
+  const page = await openStory({ api: { '/api/graphql': () => ({ body: { data: { xig_media_like: {}, xig_media_save: {} } } }) } });
+  await openReel(page);
+  await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v.readyState >= 1 && !v.paused; });
+  const saveAt = await spot(page, '.save'), likeAt = await spot(page, '.like');
+  const bar = await page.evaluate(() => {
+    const t = document.querySelector('#sg-reel [data-sg-bar="story"]').shadowRoot.querySelector('.track').getBoundingClientRect();
+    return [t.left + t.width * 0.3, t.bottom - 2];
+  });
+  const paused = () => page.evaluate(() => document.querySelector('#sg-reel video').paused);
+  await tapAt(page, bar[0], bar[1]);
+  await tapAt(page, saveAt[0], saveAt[1]);
+  assert.equal(await paused(), true, 'the tap paused the video');
+  await tapAt(page, likeAt[0], likeAt[1]);
+  assert.equal(await paused(), false, 'and played it again');
+  const st = await r12(page);
+  assert.deepEqual([st.save.sent, st.like.sent], [0, 0]);
+  assert.equal(page.hits['/api/graphql'], undefined);
+  // Once it is back, its buttons work again.
+  await page.waitForFunction(() => !document.getElementById('sg-reelinfo').hasAttribute('data-faded'), null, { timeout: 3000 });
+  await tapOn(page, '.like');
+  await page.waitForTimeout(150);
+  assert.equal((await r12(page)).like.sent, 1);
+});
+
+test('R12: a swipe up or down that starts on the details returns to the Story, which continues', async () => {
+  for (const [sel, dy] of [['.like', -350], ['.save', -300], ['.comment', 200], ['.cap', -350], ['.name', -350]]) {
+    const page = await openStory();
+    await openReel(page);
+    const [x, y] = await spot(page, sel);
+    await drag(page, [x, y], [x, y + dy]);
+    const st = await page.evaluate(() => ({ open: !!document.getElementById('sg-reel'), story: window.__story }));
+    assert.equal(st.open, false, sel);
+    assert.deepEqual([st.story.paused, st.story.closed, st.story.reply], [false, 0, 0], sel);
+    const r = await r12(page);
+    assert.deepEqual([r.like.sent, r.save.sent, r.comments, r.profile], [0, 0, 0, 0], sel);
+  }
+  // An opened caption scrolls instead (the long-caption test); a drag of a few px is no swipe.
+  const page = await openStory();
+  await openReel(page);
+  const [x, y] = await spot(page, '.like');
+  await drag(page, [x, y], [x, y - 25]);
+  assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), true);
+});
+
+test('R12: like and save send the Reel\'s exact id, though Instagram\'s answer has it as a bare 19-digit number', async () => {
+  const BIG = '3456789012345678901';
+  const raw = JSON.stringify({ status: 'ok', items: [reelItem({ pk: 'PK_HERE', id: BIG + '_' + CREATOR_ID })] })
+    .replace('"pk":"PK_HERE"', '"pk":' + BIG);
+  assert.ok(raw.includes('"pk":' + BIG + ','));
+  const page = await openStory({ api: {
+    '/api/v1/media/*': () => ({ raw }),
+    '/api/graphql': (u, req) => {
+      const name = new URLSearchParams(req.postData()).get('fb_api_req_friendly_name');
+      const root = { PolarisAPILikePostMutation: 'xig_media_like', PolarisAPIUnlikePostMutation: 'xig_media_unlike',
+        PolarisAPISavePostMutation: 'xig_media_save', PolarisAPIUnsavePostMutation: 'xig_media_unsave' }[name];
+      return { body: { data: { [root]: {} } } };
+    },
+  } });
+  await openReel(page);
+  for (const sel of ['.like', '.like', '.save', '.save']) {
+    await tapOn(page, sel);
+    await page.waitForTimeout(150);
+  }
+  const sentIds = page.reqs.filter(x => x.key === '/api/graphql').map(x => {
+    const b = new URLSearchParams(x.body);
+    return [b.get('fb_api_req_friendly_name'), JSON.parse(b.get('variables')).input.media_id];
+  });
+  assert.deepEqual(sentIds, [['PolarisAPILikePostMutation', BIG], ['PolarisAPIUnlikePostMutation', BIG],
+    ['PolarisAPISavePostMutation', BIG], ['PolarisAPIUnsavePostMutation', BIG]]);
+  // Through Instagram's own code: the same exact id.
+  const p2 = await openStory({ api: { '/api/v1/media/*': () => ({ raw }) }, init: fakeModules(`{
+    PolarisAPILikePost: { likePost: id => { window.__calls.push(['like', id]); return Promise.resolve({}); } },
+    PolarisAPISavePost: { savePost: id => { window.__calls.push(['save', id]); return Promise.resolve({}); } },
+  }`) });
+  await openReel(p2);
+  await tapOn(p2, '.like');
+  await tapOn(p2, '.save');
+  await p2.waitForTimeout(150);
+  assert.deepEqual(await p2.evaluate(() => window.__calls), [['like', BIG], ['save', BIG]]);
+});
+
+test('R12: Instagram\'s action block (GraphQL codes 1404006/1404078) counts as slowing down: nothing more is sent', async () => {
+  const page = await openStory({ api: {
+    '/api/graphql': () => ({ body: { errors: [{ code: 1404078, summary: 'Action blocked', description: 'We restrict certain activity to protect our community.' }], data: null } }),
+    '/api/v1/friendships/*': () => ({ body: { status: 'ok', friendship_status: { following: true } } }),
+  } });
+  await openReel(page);
+  await tapOn(page, '.like');
+  await page.waitForFunction(() => window.__sent.some(m => m.action === 'toast'));
+  assert.match((await toasts(page))[0], /slowing things down/);
+  await tapOn(page, '.like');
+  await tapOn(page, '.save');
+  await tapOn(page, '.follow');
+  await page.waitForTimeout(200);
+  assert.equal(page.hits['/api/graphql'], 1);
+  assert.equal(page.hits['/api/v1/friendships/*'], undefined);
+  let st = await r12(page);
+  assert.deepEqual([st.slowed, st.blocked, st.like.refused], [3, 1, 1]);
+  // Through Instagram's own code: its raw GraphQL error, or a network error carrying it.
+  for (const rejection of ['({ code: 1404006, summary: "Action blocked" })', 'Object.assign(new Error("x"), { source: { code: 1404078 } })']) {
+    const p2 = await openStory({ init: fakeModules(`{
+      PolarisAPILikePost: { likePost: id => { window.__calls.push(id); return Promise.reject(${rejection}); } },
+    }`) });
+    await openReel(p2);
+    await tapOn(p2, '.like');
+    await p2.waitForFunction(() => window.__sent.some(m => m.action === 'toast'));
+    await tapOn(p2, '.like');
+    await p2.waitForTimeout(150);
+    assert.equal((await p2.evaluate(() => window.__calls)).length, 1, rejection);
+    assert.match((await toasts(p2))[0], /slowing things down/);
+    st = await r12(p2);
+    assert.equal(st.slowed, 1);
+  }
+});
+
+test('R12: an action Instagram\'s own code never answers is given up on: Follow comes back with a message', async () => {
+  const page = await openStory({ cfg: { actionWaitMs: 300 }, init: fakeModules(`{
+    PolarisSharedAPI: { followUser: id => { window.__calls.push(['follow', id]); return new Promise(() => null); } },
+    PolarisAPILikePost: { likePost: id => { window.__calls.push(['like', id]); return new Promise(() => null); } },
+  }`) });
+  await openReel(page);
+  await tapOn(page, '.follow');
+  assert.equal((await ui(page)).follow, 'Following');
+  await page.waitForFunction(() => window.__sent.some(m => m.action === 'toast'), null, { timeout: 3000 });
+  assert.equal((await ui(page)).follow, 'Follow');
+  assert.match((await toasts(page))[0], /Couldn.t confirm the follow/);
+  await tapOn(page, '.like');
+  assert.equal((await ui(page)).like.on, true);
+  await page.waitForFunction(() => window.__sent.filter(m => m.action === 'toast').length === 2, null, { timeout: 3000 });
+  const s = await ui(page);
+  assert.deepEqual([s.like.on, s.like.n], [false, '1,234']);
+  const st = await r12(page);
+  assert.deepEqual([st.follow.unconfirmed, st.follow.refused, st.like.unconfirmed, st.like.refused], [1, 0, 1, 0]);
+  assert.deepEqual(await page.evaluate(() => window.__calls), [['follow', CREATOR_ID], ['like', REEL_PK]]);
 });
