@@ -66,6 +66,13 @@ final class ZoomFrame extends FrameLayout {
     private boolean splitDecided;
     private float splitX, splitY;
 
+    // B25: MOVEs handed on to the page in the current touch, and in the last few
+    // finished ones. A report that drags stop scrolling counts only when the
+    // drags really reached the page (this frame didn't keep them).
+    private int seqMoves;
+    private final int[] lastMoves = new int[4];
+    private int lastMovesAt;
+
     ZoomFrame(Context context, Listener listener) {
         super(context);
         this.listener = listener;
@@ -93,6 +100,30 @@ final class ZoomFrame extends FrameLayout {
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent ev) {
+        int a = ev.getActionMasked();
+        if (a == MotionEvent.ACTION_DOWN) seqMoves = 0;
+        boolean r = route(ev);
+        if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+            lastMoves[lastMovesAt] = seqMoves;
+            lastMovesAt = (lastMovesAt + 1) % lastMoves.length;
+        }
+        return r;
+    }
+
+    /** Hands a touch event on to the page, counting the MOVEs that get there. */
+    private boolean toPage(MotionEvent ev) {
+        if (ev.getActionMasked() == MotionEvent.ACTION_MOVE) seqMoves++;
+        return super.dispatchTouchEvent(ev);
+    }
+
+    /** The most MOVEs any of the last few finished touches handed to the page. */
+    int recentPageMoves() {
+        int most = 0;
+        for (int n : lastMoves) most = Math.max(most, n);
+        return most;
+    }
+
+    private boolean route(MotionEvent ev) {
         if (page() == null) return super.dispatchTouchEvent(ev);
         if (split) return dispatchSplit(ev);
         int action = ev.getActionMasked();
@@ -119,7 +150,7 @@ final class ZoomFrame extends FrameLayout {
             tapCandidate = false;
             return true;
         }
-        return super.dispatchTouchEvent(ev);
+        return toPage(ev);
     }
 
     private void onZoomTouch(MotionEvent ev) {
@@ -258,29 +289,38 @@ final class ZoomFrame extends FrameLayout {
             return;
         }
         final float s0 = scale, x0 = tx, y0 = ty;
-        animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.setDuration(180);
-        animator.setInterpolator(new DecelerateInterpolator());
-        animator.addUpdateListener(a -> {
+        final ValueAnimator anim = ValueAnimator.ofFloat(0f, 1f);
+        animator = anim;
+        anim.setDuration(180);
+        anim.setInterpolator(new DecelerateInterpolator());
+        anim.addUpdateListener(a -> {
             float f = (float) a.getAnimatedValue();
             scale = s0 + (1f - s0) * f;
             tx = x0 * (1f - f);
             ty = y0 * (1f - f);
             apply();
         });
-        animator.addListener(new android.animation.AnimatorListenerAdapter() {
+        anim.addListener(new android.animation.AnimatorListenerAdapter() {
             @Override
             public void onAnimationEnd(android.animation.Animator a) {
+                // A finished animator must not linger: B25's repair gate reads
+                // isAnimating(). Only this one, never a newer one.
+                if (animator == anim) animator = null;
                 scale = 1f;
                 tx = ty = 0f;
                 apply();
                 releaseHold();
             }
         });
-        animator.start();
+        anim.start();
     }
 
-    /** Presses and holds the middle of the page (pauses a Story while a menu is open). */
+    /**
+     * Presses and holds the middle of the page (pauses a Story while a menu is open).
+     * The press and its release go straight to the page view, not through this
+     * frame's touch target: a release that went astray would leave the web engine
+     * believing a finger is still down (B25).
+     */
     void hold() {
         if (holding || page() == null) return;
         long now = SystemClock.uptimeMillis();
@@ -290,7 +330,7 @@ final class ZoomFrame extends FrameLayout {
         holdY = getHeight() / 2f;
         listener.onHoldChanged(true);
         MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, holdX, holdY, 0);
-        super.dispatchTouchEvent(down);
+        page().dispatchTouchEvent(down);
         down.recycle();
     }
 
@@ -301,12 +341,68 @@ final class ZoomFrame extends FrameLayout {
     /** Lets go of a held finger without it counting as a tap. */
     void releaseHold() {
         if (!holding || isZoomed()) return;
+        dropHold();
+    }
+
+    private void dropHold() {
         holding = false;
-        long now = SystemClock.uptimeMillis();
-        MotionEvent cancel = MotionEvent.obtain(holdDownTime, now, MotionEvent.ACTION_CANCEL, holdX, holdY, 0);
-        super.dispatchTouchEvent(cancel);
+        MotionEvent cancel = holdCancel();
+        View p = page();
+        if (p != null) p.dispatchTouchEvent(cancel);
         cancel.recycle();
         listener.onHoldChanged(false);
+    }
+
+    /**
+     * The cancel that ends the held finger, for whichever view has the page's
+     * input at the moment (the app also sends it to a full-screen view). The
+     * caller recycles it.
+     */
+    MotionEvent holdCancel() {
+        return MotionEvent.obtain(holdDownTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, holdX, holdY, 0);
+    }
+
+    boolean isOwned() {
+        return owned;
+    }
+
+    boolean isPinching() {
+        return pinching;
+    }
+
+    boolean isAnimating() {
+        return animator != null && animator.isRunning();
+    }
+
+    /**
+     * B25's harmless reset: back to 1x with no gesture in progress, any held
+     * finger let go (even while zoomed), split view off unless the comments
+     * still need it, and one cancel straight to the page view. It cannot repair
+     * the web engine's own touch state; it clears everything this frame holds.
+     */
+    void forceIdle(boolean keepSplit) {
+        stopAnimation();
+        owned = false;
+        pinching = false;
+        panPointer = -1;
+        tapCandidate = false;
+        View p = page();
+        if (p == null) return;
+        if (split && !keepSplit) {
+            split = false;
+            p.animate().cancel();
+            p.setClipBounds(null);
+        }
+        if (!split) {
+            scale = 1f;
+            tx = ty = 0f;
+            apply();
+        }
+        if (holding) dropHold();
+        long now = SystemClock.uptimeMillis();
+        MotionEvent cancel = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, getWidth() / 2f, getHeight() / 2f, 0);
+        p.dispatchTouchEvent(cancel);
+        cancel.recycle();
     }
 
     private void cancelPage(MotionEvent ev) {
@@ -396,6 +492,6 @@ final class ZoomFrame extends FrameLayout {
                 }
             }
         }
-        return super.dispatchTouchEvent(ev);
+        return toPage(ev);
     }
 }

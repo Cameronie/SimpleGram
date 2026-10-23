@@ -62,6 +62,54 @@
       try { return fn.apply(this, arguments); } catch (e) { stats.errors++; return undefined; }
     };
   }
+  // B25 touch rule: SimpleGram holds a touch still with a non-passive touchmove
+  // preventDefault, never with touch-action none/pan-x (a touch-action surface
+  // touched while the web engine believes a finger is down switches vertical
+  // scrolling off for good). Remembered so diagnostics tell ours from Instagram's.
+  const sgPrevented = new WeakSet();
+  function sgPrevent(e) {
+    if (!e.cancelable) return;
+    e.preventDefault();
+    sgPrevented.add(e);
+  }
+  // SimpleGram's own surface over the page (R9's Reel layer; R11's bar later):
+  // nothing under it scrolls while a finger drags on it.
+  function holdStill(el) {
+    el.addEventListener('touchmove', e => { e.stopPropagation(); sgPrevent(e); }, { passive: false });
+  }
+
+  // B25 census: non-passive touchmove listeners on window, document and body
+  // (Instagram's and SimpleGram's), net of removals. Wrapped here, at document
+  // start, before any of Instagram's scripts; the wrapper only counts and
+  // always calls through, whatever happens in the counting.
+  let moveBlockers = 0;
+  (function countMoveBlockers() {
+    const live = new WeakMap();
+    const key = (t, opts) => {
+      const k = t === window ? 'w' : t === document ? 'd' : document.body && t === document.body ? 'b' : '';
+      return k && k + ((typeof opts === 'boolean' ? opts : !!(opts && opts.capture)) ? 1 : 0);
+    };
+    try {
+      const ET = EventTarget.prototype, add = ET.addEventListener, remove = ET.removeEventListener;
+      ET.addEventListener = function addEventListener(type, fn, opts) {
+        if (type === 'touchmove' && fn && opts && typeof opts === 'object' && opts.passive === false) {
+          try {
+            const k = key(this, opts);
+            let s = k && live.get(fn);
+            if (k && !s) live.set(fn, s = new Set());
+            if (s && !s.has(k)) { s.add(k); moveBlockers++; }
+          } catch (e) { /* counting only */ }
+        }
+        return add.apply(this, arguments);
+      };
+      ET.removeEventListener = function removeEventListener(type, fn, opts) {
+        if (type === 'touchmove' && fn) {
+          try { const k = key(this, opts), s = k && live.get(fn); if (s && s.delete(k)) moveBlockers--; } catch (e) { /* counting only */ }
+        }
+        return remove.apply(this, arguments);
+      };
+    } catch (e) { /* left as it was */ }
+  })();
 
   /* ------------------------------------------------------------------ *
    * Routes
@@ -3140,7 +3188,7 @@
     const dx = t.clientX - swipe.x, dy = t.clientY - swipe.y;
     if (swipe.vertical === null && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) swipe.vertical = Math.abs(dy) > Math.abs(dx);
     if (swipe.vertical) {
-      if (e.cancelable) e.preventDefault();
+      sgPrevent(e);
       e.stopPropagation();
     }
   });
@@ -3196,6 +3244,18 @@
   let storyPress = null;               // a touch Instagram's Story saw start
   let appHeld = false;                 // the app is holding a finger on the page (appHold)
   let r8El = null, r8On = false;
+  // B25: an R8 request on its way (a late exit event must not lose track of it),
+  // and an exit asked of the app that hasn't landed yet.
+  let r8Pending = false, r8PendingAt = 0, r8ExitAt = 0;
+  const R8_STALE_MS = 400;             // a swipe's lift handled this late switches nothing
+  // B25 counts (shapes only): r8Race, a late exit event while a request was on its
+  // way; r8Settling, touches that started nothing while a switch settled; r8Adopted,
+  // video full screens R8 didn't ask for and took over; r8Stale, lifts handled too
+  // late; exitAsked/exitFallback, exits the app made the Back way / the page made.
+  const fsCounts = { r8Race: 0, r8Settling: 0, r8Adopted: 0, r8Stale: 0, exitAsked: 0, exitFallback: 0 };
+  const fsPageLog = [];                // the last fullscreenchange events
+  const downIds = new Set();           // touch identifiers the page saw go down and not up
+  let lastTouchEndAt = 0, lastFsChangeAt = 0;
   let reelBox = null;                  // R9's Reel layer
   function searchOpen() { return typeof search !== 'undefined' && !!search.open; }
   function isField(el) {
@@ -3261,6 +3321,10 @@
     const g = { x: t.clientX, y: t.clientY, at: Date.now(), target: e.target };
     const r = route();
     const fs = document.fullscreenElement;
+    // B25: while a full-screen switch settles, this touch starts none: a quick
+    // second swipe would otherwise switch again under the finger, or land in a
+    // full screen R8 has lost track of.
+    if (fullScreenSettling()) { fsCounts.r8Settling++; return; }
     if (r8On && fs && fs === r8El) g.exit = true;
     else if ((r === 'post' || r === 'reel') && !fs && !searchOpen()) {
       const v = videoAt(g.x, g.y);
@@ -3279,14 +3343,14 @@
     const g = gesture;
     if (!g || (!g.r8 && !g.exit)) return;
     if (e.touches.length !== 1) { g.r8 = null; g.exit = false; return; }
-    if (g.exit) { if (e.cancelable) e.preventDefault(); return; }
+    if (g.exit) { sgPrevent(e); return; }
     const t = e.touches[0], dx = t.clientX - g.x, dy = t.clientY - g.y;
     if (g.r8 === 'pending') {
       if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
       // Sideways (a carousel) or up (reading on) is left alone for the whole touch.
       g.r8 = dy > 0 && dy >= Math.abs(dx) ? 'armed' : null;
     }
-    if (g.r8 === 'armed' && e.cancelable) e.preventDefault();
+    if (g.r8 === 'armed') sgPrevent(e);
   }
 
   window.addEventListener('touchend', safe(e => {
@@ -3296,6 +3360,9 @@
     const t = e.changedTouches[0];
     const dx = t.clientX - g.x, dy = t.clientY - g.y, ms = Date.now() - g.at;
     const vertical = Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6;
+    // B25: a lift handled long after it happened (a busy page) switches nothing;
+    // the next finger may already be down. Swipe again once the page has caught up.
+    if ((g.exit || g.r8 === 'armed') && vertical && staleTouch(e)) { fsCounts.r8Stale++; return; }
     if (g.exit) { if (vertical) exitFullVideo('swipe'); return; }
     if (g.r8 === 'armed') { if (vertical && dy > 0 && ms < 1500) enterR8(g.video); return; }
     if (!g.story || route() !== 'story') return;
@@ -3304,7 +3371,13 @@
       const reel = sharedReelHere();
       // Instagram's own swipe up opens the reply box; it never sees this one,
       // so its Story stays pressed (paused) under the Reel.
-      if (reel && openStoryReel(reel, g)) { e.stopImmediatePropagation(); return; }
+      if (reel && openStoryReel(reel, g)) {
+        // B25's own listener never sees this lift: count it here, or the next touch reads as a lost end.
+        noteTouchLift(e, false);
+        dseq = null;
+        e.stopImmediatePropagation();
+        return;
+      }
     }
     // Instagram's own thresholds for a swipe to the next or previous person.
     if (Math.abs(dx) > 50 && Math.abs(dy) < 100 && ms <= 500) storySwitchStart(dx > 0 ? 'back' : 'next');
@@ -3354,28 +3427,76 @@
     togglePlay(fs);
   }), true);
 
-  function enterR8(v) {
-    if (!v || !v.isConnected || document.fullscreenElement) return;
-    const req = v.requestFullscreen || v.webkitRequestFullscreen;
-    if (typeof req !== 'function') { fvStats.r8Failed++; return; }
-    const fail = () => { fvStats.r8Failed++; if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; } };
-    r8El = v;
-    v.dataset.sgFull = '1';
-    let p;
-    try { p = req.call(v, { navigationUI: 'hide' }); } catch (err) { fail(); return; }
-    if (p && typeof p.then === 'function') p.then(null, () => { if (document.fullscreenElement !== v) fail(); });
+  /* B25 touch rules for full screen (R8 now; R10's tap and R11's bar build on
+   * them): leaveFullScreen is the one way out; nothing starts while a switch
+   * settles (fullScreenSettling); a lift handled too late switches nothing
+   * (staleTouch); SimpleGram's own surfaces hold still with holdStill/sgPrevent. */
+
+  // A full-screen switch R8 asked for or was told of hasn't landed yet. Each
+  // wait has a limit, so a request that never answers can't block R8 for good.
+  function fullScreenSettling() {
+    if (r8Pending && performance.now() - r8PendingAt > 3000) r8Pending = false;
+    if (r8ExitAt && Date.now() - r8ExitAt > 1500) r8ExitAt = 0;
+    const fs = document.fullscreenElement;
+    return r8Pending || (r8On && !fs) || (!!r8ExitAt && !!fs);
   }
-  function exitFullVideo(why) {
-    if (reelBox) { closeStoryReel(why); return; }
-    if (!r8On || document.fullscreenElement !== r8El) return;
+  // The event's own time (when the finger lifted) is far behind now.
+  function staleTouch(e) {
+    const lag = performance.now() - e.timeStamp;
+    return lag > R8_STALE_MS && lag < 60000;
+  }
+  // The one way SimpleGram leaves a full screen it is in. The app does it as Back
+  // does, its full-screen view first and then the browser, so a finger already
+  // down for the next swipe is never split between two views (B25). The page
+  // leaves full screen itself only when there is no app to ask (a browser).
+  function leaveFullScreen(why) {
+    if (!document.fullscreenElement) return false;
+    r8ExitAt = Date.now();             // before asking: the app may be done before post() returns
+    if (post('fullVideoExitRequest', { why: /^[a-z]{1,12}$/.test(why) ? why : 'other' })) {
+      fsCounts.exitAsked++;
+      return true;
+    }
+    r8ExitAt = 0;
+    fsCounts.exitFallback++;
     try {
       const p = document.exitFullscreen();
       if (p && p.catch) p.catch(() => {});
     } catch (e) { /* already out */ }
+    return true;
+  }
+  SG.leaveFullScreen = leaveFullScreen;
+
+  function enterR8(v) {
+    if (!v || !v.isConnected || document.fullscreenElement || fullScreenSettling()) return;
+    const req = v.requestFullscreen || v.webkitRequestFullscreen;
+    if (typeof req !== 'function') { fvStats.r8Failed++; return; }
+    const fail = () => {
+      fvStats.r8Failed++;
+      if (r8El === v) r8Pending = false;
+      if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; }
+    };
+    r8El = v;
+    r8Pending = true;
+    r8PendingAt = performance.now();
+    v.dataset.sgFull = '1';
+    let p;
+    try { p = req.call(v, { navigationUI: 'hide' }); } catch (err) { fail(); return; }
+    if (p && typeof p.then === 'function') {
+      p.then(() => { if (r8El === v && document.fullscreenElement === v) r8Pending = false; },
+        () => { if (document.fullscreenElement !== v) fail(); });
+    }
+  }
+  function exitFullVideo(why) {
+    if (reelBox) { closeStoryReel(why); return; }
+    if (!r8On || document.fullscreenElement !== r8El) return;
+    leaveFullScreen(why);
   }
   document.addEventListener('fullscreenchange', safe(() => {
     const el = document.fullscreenElement;
+    let via = 'other';
     if (r8El && el === r8El) {
+      via = 'r8';
+      r8Pending = false;
       if (!r8On) {
         r8On = true;
         fvStats.r8++;
@@ -3386,12 +3507,34 @@
           if (document.fullscreenElement === v && v.muted && !userMuted && !v.paused && wantsSound(v)) unmute(v);
         }), 150);
       }
+    } else if (el && el.tagName === 'VIDEO' && !el.dataset.sgOwn && !r8Pending && CFG.role === 'main' &&
+      (route() === 'post' || route() === 'reel')) {
+      // B25: a video full screen R8 isn't tracking (Instagram's own player, or a
+      // request that landed after R8 lost track of it) is taken over, so a swipe
+      // leaves it the safe way and the browser's controls stay hidden.
+      if (r8El && r8El !== el) delete r8El.dataset.sgFull;
+      r8El = el;
+      r8On = true;
+      el.dataset.sgFull = '1';
+      fsCounts.r8Adopted++;
+      via = 'r8-adopted';
     } else if (r8On || r8El) {
       if (r8On) fvStats.exits++;
       r8On = false;
-      if (r8El) delete r8El.dataset.sgFull;
-      r8El = null;
+      if (r8Pending && !el) {
+        // B25: an exit from before, arriving while the next request is on its
+        // way. That request stays tracked (it used to land untracked).
+        fsCounts.r8Race++;
+        via = 'r8-race';
+      } else {
+        via = 'r8';
+        r8Pending = false;
+        if (r8El) delete r8El.dataset.sgFull;
+        r8El = null;
+      }
     }
+    if (!el) r8ExitAt = 0;
+    noteFsPage(el, via);
     // The full screen R9's layer lived in ended: Instagram is closing the Story.
     if (reelBox && reelBox.inFull && (!el || !el.contains(reelBox.box))) closeStoryReel('ended');
   }));
@@ -3413,7 +3556,7 @@
     box.setAttribute('role', 'dialog');
     box.setAttribute('aria-label', 'Reel');
     box.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;margin:0;padding:0;z-index:2147483647;' +
-      'background:#000;display:flex;align-items:center;justify-content:center;touch-action:none';
+      'background:#000;display:flex;align-items:center;justify-content:center';
     const v = document.createElement('video');
     v.dataset.sgOwn = '1';
     v.setAttribute('playsinline', '');
@@ -3436,7 +3579,8 @@
       e.stopPropagation();
       start = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
     }, { passive: true });
-    box.addEventListener('touchmove', e => { e.stopPropagation(); }, { passive: true });
+    // Held still with a blocking touchmove, not touch-action:none (B25's touch rule).
+    holdStill(box);
     box.addEventListener('touchend', safe(e => {
       e.stopPropagation();
       const s = start;
@@ -3544,6 +3688,312 @@
         for (const v of rb.held) if (v.isConnected && v.paused && !v.ended && route() === 'story') v.play().catch(() => {});
       }), 350);
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * B25: touch health and the scrolling repair.
+   * A touch whose end the web engine never saw leaves it believing a finger
+   * is still down; the first surface that doesn't allow vertical panning then
+   * switches vertical scrolling off for the web view's lifetime, while taps
+   * keep working. The app prevents the known causes. This notices if
+   * one-finger drags stop scrolling anyway and tells the app (scrollStuck),
+   * which first resets what it holds and then offers to rebuild the web view.
+   * Only a drag that should certainly have scrolled counts; anything doubtful
+   * (a pinch, a sideways swipe, a surface that doesn't pan vertically, the
+   * end of a list, a scroll lock, a held-still drag, a busy page, full screen,
+   * Stories, dialogs, zoom, the keyboard) is left out. Counts and shapes only.
+   * ------------------------------------------------------------------ */
+  const DEAD_TRAVEL = 60;        // CSS px of mostly vertical travel
+  const DEAD_WAIT = 800;         // ms after the lift for a scroll to show
+  const DEAD_WINDOW = 30000;     // strikes count within this long
+  const DEAD_STRIKES = 3;
+  const STUCK_EVERY = 60000;     // one report a minute at most, unless the app asks again
+  const touchSeq = { starts: 0, ends: 0, cancels: 0, orphans: 0, orphanLast: null };
+  const dragStats = { dead: 0, deadLast5: [], scrolled: 0, preventedSG: 0, preventedOther: 0, noMoves: 0,
+    maxTouchesAtStart: 0, skipped: {} };
+  const stuckStats = { posted: 0, refused: 0, soft: 0, chip: 0, ok: 0, deadAfterSoft: 0 };
+  const taSeen = [];             // the last distinct non-auto touch-action values touched
+  stats.b25 = { touchSeq: touchSeq, drag: dragStats, taSeen: taSeen, fsPage: fsPageLog, fs: fsCounts, stuck: stuckStats,
+    census: null, search: null };
+  let dseq = null;               // the one-finger touch being watched
+  let strikes = [];              // when the recent dead drags ended
+  let lastScrollAt = 0, viewW = 0, maxViewH = 0;
+  const longTasks = [];          // recent main-thread stalls over 200 ms: [start, end]
+  const report = { at: 0, followUp: false, wasFollowUp: false, open: false };
+
+  function noteScroll() { lastScrollAt = performance.now(); }
+  // Scrolls in the page (element scrolls pass the document in the capture
+  // phase). The search screen's list is in a shadow root: it has its own.
+  document.addEventListener('scroll', noteScroll, { capture: true, passive: true });
+
+  function noteFsPage(el, via) {
+    const now = performance.now();
+    fsPageLog.push({ tag: el ? String(el.tagName || '?').toLowerCase() : null, route: route(), via: via, on: !!el,
+      msSinceTouchEnd: lastTouchEndAt ? Math.round(now - lastTouchEndAt) : -1, touchActive: downIds.size > 0 });
+    if (fsPageLog.length > 8) fsPageLog.shift();
+    lastFsChangeAt = now;
+  }
+  function allowsPanY(v) {
+    return !v || v === 'auto' || v === 'manipulation' || /(^|\s)pan-y(\s|$)/.test(v);
+  }
+  // The touched element's chain, through open shadow roots: its touch-action
+  // values, whether they all allow vertical panning, the nearest vertical
+  // scroller, and whether it is SimpleGram's search screen.
+  function touchChain(e) {
+    const out = { ta: [], panY: true, scroller: null, reverse: false, overlay: false };
+    const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+    for (const n of path) {
+      if (!(n instanceof Element)) continue;
+      if (n === search.host) out.overlay = true;
+      const cs = getComputedStyle(n);
+      const v = cs.touchAction;
+      if (v && v !== 'auto' && out.ta.indexOf(v) < 0 && out.ta.length < 6) out.ta.push(v.slice(0, 40));
+      if (!allowsPanY(v)) out.panY = false;
+      if (!out.scroller && n !== document.documentElement && n !== document.body &&
+        /^(auto|scroll|overlay)$/.test(cs.overflowY) && n.scrollHeight > n.clientHeight + 1) {
+        out.scroller = n;
+        // A chat-style list: scrollTop runs from -max up to 0 at the newest item.
+        out.reverse = /flex/.test(cs.display) && /-reverse$/.test(cs.flexDirection);
+      }
+    }
+    return out;
+  }
+  function noteTouchActions(list) {
+    for (const v of list) {
+      const i = taSeen.findIndex(x => x.v === v);
+      if (i >= 0) taSeen.splice(i, 1);
+      taSeen.push({ v: v, t: tenths(), route: route() });
+      if (taSeen.length > 5) taSeen.shift();
+    }
+  }
+  function dialogShown() {
+    const list = document.querySelectorAll('[role="dialog"],[aria-modal="true"]');
+    for (let i = 0; i < list.length && i < 20; i++) {
+      const r = list[i].getBoundingClientRect();
+      if (r.width > 1 && r.height > 1 && getComputedStyle(list[i]).visibility !== 'hidden') return true;
+    }
+    return false;
+  }
+  function deepActive() {
+    let a = document.activeElement;
+    for (let i = 0; a && a.shadowRoot && a.shadowRoot.activeElement && i < 5; i++) a = a.shadowRoot.activeElement;
+    return a;
+  }
+  // Only a shrunk viewport says the keyboard is up: a field keeps its focus
+  // after Back hides the keyboard, and drags there still count.
+  function keyboardLikely() {
+    noteViewport();
+    const vv = window.visualViewport;
+    return !!vv && maxViewH > 0 && vv.height < maxViewH * 0.75;
+  }
+  // The tallest the viewport has been at this width (a new width starts over).
+  function noteViewport() {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    if (innerWidth !== viewW) { viewW = innerWidth; maxViewH = 0; }
+    if (vv.height > maxViewH) maxViewH = vv.height;
+  }
+  if (CFG.role === 'main' && window.visualViewport) {
+    window.visualViewport.addEventListener('resize', safe(noteViewport), { passive: true });
+    // Its full height known before the first touch, read once the page has its
+    // viewport (reading it at document start makes the page resize later).
+    document.addEventListener('DOMContentLoaded', safe(noteViewport), { once: true });
+  }
+  function scrollLocked() {
+    const h = document.documentElement, b = document.body;
+    return (!!h && /^(hidden|clip)$/.test(getComputedStyle(h).overflowY)) ||
+      (!!b && /^(hidden|clip)$/.test(getComputedStyle(b).overflowY));
+  }
+  function whereOf(d) {
+    const r = route();
+    return d.chain.overlay ? 'overlay' : r === 'home' ? 'home' : r === 'post' || r === 'reel' ? 'post' : 'other';
+  }
+  function skipDrag(why) { bump(dragStats.skipped, why); }
+  function sawPrevented(d) {
+    const m = d.last;
+    d.last = null;
+    if (m && m.defaultPrevented) { d.prevented++; if (sgPrevented.has(m)) d.sg = true; }
+  }
+
+  window.addEventListener('touchstart', safe(e => {
+    if (!e.isTrusted || CFG.role !== 'main') return;
+    const now = performance.now();
+    // Every finger in this touch is new, yet the last touch never ended: the
+    // page never saw that touch's end (the lost end, seen from the page).
+    if (downIds.size && e.touches.length === e.changedTouches.length) {
+      touchSeq.orphans++;
+      touchSeq.orphanLast = { route: route(), fs: !!document.fullscreenElement,
+        msSinceFsChange: lastFsChangeAt ? Math.round(now - lastFsChangeAt) : -1, appHeld: appHeld };
+      downIds.clear();
+    }
+    if (!downIds.size) touchSeq.starts++;
+    for (let i = 0; i < e.changedTouches.length; i++) downIds.add(e.changedTouches[i].identifier);
+    if (e.touches.length > dragStats.maxTouchesAtStart) dragStats.maxTouchesAtStart = e.touches.length;
+    const chain = touchChain(e);
+    noteTouchActions(chain.ta);
+    if (e.touches.length !== 1) { if (dseq) dseq.multi = true; return; }
+    noteViewport();
+    const sc = chain.scroller || document.scrollingElement || document.documentElement;
+    const t = e.touches[0];
+    // The scroller's real range: [0, max], or [-max, 0] for a reversed one (also
+    // when it rests below 0 and its style didn't say so).
+    const max = sc.scrollHeight - sc.clientHeight, top0 = sc.scrollTop;
+    const rev = (chain.scroller === sc && chain.reverse) || top0 < -1;
+    dseq = { t0: now, t1: 0, x: t.clientX, y: t.clientY, ex: t.clientX, ey: t.clientY, moves: 0, firstMove: 0,
+      multi: false, last: null, prevented: 0, sg: false, chain: chain, sc: sc, top0: top0,
+      lo: rev ? -max : 0, hi: rev ? 0 : max };
+  }), { capture: true, passive: true });
+  window.addEventListener('touchmove', safe(e => {
+    const d = dseq;
+    if (!d || !e.isTrusted) return;
+    if (e.touches.length !== 1) d.multi = true;
+    sawPrevented(d);                 // the previous move has been through every listener by now
+    d.last = e;
+    d.moves++;
+    if (!d.firstMove) d.firstMove = performance.now();
+    const t = e.touches[0];
+    if (t) { d.ex = t.clientX; d.ey = t.clientY; }
+  }), { capture: true, passive: true });
+  // A finger (or the whole touch) lifted or cancelled, as far as the page's bookkeeping goes.
+  function noteTouchLift(e, cancel) {
+    for (let i = 0; i < e.changedTouches.length; i++) downIds.delete(e.changedTouches[i].identifier);
+    if (e.touches.length) return;
+    downIds.clear();
+    if (cancel) touchSeq.cancels++;
+    else { touchSeq.ends++; lastTouchEndAt = performance.now(); }
+  }
+  window.addEventListener('touchend', safe(e => {
+    if (!e.isTrusted) return;
+    noteTouchLift(e, false);
+    const d = dseq;
+    if (!d) return;
+    if (e.touches.length) { d.multi = true; return; }
+    dseq = null;
+    const t = e.changedTouches[0];
+    if (t) { d.ex = t.clientX; d.ey = t.clientY; }
+    d.t1 = performance.now();
+    judgeDrag(d);
+  }), { capture: true, passive: true });
+  window.addEventListener('touchcancel', safe(e => {
+    if (!e.isTrusted) return;
+    noteTouchLift(e, true);
+    dseq = null;                     // a cancelled touch never counts
+  }), { capture: true, passive: true });
+  if (CFG.role === 'main') {
+    try {
+      new PerformanceObserver(safe(list => {
+        for (const e of list.getEntries()) {
+          if (e.duration < 200) continue;
+          longTasks.push([e.startTime, e.startTime + e.duration]);
+          if (longTasks.length > 8) longTasks.shift();
+        }
+      })).observe({ type: 'longtask' });
+    } catch (e) { /* long task timing unavailable */ }
+  }
+
+  // At the lift: only a drag that should certainly scroll is watched further.
+  function judgeDrag(d) {
+    const dx = d.ex - d.x, dy = d.ey - d.y;
+    if (Math.abs(dy) < DEAD_TRAVEL) return;          // a tap or a short touch: nothing to judge
+    if (d.multi) return skipDrag('pinch');
+    if (Math.abs(dy) < 2 * Math.abs(dx)) return skipDrag('sideways');
+    if (!d.moves) { dragStats.noMoves++; return skipDrag('noMoves'); }
+    if (d.firstMove - d.t0 > 500) return skipDrag('slowStart');
+    const sel = typeof getSelection === 'function' ? getSelection() : null;
+    if (sel && !sel.isCollapsed) return skipDrag('selection');
+    if (!d.chain.panY) return skipDrag('noPanY');
+    if (document.fullscreenElement || r8On || reelBox) return skipDrag('fullScreen');
+    if (route() === 'story') return skipDrag('story');
+    if (appHeld) return skipDrag('held');
+    if (d.x < 16 || d.x > innerWidth - 16 || d.y > innerHeight - 24) return skipDrag('screenEdge');
+    const vv = window.visualViewport;
+    if (vv && Math.abs(vv.scale - 1) > 0.01) return skipDrag('zoom');
+    if (keyboardLikely()) return skipDrag('keyboard');
+    if (dialogShown()) return skipDrag('dialog');
+    if (d.sc === (document.scrollingElement || document.documentElement) && scrollLocked()) return skipDrag('locked');
+    // The list is at its end in the drag's direction: nothing to scroll.
+    if (dy < 0 ? d.top0 >= d.hi - 2 : d.top0 <= d.lo + 2) return skipDrag('end');
+    setTimeout(safe(() => settleDrag(d)), DEAD_WAIT);
+  }
+  // A while after the lift: did anything scroll?
+  function settleDrag(d) {
+    const now = performance.now();
+    if (now - d.t1 > DEAD_WAIT + 600) return skipDrag('busy');   // too busy to tell
+    sawPrevented(d);
+    if (d.prevented) {
+      if (d.sg) dragStats.preventedSG++;
+      else dragStats.preventedOther++;
+      return skipDrag('prevented');
+    }
+    if (lastScrollAt >= d.t0 || Math.abs(d.sc.scrollTop - d.top0) > 1) {
+      dragStats.scrolled++;
+      strikes = [];
+      if (report.open) { report.open = false; stuckStats.ok++; post('scrollOk'); }
+      return;
+    }
+    for (const lt of longTasks) if (lt[1] > d.t0 && lt[0] < now) return skipDrag('busy');
+    if (document.fullscreenElement) return skipDrag('fullScreen');
+    dragStats.dead++;
+    if (stuckStats.soft) stuckStats.deadAfterSoft++;
+    const travel = Math.abs(d.ey - d.y);
+    dragStats.deadLast5.push({ route: route(), where: whereOf(d), travel: travel < 120 ? 60 : travel < 240 ? 120 : travel < 480 ? 240 : 480,
+      chainTA: d.chain.ta.slice(0, 4) });
+    if (dragStats.deadLast5.length > 5) dragStats.deadLast5.shift();
+    strikes = strikes.filter(t => now - t < DEAD_WINDOW);
+    strikes.push(now);
+    maybeReport(d);
+  }
+  function maybeReport(d) {
+    if (strikes.length < (report.followUp ? 2 : DEAD_STRIKES)) return;
+    const now = Date.now();
+    if (!report.followUp && report.at && now - report.at < STUCK_EVERY) return;
+    report.wasFollowUp = report.followUp;
+    report.followUp = false;
+    report.at = now;
+    report.open = true;
+    stuckStats.posted++;
+    post('scrollStuck', { strikes: strikes.length, where: whereOf(d), moves: d.moves, dead: dragStats.dead });
+  }
+  // The app's answer to a report.
+  function stuckAck(cmd) {
+    if (cmd.accepted === false) {
+      // The app couldn't trust it (its zoom, a dialog, a finger down): the
+      // next dead drag may report again.
+      stuckStats.refused++;
+      report.at = 0;
+      report.followUp = report.wasFollowUp;
+      return;
+    }
+    strikes = [];
+    // After the quiet reset, two more dead drags are enough to bring the chip.
+    if (cmd.stage === 'soft') { stuckStats.soft++; report.followUp = true; }
+    else if (cmd.stage === 'chip') stuckStats.chip++;
+  }
+  // The app's quiet reset: no gesture of the page's own is left half-done.
+  function gestureReset() {
+    gesture = null;
+    swipe = null;
+    storyPress = null;
+    dseq = null;
+    downIds.clear();
+    syncSwipeGuard();
+  }
+  function touchCensus() {
+    const h = document.documentElement, b = document.body;
+    const hs = h ? getComputedStyle(h) : null, bs = b ? getComputedStyle(b) : null;
+    let dialogs = 0;
+    const list = document.querySelectorAll('[role="dialog"],[aria-modal="true"]');
+    for (let i = 0; i < list.length && i < 20; i++) {
+      const r = list[i].getBoundingClientRect();
+      if (r.width > 1 && r.height > 1) dialogs++;
+    }
+    const vv = window.visualViewport;
+    return {
+      html: hs ? { overflowY: hs.overflowY, touchAction: hs.touchAction } : null,
+      body: bs ? { overflowY: bs.overflowY, touchAction: bs.touchAction } : null,
+      moveBlockers: moveBlockers, swipeGuard: guardOn, dialogs: dialogs,
+      vvScale: vv ? Math.round(vv.scale * 100) / 100 : null, downNow: downIds.size, strikes: strikes.length,
+    };
   }
 
   /* ------------------------------------------------------------------ *
@@ -4815,6 +5265,7 @@
   function render() {
     const w = search.wrap;
     w.style.setProperty('--sg-bottom', navHeight() + 'px');
+    dropGrid(search.body);             // the old list goes; its picture watcher with it
     w.textContent = '';
     if (search.view) return renderView(w);
     const bar = el('div', 'bar');
@@ -4838,6 +5289,7 @@
       tabs.appendChild(b);
     }
     const body = el('div', 'body');
+    body.addEventListener('scroll', noteScroll, { passive: true });   // B25: the drag check sees this list scroll
     search.body = body;
     w.append(bar, tabs, body);
     input.addEventListener('input', () => {
@@ -4860,8 +5312,7 @@
   function renderBody() {
     const body = search.body;
     if (!body) return;
-    if (body.sgGrid && body.sgGrid.io) body.sgGrid.io.disconnect();
-    body.sgGrid = null;
+    dropGrid(body);
     body.textContent = '';
     const q = search.query.trim();
     if (!q) {
@@ -4943,6 +5394,7 @@
       seg.appendChild(b);
     }
     const body = el('div', 'body');
+    body.addEventListener('scroll', noteScroll, { passive: true });
     search.body = body;
     w.append(head, seg, body);
     renderGrid(body, search.grid, () => runGrid(true), null);
@@ -4950,10 +5402,11 @@
   // Thumbnails load as they come within a few screens of the list's view and
   // are let go once they are further away, so a grid hundreds of posts long
   // keeps only a screenful or two of pictures in memory. Cells keep their size.
+  let liveWatchers = 0;     // picture watchers not yet let go (diagnostics: a leak shows here)
   function thumbWatcher(body) {
     if (typeof IntersectionObserver !== 'function') return null;
     try {
-      return new IntersectionObserver(safe(entries => {
+      const io = new IntersectionObserver(safe(entries => {
         for (const e of entries) {
           const img = e.target.firstChild;
           if (!img || img.tagName !== 'IMG') continue;
@@ -4961,7 +5414,17 @@
           else if (img.hasAttribute('src')) img.removeAttribute('src');
         }
       }), { root: body, rootMargin: '1600px 0px' });
+      liveWatchers++;
+      return io;
     } catch (e) { return null; }
+  }
+  // A list's grid is going (a new search, a new tab, a re-render): its watcher
+  // stops, or the detached grid keeps it (and its hundreds of cells) alive.
+  function dropGrid(body) {
+    const g = body && body.sgGrid;
+    if (!g) return;
+    if (g.io) { g.io.disconnect(); g.io = null; liveWatchers--; }
+    body.sgGrid = null;
   }
   function addCells(g, list) {
     for (let i = g.n; i < list.length; i++) {
@@ -5005,8 +5468,7 @@
       gridFoot(g.foot, state, more);
       return;
     }
-    if (g && g.io) g.io.disconnect();
-    body.sgGrid = null;
+    dropGrid(body);
     body.textContent = '';
     if (!state || state.loading && !state.media.length) { body.appendChild(el('div', 'spin')); return; }
     if (state.error) return renderFailure(body, q);
@@ -5559,6 +6021,34 @@
     const y = saved && saved.scroll;
     if (y && search.body) requestAnimationFrame(() => { search.body.scrollTop = y; });
   }
+  // B25's rebuild: the app reads the search screen before it replaces the web
+  // view (session storage may not come along) and hands it to the new page.
+  // Stays inside the app; never part of the diagnostics.
+  SG.searchState = () => {
+    if (CFG.role !== 'main' || !search.open && !search.suspended) return null;
+    return JSON.stringify({ open: !!search.open, suspended: !!search.suspended, tab: search.tab, query: search.query,
+      view: search.view, returnUrl: search.returnUrl, token: search.token, results: search.results, posts: search.posts,
+      grid: search.grid, scroll: search.body ? search.body.scrollTop : search.lastScroll || 0 });
+  };
+  function searchRestore(st) {
+    // Search already up with something in it (the page's own restore got there first) stays.
+    if (!st || typeof st !== 'object' || CFG.role !== 'main' || search.open && (search.query || search.view)) return;
+    if (st.open) {
+      Object.assign(search, { tab: TABS.some(t => t[0] === st.tab) ? st.tab : 'accounts', query: String(st.query || ''),
+        view: st.view || null, results: st.results || {}, posts: st.posts || null, grid: st.grid || null,
+        returnUrl: st.returnUrl || null, token: st.token || null, suspended: false });
+      for (const s of [search.posts, search.grid]) if (s && s.loading) s.loading = false;
+      search.pending = null;
+      if (!search.open) showSearch();
+      render();
+      const y = st.scroll;
+      if (y && search.body) requestAnimationFrame(() => { search.body.scrollTop = y; });
+    } else if (st.suspended && st.token) {
+      // A result opened from search: Back to the marked page brings search back.
+      writeSession(SEARCH_STATE, Object.assign({}, st, { open: false, suspended: true, at: Date.now() }));
+      restoreSearch();
+    }
+  }
 
   /* ------------------------------------------------------------------ *
    * Story hold while zoomed: keep the same Story; let a video loop.
@@ -5731,9 +6221,17 @@
       case 'storyHold': storyHold(!!cmd.on); break;
       case 'appHold': appHold(!!cmd.on); break;
       case 'fullVideoExit': exitFullVideo('back'); break;
+      case 'gestureReset': gestureReset(); break;
+      case 'scrollStuckAck': stuckAck(cmd); break;
+      // The app's chip is still up from an earlier page: the first drag here that scrolls clears it.
+      case 'stuckChipUp': report.open = true; report.at = Date.now(); break;
+      case 'searchRestore': searchRestore(cmd.state); break;
       case 'viewer': if (cmd.id) CFG.viewerId = String(cmd.id); break;
       case 'status':
         stats.storage = safe(storageShape)() || null;
+        stats.b25.census = safe(touchCensus)() || null;
+        stats.b25.search = safe(() => ({ open: !!search.open, leaving: !!leaving,
+          cells: search.body && search.body.sgGrid ? search.body.sgGrid.n : 0, liveObservers: liveWatchers }))() || null;
         post('status', { stats: stats, route: route(), version: CFG.version });
         break;
       case 'tidy': queueTidy(); break;

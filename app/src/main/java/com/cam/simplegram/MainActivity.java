@@ -55,6 +55,7 @@ import androidx.webkit.WebViewFeature;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.json.JSONTokener;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -128,6 +129,41 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private String viewerId;
     private final List<Script> scripts = new ArrayList<>();
 
+    // B25: the touch sequence open at Activity level (DOWN until UP/CANCEL). A
+    // full-screen switch moves the page's input from one view to another; a
+    // touch open across it must be cancelled where the input now lives and the
+    // rest of it swallowed, or the web engine believes a finger is still down
+    // and later stops vertical scrolling for good.
+    private boolean touchOpen;
+    private boolean touchSwallow;
+    private boolean touchAccepted;
+    private boolean inTouchDispatch;
+    private MotionEvent touchLast;
+    private int touchDownOn;               // RX_WEB or RX_CUSTOM
+    private long touchDownAt;
+    private int touchSeq;
+    private static final int RX_WEB = 0, RX_CUSTOM = 1;
+    private final int[] touchStarted = new int[2], touchEnded = new int[2], touchRefused = new int[2];
+    private int cancelsShow, cancelsHide, cancelsHold, swallowedTouches, showDuringTouch, hideDuringTouch;
+    // The last few full-screen switches (shapes only), newest last.
+    private final ArrayList<JSONObject> fsLog = new ArrayList<>();
+    // Who is ending full screen: the page (Chromium already switched), Back, or the
+    // page asking the app to do it the Back way (R8's swipe, later R10).
+    private String hideInitiator = "page";
+    private boolean resumed;
+
+    // B25 self-repair: drags that should scroll don't (reported by the page).
+    private TextView stuckChip;
+    private boolean stuckChipWanted;
+    private boolean softResetDone;
+    private long softResetAt, rebuiltAt;
+    private int stuckPosts, softResets, strikesAfterSoft, chipShown, rebuilds, strikesAfterRebuild, manualFix;
+    private final JSONObject stuckIgnored = new JSONObject();
+    private boolean rebuilding;
+    private Runnable pendingRebuild;     // the rebuild's delayed swap, dropped in onDestroy
+    // The page's search screen, read before a rebuild and handed to the new page once.
+    private JSONObject searchHandBack;
+
     /** A WebView's injected page script, re-registered when the signed-in account changes. */
     private static final class Script {
         final WebView view;
@@ -181,6 +217,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         skipLp.bottomMargin = dp(72);
         root.addView(skipChip, skipLp);
+
+        stuckChip = makeStuckChip();
+        FrameLayout.LayoutParams stuckLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        stuckLp.topMargin = dp(56);
+        root.addView(stuckChip, stuckLp);
 
         menuButton = makeMenuButton();
         root.addView(menuButton, new FrameLayout.LayoutParams(dp(TAB_W), dp(TAB_H)));
@@ -271,6 +313,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
             WebViewCompat.addWebMessageListener(w, "SGNative", ORIGINS,
                     (view, message, origin, isMainFrame, reply) -> {
+                        // A message still on its way from a main WebView that was rebuilt (B25) is dropped.
+                        if ("main".equals(role) && view != web) return;
                         if (isMainFrame && message.getData() != null) onMessage(role, message.getData());
                     });
         }
@@ -485,10 +529,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 fullScreenNested++;
                 customViewCallback = callback;
                 if (view == customView) return;
+                View oldInput = liveInput(customView);
                 root.removeView(customView);
                 customView = view;
                 view.setBackgroundColor(Color.BLACK);
                 root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                logFullScreen("nested", "page");
+                splitTouch(true, oldInput, liveInput(view));
                 return;
             }
             customView = view;
@@ -497,6 +544,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             fullScreenLast = route + " at " + clock();
             view.setBackgroundColor(Color.BLACK);
             root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            // B25: Chromium has already moved the page's input to this view. A
+            // finger down on the page now is cancelled here, where the input lives.
+            logFullScreen("show", "page");
+            splitTouch(true, liveInput(view));
             // R8: a post's video takes the whole screen. The tab's elevation would
             // draw it (and give it taps) over the video, so it goes. Not in a Story,
             // where the tab is how Stories are saved (R9's layer hides it itself).
@@ -509,14 +560,40 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             updateFeedBar();     // the skip note and the end card stay off a full screen
         }
 
+        /**
+         * Ends full screen. From Chromium (the page left full screen) the input
+         * has already moved back to the WebView; from Back or the page's own
+         * request (fullVideoExitRequest) the view goes first and Chromium is told
+         * after, so the input is still live in the view while it goes. Either way
+         * a finger that is down gets its cancel wherever the input is (B25).
+         */
         @Override
         public void onHideCustomView() {
             if (customView == null) return;
+            String initiator = hideInitiator;
+            hideInitiator = "page";
+            logFullScreen("hide", initiator);
+            View input = liveInput(customView);
+            boolean split = touchOpen && !touchSwallow;
+            if (split) cancelTo(input);                  // still live on the Back way
+            if (zoom.isHolding()) cancelHoldTo(input);
             root.removeView(customView);
             customView = null;
+            if (split) cancelTo(web);                    // live again if Chromium switched first
             if (!screenshotMode) setSystemBarsHidden(false);
             if (customViewCallback != null) customViewCallback.onCustomViewHidden();
             customViewCallback = null;
+            if (zoom.isHolding()) cancelHoldTo(web);
+            if (split) {
+                cancelTo(web);                           // and after Chromium was told
+                startSwallow(false);
+                final int seq = touchSeq;
+                // Chromium may switch back a moment later: once more if that same
+                // touch is still being swallowed (never into a new touch).
+                ui.post(() -> {
+                    if (touchOpen && touchSwallow && touchSeq == seq) cancelTo(web);
+                });
+            }
             if (fullHidTab) {
                 fullHidTab = false;
                 if (!screenshotMode && !pageVideo) menuButton.setVisibility(View.VISIBLE);
@@ -579,6 +656,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         setPageVideo(false);
                         setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
+                        handBackSearch();
+                        // The chip is still up: the new page says scrollOk on its first drag that scrolls.
+                        if (stuckChipWanted) js("stuckChipUp");
                         if (!prefs.getBoolean("tabTip", false)) {
                             prefs.edit().putBoolean("tabTip", true).apply();
                             toast("Tip: drag the ⋮ tab up, down or to the other side");
@@ -634,6 +714,21 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "fullVideo":
                 if (main) setPageVideo(m.optBoolean("on"));
+                break;
+            case "fullVideoExitRequest":
+                // R8's swipe (and R10's later): leave full screen the Back way, view
+                // first. Never a Story's own full screen: that would close the Story.
+                if (main && !"story".equals(route)) hideCustomView("r8bridge");
+                break;
+            case "scrollStuck":
+                if (main) onScrollStuck(m);
+                break;
+            case "scrollOk":
+                // Drags scroll again (the page saw one): the chip has nothing to fix.
+                if (main && stuckChipWanted) {
+                    stuckChipWanted = false;
+                    updateStuckChip();
+                }
                 break;
             case "comments":
                 if (main) openComments(m);
@@ -707,6 +802,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (on) {
             menuButton.setVisibility(View.GONE);
             zoomChip.setVisibility(View.GONE);
+            updateStuckChip();       // the stuck chip stays off the Reel layer too
             setSystemBarsHidden(true);
         } else {
             if (!screenshotMode && !fullHidTab) menuButton.setVisibility(View.VISIBLE);
@@ -885,6 +981,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     /** The card shows when the page asks for it and nothing else is in the way. */
     private void updateFeedBar() {
         updateSkipChip();
+        updateStuckChip();
         boolean show = feedWanted && "home".equals(route) && !onOtherFeed() && !screenshotMode && !comments.isOpen()
                 && !zoom.isZoomed() && !searchOpen && customView == null;
         boolean visible = feedBar.getVisibility() == View.VISIBLE;
@@ -1178,6 +1275,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 "Continue Home into Following: " + (continueHome() ? "On" : "Off"),
                 "Open Instagram links with SimpleGram…",
                 "Open copied Instagram link",
+                "Fix scrolling",
                 "About SimpleGram",
         };
         dialog().setItems(items, (x, which) -> {
@@ -1193,6 +1291,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     break;
                 case 3:
                     openCopiedLink();
+                    break;
+                case 4:
+                    // B25's escape hatch: a new page view, at any time.
+                    fixScrolling();
                     break;
                 default:
                     dialog().setTitle("SimpleGram " + BuildConfig.VERSION_NAME)
@@ -1437,6 +1539,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 .append(" (app: open ").append(startsLoadUrl).append(", back ").append(startsGoBack)
                 .append(", refresh ").append(startsReload).append(")\n")
                 .append("  Back presses in the page: ").append(backPresses).append('\n');
+        appendTouchStatus(b, stats.optJSONObject("b25"));
         b.append("\nCounts since the page last loaded. No account names or post details are kept.");
         dialog().setTitle("Filter status").setMessage(b.toString())
                 .setNeutralButton("Copy details", (d, w) -> copyDetails(stats, device))
@@ -1473,6 +1576,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
             n.put("pageStarts", new JSONObject().put("all", startsAll).put("loadUrl", startsLoadUrl)
                     .put("goBack", startsGoBack).put("reload", startsReload).put("backPresses", backPresses));
+            n.put("b25", touchDiagnostics());
         } catch (JSONException e) {
             // Partial details are still useful.
         }
@@ -1679,7 +1783,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             setPageVideo(false);
             js("fullVideoExit");
         } else if (customView != null) {
-            new Chrome().onHideCustomView();
+            hideCustomView("back");
         } else if (zoom.isZoomed()) {
             zoom.reset(true);
         } else if (comments.isOpen()) {
@@ -1722,6 +1826,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     @Override
     protected void onPause() {
         super.onPause();
+        resumed = false;
         setAwake(false);
         web.onPause();
         comments.web().onPause();
@@ -1731,6 +1836,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
         web.onResume();
         comments.web().onResume();
     }
@@ -1779,7 +1885,16 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     @Override
     protected void onDestroy() {
+        if (pendingRebuild != null) {
+            ui.removeCallbacks(pendingRebuild);
+            pendingRebuild = null;
+        }
+        rebuilding = false;
         downloads.release();
+        if (touchLast != null) {
+            touchLast.recycle();
+            touchLast = null;
+        }
         for (Script s : scripts) {
             ViewGroup parent = (ViewGroup) s.view.getParent();
             if (parent != null) parent.removeView(s.view);
@@ -1787,6 +1902,428 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
         scripts.clear();
         super.onDestroy();
+    }
+
+    /* ------------------------------------------------------------------ *
+     * B25: touches across full-screen switches, and the scrolling repair
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Every touch passes here first. The open sequence is tracked so that a
+     * full-screen switch in the middle of it can cancel it where the page's
+     * input lives (see splitTouch) and swallow the rest of it: the moves and
+     * the lift of a split touch must reach no view at all.
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        int a = ev.getActionMasked();
+        if (a == MotionEvent.ACTION_DOWN) {
+            touchOpen = true;
+            touchSwallow = false;
+            touchAccepted = false;
+            touchDownOn = customView != null ? RX_CUSTOM : RX_WEB;
+            touchDownAt = ev.getEventTime();
+            touchSeq++;
+            touchStarted[touchDownOn]++;
+        }
+        if (!touchOpen) return super.dispatchTouchEvent(ev);   // the rest of a touch that began before this window had it
+        if (touchLast != null) touchLast.recycle();
+        touchLast = MotionEvent.obtain(ev);
+        boolean end = a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL;
+        if (touchSwallow) {
+            if (end) closeTouch();
+            return true;
+        }
+        boolean handled;
+        inTouchDispatch = true;
+        try {
+            handled = super.dispatchTouchEvent(ev);
+        } finally {
+            inTouchDispatch = false;
+        }
+        if (a == MotionEvent.ACTION_DOWN) {
+            touchAccepted = handled;
+        } else if (touchAccepted && !handled && a != MotionEvent.ACTION_CANCEL) {
+            // The view that took the DOWN turned the rest down: what an input
+            // that went inert under the finger does (counted once per touch).
+            touchRefused[touchDownOn]++;
+            touchAccepted = false;
+        }
+        if (end) closeTouch();
+        return handled;
+    }
+
+    private void closeTouch() {
+        touchOpen = false;
+        touchSwallow = false;
+        touchEnded[touchDownOn]++;
+    }
+
+    /** The view that takes the page's input inside a full-screen view (WebView's own is its first child). */
+    private static View liveInput(View custom) {
+        if (custom instanceof ViewGroup && ((ViewGroup) custom).getChildCount() > 0) return ((ViewGroup) custom).getChildAt(0);
+        return custom;
+    }
+
+    /** A cancel built from the open touch's latest event (all its pointers), sent straight to a view. */
+    private void cancelTo(View v) {
+        if (v == null || touchLast == null) return;
+        MotionEvent c = MotionEvent.obtain(touchLast);
+        c.setAction(MotionEvent.ACTION_CANCEL);
+        v.dispatchTouchEvent(c);
+        c.recycle();
+    }
+
+    /** The app's held finger (ZoomFrame.hold) gets its cancel where the input is too. */
+    private void cancelHoldTo(View v) {
+        if (v == null) return;
+        MotionEvent c = zoom.holdCancel();
+        v.dispatchTouchEvent(c);
+        c.recycle();
+        cancelsHold++;
+    }
+
+    /**
+     * Full screen just started: the touch that is down (if any) and the app's
+     * held finger are cancelled for the views that now hold the input. Extra
+     * cancels are harmless; a missing one is what B25 was.
+     */
+    private void splitTouch(boolean show, View... inputs) {
+        if (zoom.isHolding()) for (View v : inputs) cancelHoldTo(v);
+        if (!touchOpen || touchSwallow) return;
+        for (View v : inputs) cancelTo(v);
+        cancelTo(web);
+        startSwallow(show);
+    }
+
+    private void startSwallow(boolean show) {
+        if (show) cancelsShow++;
+        else cancelsHide++;
+        swallowedTouches++;
+        touchSwallow = true;
+        // The view tree lets go of the touch too (the menu tab, the zoom frame),
+        // unless this runs inside a touch's own dispatch.
+        if (!inTouchDispatch && touchLast != null) {
+            MotionEvent c = MotionEvent.obtain(touchLast);
+            c.setAction(MotionEvent.ACTION_CANCEL);
+            getWindow().superDispatchTouchEvent(c);
+            c.recycle();
+        }
+    }
+
+    /** Leaves full screen the Back way: the view goes first, then Chromium is told. */
+    private void hideCustomView(String initiator) {
+        if (customView == null) return;
+        hideInitiator = initiator;
+        new Chrome().onHideCustomView();
+    }
+
+    /** One line of the full-screen log (shapes only). */
+    private void logFullScreen(String kind, String initiator) {
+        if (touchOpen) {
+            if ("hide".equals(kind)) hideDuringTouch++;
+            else showDuringTouch++;
+        }
+        try {
+            JSONObject e = new JSONObject()
+                    .put("kind", kind)
+                    .put("route", route)
+                    .put("initiator", initiator)
+                    .put("touchOpen", touchOpen)
+                    .put("pointers", touchOpen && touchLast != null ? touchLast.getPointerCount() : 0)
+                    .put("downOn", touchOpen ? (touchDownOn == RX_CUSTOM ? "custom" : "web") : "")
+                    .put("msSinceDown", touchOpen ? SystemClock.uptimeMillis() - touchDownAt : -1)
+                    .put("holding", zoom.isHolding())
+                    .put("orientation", getResources().getConfiguration().orientation);
+            fsLog.add(e);
+            while (fsLog.size() > 8) fsLog.remove(0);
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    private TextView makeStuckChip() {
+        TextView chip = new TextView(this);
+        chip.setText("Scrolling stopped. Tap to fix");
+        chip.setTextColor(Color.WHITE);
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        chip.setTypeface(Typeface.DEFAULT_BOLD);
+        chip.setGravity(Gravity.CENTER);
+        chip.setPadding(dp(18), dp(10), dp(18), dp(10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xF20095F6);
+        bg.setCornerRadius(dp(20));
+        chip.setBackground(bg);
+        chip.setElevation(dp(8));
+        chip.setContentDescription("Scrolling stopped. Tap to fix");
+        chip.setVisibility(View.GONE);
+        // Only ever on a tap: the rebuild reloads the page.
+        chip.setOnClickListener(v -> {
+            stuckChipWanted = false;
+            updateStuckChip();
+            rebuildWebView();
+        });
+        return chip;
+    }
+
+    private void updateStuckChip() {
+        if (stuckChip == null) return;
+        boolean show = stuckChipWanted && customView == null && !pageVideo && !screenshotMode && !zoom.isZoomed();
+        stuckChip.setVisibility(show ? View.VISIBLE : View.GONE);
+    }
+
+    /**
+     * The page saw drags that should have scrolled and didn't. The first time,
+     * a reset that changes nothing you can see; if it goes on, the chip. Never
+     * while anything of the app's own could explain it (the gate).
+     */
+    private void onScrollStuck(JSONObject m) {
+        stuckPosts++;
+        String why = stuckGate(m.optInt("moves", 1));
+        if (why != null) {
+            try {
+                stuckIgnored.put(why, stuckIgnored.optInt(why) + 1);
+            } catch (JSONException ignored) {
+                // Not reachable with constant keys.
+            }
+            stuckAck(false, "");
+            return;
+        }
+        if (rebuiltAt > 0) strikesAfterRebuild++;
+        long now = SystemClock.uptimeMillis();
+        if (!softResetDone || now - softResetAt > 10 * 60_000L) {
+            softReset();
+            stuckAck(true, "soft");
+        } else {
+            strikesAfterSoft++;
+            if (!stuckChipWanted) chipShown++;
+            stuckChipWanted = true;
+            updateStuckChip();
+            stuckAck(true, "chip");
+        }
+    }
+
+    /** Why a report can't be trusted right now, or null. */
+    private String stuckGate(int pageMoves) {
+        if (zoom.scale() != 1f) return "zoom";
+        if (zoom.isOwned() || zoom.isPinching() || zoom.isAnimating()) return "zoomGesture";
+        if (zoom.isHolding()) return "holding";
+        if (zoom.isSplit() || comments.isOpen()) return "comments";
+        if (customView != null) return "fullScreen";
+        if (pageVideo) return "pageVideo";
+        if (screenshotMode) return "screenshot";
+        if (menuOpen || !hasWindowFocus()) return "dialog";
+        if (!resumed) return "paused";
+        if (touchOpen) return "fingerDown";
+        // The drags' moves reached the page (this app didn't keep them).
+        if (zoom.recentPageMoves() < Math.max(1, Math.min(pageMoves, 3))) return "movesKept";
+        return null;
+    }
+
+    private void stuckAck(boolean accepted, String stage) {
+        try {
+            js(new JSONObject().put("type", "scrollStuckAck").put("accepted", accepted).put("stage", stage));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /** Clears everything the app and the page hold about touches; harmless at any time. */
+    private void softReset() {
+        softResets++;
+        softResetDone = true;
+        softResetAt = SystemClock.uptimeMillis();
+        zoom.forceIdle(comments.isOpen());
+        js("gestureReset");
+    }
+
+    /** ⋮ → More… → Fix scrolling. */
+    private void fixScrolling() {
+        manualFix++;
+        stuckChipWanted = false;
+        updateStuckChip();
+        rebuildWebView();
+    }
+
+    /**
+     * A new main WebView in the old one's place: the only thing that clears
+     * the web engine's stuck touch state. The page's search screen is read
+     * first and handed to the new page; the rest comes back from the saved
+     * history (or the address).
+     */
+    private void rebuildWebView() {
+        if (rebuilding || isFinishing()) return;
+        rebuilding = true;
+        final boolean[] done = {false};
+        Runnable go = () -> {
+            if (done[0]) return;
+            done[0] = true;
+            pendingRebuild = null;
+            swapWebView();
+        };
+        web.evaluateJavascript("(function(){try{return window.__sg&&window.__sg.searchState?window.__sg.searchState():null}catch(e){return null}})()",
+                v -> {
+                    if (done[0] || isDestroyed()) return;
+                    searchHandBack = parseSearchState(v);
+                    searchHandBackUntil = SystemClock.uptimeMillis() + 30_000L;
+                    ui.post(go);         // not from inside the old WebView's own callback
+                });
+        // A page too busy to answer is rebuilt without its search screen.
+        pendingRebuild = go;
+        ui.postDelayed(go, 700);
+    }
+
+    private long searchHandBackUntil;
+
+    private static JSONObject parseSearchState(String v) {
+        if (v == null || "null".equals(v)) return null;
+        try {
+            Object o = new JSONTokener(v).nextValue();
+            if (!(o instanceof String)) return null;
+            JSONObject st = new JSONObject((String) o);
+            return st.optBoolean("open") || st.optBoolean("suspended") ? st : null;
+        } catch (JSONException e) {
+            return null;
+        }
+    }
+
+    /** The new page's 'ready': its search screen as it was before the rebuild. */
+    private void handBackSearch() {
+        JSONObject st = searchHandBack;
+        searchHandBack = null;
+        if (st == null || SystemClock.uptimeMillis() > searchHandBackUntil) return;
+        try {
+            js(new JSONObject().put("type", "searchRestore").put("state", st));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    private void swapWebView() {
+        // A swap queued before the Activity went away would leave a WebView nobody destroys.
+        if (isFinishing() || isDestroyed()) {
+            rebuilding = false;
+            return;
+        }
+        // Nothing that belongs to the old page view stays up.
+        if (screenshotMode) exitScreenshot();
+        if (customView != null) hideCustomView("rebuild");
+        setPageVideo(false);
+        closeComments();
+        zoom.forceIdle(false);
+        if (fileCallback != null) {
+            fileCallback.onReceiveValue(null);
+            fileCallback = null;
+        }
+        setAwake(false);
+
+        WebView old = web;
+        Bundle state = new Bundle();
+        String url = old.getUrl();
+        boolean saved = old.saveState(state) != null;
+        int index = Math.max(0, zoom.indexOfChild(old));
+        ViewGroup.LayoutParams lp = old.getLayoutParams();
+        for (java.util.Iterator<Script> it = scripts.iterator(); it.hasNext(); ) {
+            Script s = it.next();
+            if (s.view != old) continue;
+            if (s.handler != null) s.handler.remove();
+            it.remove();
+        }
+        zoom.removeView(old);
+        old.stopLoading();
+        old.destroy();
+
+        WebView fresh = newWebView("main");
+        web = fresh;
+        zoom.addView(fresh, index, lp != null ? lp
+                : new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        if (!resumed) fresh.onPause();
+        fresh.requestFocus();
+
+        // A new page: what the old one asked for goes with it ('ready' brings the new state).
+        route = "other";
+        pageUrl = "";
+        searchOpen = false;
+        feedWanted = false;
+        skipKind = "";
+        skipCount = 0;
+        menuLink = null;
+        rebuilds++;
+        rebuiltAt = SystemClock.uptimeMillis();
+        softResetDone = false;
+        stuckChipWanted = false;
+        updateFeedBar();
+        onZoomChanged(zoom.scale());
+
+        boolean restored = saved && fresh.restoreState(state) != null;
+        if (restored) {
+            // The restore's own onPageStarted adds it to startsAll: credit it to the app.
+            startsLoadUrl++;
+            goBackAt = 0;
+        } else {
+            load(fresh, url != null && Links.isInstagram(Uri.parse(url)) ? url : Links.HOME);
+        }
+        rebuilding = false;
+    }
+
+    /** The b25 block of Copy details: counts and shapes only. */
+    private JSONObject touchDiagnostics() throws JSONException {
+        JSONObject touch = new JSONObject()
+                .put("web", new JSONObject().put("started", touchStarted[RX_WEB]).put("ended", touchEnded[RX_WEB]).put("refused", touchRefused[RX_WEB]))
+                .put("custom", new JSONObject().put("started", touchStarted[RX_CUSTOM]).put("ended", touchEnded[RX_CUSTOM]).put("refused", touchRefused[RX_CUSTOM]))
+                .put("cancelsSent", new JSONObject().put("show", cancelsShow).put("hide", cancelsHide).put("hold", cancelsHold))
+                .put("swallowed", swallowedTouches)
+                .put("open", touchOpen);
+        JSONObject fs = new JSONObject()
+                .put("last", new JSONArray(fsLog))
+                .put("showDuringTouch", showDuringTouch)
+                .put("hideDuringTouch", hideDuringTouch);
+        JSONObject z = new JSONObject()
+                .put("scale", Math.round(zoom.scale() * 100) / 100.0)
+                .put("owned", zoom.isOwned())
+                .put("pinching", zoom.isPinching())
+                .put("holding", zoom.isHolding())
+                .put("split", zoom.isSplit())
+                .put("animating", zoom.isAnimating())
+                .put("chipVisible", zoomChip.getVisibility() == View.VISIBLE)
+                .put("fullHidTab", fullHidTab)
+                .put("pageVideo", pageVideo)
+                .put("screenshotMode", screenshotMode);
+        JSONObject repair = new JSONObject()
+                .put("stuckPosts", stuckPosts)
+                .put("stuckIgnored", new JSONObject(stuckIgnored.toString()))
+                .put("softResets", softResets)
+                .put("strikesAfterSoft", strikesAfterSoft)
+                .put("chipShown", chipShown)
+                .put("chipNow", stuckChipWanted)
+                .put("rebuilds", rebuilds)
+                .put("strikesAfterRebuild", strikesAfterRebuild)
+                .put("manualFix", manualFix);
+        return new JSONObject().put("touch", touch).put("fsLog", fs).put("zoom", z).put("repair", repair);
+    }
+
+    private int ignoredReports() {
+        int n = 0;
+        for (java.util.Iterator<String> k = stuckIgnored.keys(); k.hasNext(); ) n += stuckIgnored.optInt(k.next());
+        return n;
+    }
+
+    /** Filter status: a short "Touch and scrolling" section. */
+    private void appendTouchStatus(StringBuilder b, JSONObject page) {
+        JSONObject seq = page == null ? null : page.optJSONObject("touchSeq");
+        JSONObject drag = page == null ? null : page.optJSONObject("drag");
+        b.append("\nTouch and scrolling\n")
+                .append("  Full screen during a touch: ").append(showDuringTouch + hideDuringTouch)
+                .append(" (touches cancelled ").append(cancelsShow + cancelsHide)
+                .append(", held finger ").append(cancelsHold).append(")\n")
+                .append("  Touch ends turned down: ").append(touchRefused[RX_WEB] + touchRefused[RX_CUSTOM])
+                .append(" · lost touch ends seen by the page: ").append(seq == null ? 0 : seq.optInt("orphans")).append('\n')
+                .append("  Drags that didn't scroll: ").append(drag == null ? 0 : drag.optInt("dead"))
+                .append(" · reported ").append(stuckPosts)
+                .append(" (not trusted ").append(ignoredReports()).append(")\n")
+                .append("  Quiet resets: ").append(softResets)
+                .append(" · page view rebuilt: ").append(rebuilds)
+                .append(" (by hand ").append(manualFix).append(")\n");
     }
 
     /* ------------------------------------------------------------------ *
