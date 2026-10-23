@@ -40,6 +40,12 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 
 Plan conflicts between the batch-4 notes are settled in [`notes/batch-4/plan-decisions.md`](notes/batch-4/plan-decisions.md).
 
+## Batch 5 — open (reported against 1.3)
+
+| # | Report | Likely cause (tentative, not yet diagnosed) | Planned fix |
+| --- | --- | --- | --- |
+| B20 | Comments panel: only two comments fit at a time. Nearly half the panel is the empty "Add a comment…" area: a one-line box with a big blank band under it. The box should be one line high while reading, and grow only once you tap it and start typing. | SimpleGram hides Instagram's own bottom bar inside the comments panel, but Instagram's page still keeps that bar's room under the comment box, so the box floats above an empty band. The space Android keeps for the system navigation bar may add to it. | Comment box one line high, with nothing under it, so the comments get the space. Tapping it opens the keyboard and lets it grow as you type, as Instagram does; it shrinks back when you leave it. |
+
 ## Batch 4 — fixed (unconfirmed) in 1.3 (reported against 1.2)
 
 Diagnoses: [B16/B17](notes/batch-4/b16-b17-diagnosis.md), [B18](notes/batch-4/b18-diagnosis.md), [R5–R7](notes/batch-4/r5-r7-feasibility.md); conflicts between them settled in [plan-decisions](notes/batch-4/plan-decisions.md).
