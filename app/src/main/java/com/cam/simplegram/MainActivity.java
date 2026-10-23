@@ -107,6 +107,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private String fullScreenLast = "";
     // A Reel the page plays over a Story (R9): Back closes it, not the Story.
     private boolean pageVideo;
+    // A post's video in full screen (R8) hid the menu tab: the whole screen, no icons over it.
+    private boolean fullHidTab;
     private Downloads downloads;
 
     private String route = "other";
@@ -350,12 +352,18 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             // A page outside Instagram (Meta login, Accounts Center) sends no
             // 'ready': forget the last Instagram page's state so Back goes back.
             if ("main".equals(role)) setPageVideo(false);   // the old page's Reel layer is gone
+            if ("main".equals(role)) {
+                // The old page's skip note is gone with it; the new page sends its
+                // own once its script runs (an error page never does).
+                skipKind = "";
+                skipCount = 0;
+            }
             if ("main".equals(role) && url != null && !Links.isInstagram(Uri.parse(url))) {
                 route = "other";
                 searchOpen = false;
                 feedWanted = false;
-                updateFeedBar();
             }
+            if ("main".equals(role)) updateFeedBar();
         }
 
         @Override
@@ -489,7 +497,16 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             fullScreenLast = route + " at " + clock();
             view.setBackgroundColor(Color.BLACK);
             root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            // R8: a post's video takes the whole screen. The tab's elevation would
+            // draw it (and give it taps) over the video, so it goes. Not in a Story,
+            // where the tab is how Stories are saved (R9's layer hides it itself).
+            if ("post".equals(route) || "reel".equals(route)) {
+                fullHidTab = true;
+                menuButton.setVisibility(View.GONE);
+                zoomChip.setVisibility(View.GONE);
+            }
             setSystemBarsHidden(true);
+            updateFeedBar();     // the skip note and the end card stay off a full screen
         }
 
         @Override
@@ -500,6 +517,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (!screenshotMode) setSystemBarsHidden(false);
             if (customViewCallback != null) customViewCallback.onCustomViewHidden();
             customViewCallback = null;
+            if (fullHidTab) {
+                fullHidTab = false;
+                if (!screenshotMode && !pageVideo) menuButton.setVisibility(View.VISIBLE);
+                onZoomChanged(zoom.scale());     // also re-reads the skip note and the end card
+            } else {
+                // A Story's route message can come while its full screen is still up:
+                // what it hid (the skip note, the end card) comes back now.
+                updateFeedBar();
+            }
         }
     }
 
@@ -649,7 +675,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     @Override
     public void onZoomChanged(float scale) {
         boolean zoomed = scale > 1.01f;
-        if (zoomed && !screenshotMode) {
+        if (zoomed && !screenshotMode && !fullHidTab) {
             zoomChip.setText(String.format(Locale.US, "%.1f×  ·  Reset", scale));
             zoomChip.setVisibility(View.VISIBLE);
         } else {
@@ -683,7 +709,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             zoomChip.setVisibility(View.GONE);
             setSystemBarsHidden(true);
         } else {
-            if (!screenshotMode) menuButton.setVisibility(View.VISIBLE);
+            if (!screenshotMode && !fullHidTab) menuButton.setVisibility(View.VISIBLE);
             if (customView == null && !screenshotMode) setSystemBarsHidden(false);
             onZoomChanged(zoom.scale());
         }
@@ -1124,6 +1150,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     break;
                 case 5:
                     feedWanted = false;
+                    skipKind = "";
                     updateFeedBar();
                     startsReload++;
                     goBackAt = 0;
@@ -1181,6 +1208,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     private void loadMain(String url) {
         feedWanted = false;
+        skipKind = "";       // the note belongs to the page being left
         updateFeedBar();
         closeComments();
         if (zoom.isZoomed()) zoom.reset(false);
@@ -1573,7 +1601,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         screenshotMode = false;
         if (screenshotShield != null) root.removeView(screenshotShield);
         screenshotShield = null;
-        menuButton.setVisibility(View.VISIBLE);
+        if (!fullHidTab) menuButton.setVisibility(View.VISIBLE);
         if (customView == null) setSystemBarsHidden(false);
         onZoomChanged(zoom.scale());
         zoom.releaseHold();
