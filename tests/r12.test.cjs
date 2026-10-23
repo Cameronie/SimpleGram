@@ -673,6 +673,8 @@ test('R12: an action on its way belongs to the Reel: closed and opened again, a 
   assert.equal((await ui(p3)).follow, 'Following', 'on its way: shown as Following');
   await tapOn(p3, '.follow');
   await p3.waitForFunction(() => window.__sent.some(m => m.action === 'toast'), null, { timeout: 4000 });
+  // The refusal's toast can trail another note on a busy machine: wait for the button itself.
+  for (let i = 0; i < 40 && (await ui(p3)).follow !== 'Follow'; i++) await p3.waitForTimeout(100);
   assert.equal((await ui(p3)).follow, 'Follow');
   assert.equal(p3.hits['/api/v1/friendships/*'], 1);
 });
