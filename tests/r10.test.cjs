@@ -361,6 +361,16 @@ test('R10: an engine without popovers falls back to the video\'s own full screen
   assert.equal(await page.evaluate(() => document.getElementById('v').muted), true);
 });
 
+test('R10: if Instagram takes the video out of the page while it is full screen, full screen ends (the app\'s way)', async () => {
+  const page = await openFeed();
+  await tapAt(page, 200, 300, 600);
+  assert.equal(await lifted(page), 'v');
+  await page.evaluate(() => document.getElementById('a-v').remove());
+  await page.waitForFunction(() => !window.__fsEl, null, { timeout: 3000 });
+  assert.deepEqual((await sent(page, 'fullVideoExitRequest')).map(m => m.why), ['gone']);
+  assert.equal(await page.evaluate(() => document.querySelectorAll('#sg-fullbar,[data-sg-bar]').length), 0);
+});
+
 /* ---------------- R10: the ⋮ menu ---------------- */
 
 test('R10: ⋮ → Full-screen video: the page names a spot on the video; the app\'s tap there opens it at once, kept from Instagram', async () => {
@@ -445,6 +455,9 @@ test('R11: the post view\'s bar: a thin white-on-dark line on the video\'s botto
   assert.equal(b.fill.bg, 'rgb(255, 255, 255)', 'white for the part played');
   assert.equal(b.active, false);
   assert.ok(b.touchAction.every(x => x === 'auto'), 'never touch-action (B25)');
+  assert.deepEqual(await page.evaluate(() => [document.getElementById('sg-style').textContent,
+    document.querySelector('[data-sg-bar]').shadowRoot.querySelector('style').textContent,
+    document.querySelector('[data-sg-bar]').getAttribute('style')].filter(t => /touch-action/.test(t))), [], 'no touch-action anywhere of ours');
   // Touch: thicker, the round white handle, the time.
   await page.evaluate(() => { document.getElementById('v').currentTime = 12; window.__seeks = []; });
   await touch(page, 'touchStart', [[100, vb - 3]]);

@@ -4264,12 +4264,16 @@
     return v;
   }
   function stillOf(v) { return v ? { v: v, muted: v.muted, paused: v.paused } : null; }
+  // The video under a finger as it goes down (only where a tap can open one).
+  function stillAt(x, y) {
+    return CFG.role === 'main' && r10Route(route()) && !document.fullscreenElement ? stillOf(videoAt(x, y)) : null;
+  }
   // Before Instagram's own handlers run (pointerdown comes before touchstart):
   // the video as it was, for afterwards.
   window.addEventListener('pointerdown', safe(e => {
     if (!e.isTrusted || e.pointerType === 'mouse' || !e.isPrimary) return;
     tapSeq = { fresh: true, x: e.clientX, y: e.clientY, at: performance.now(), moved: false, multi: false, second: false,
-      snap: stillOf(videoAt(e.clientX, e.clientY)) };
+      snap: stillAt(e.clientX, e.clientY) };
   }), { capture: true, passive: true });
   window.addEventListener('touchstart', safe(e => {
     if (!e.isTrusted) return;
@@ -4285,7 +4289,7 @@
     }
     if (e.touches.length !== 1) { if (tapSeq) tapSeq.multi = true; return; }
     const t = e.touches[0];
-    const s = tapSeq && tapSeq.fresh ? tapSeq : { snap: stillOf(videoAt(t.clientX, t.clientY)) };
+    const s = tapSeq && tapSeq.fresh ? tapSeq : { snap: stillAt(t.clientX, t.clientY) };
     tapSeq = { fresh: false, x: t.clientX, y: t.clientY, at: performance.now(), moved: false, multi: false,
       second: second, snap: s.snap };
   }), { capture: true, passive: true });
@@ -4624,7 +4628,8 @@
       frame = 0;
       if (gone) return;
       paint();
-      if (!video.paused && !document.hidden) frame = requestAnimationFrame(loop);
+      // (Out of sight it waits for the video's own time updates.)
+      if (!video.paused && !document.hidden && el.style.visibility !== 'hidden') frame = requestAnimationFrame(loop);
     });
     const kick = safe(() => { if (!frame && !gone) frame = requestAnimationFrame(loop); });
     const MEDIA = ['play', 'playing', 'pause', 'seeked', 'timeupdate', 'durationchange', 'loadedmetadata', 'emptied', 'ended'];
@@ -4765,6 +4770,9 @@
     return best;
   }
   function syncPageBar() {
+    // The full-screen video was taken out of the page under it (Instagram drew
+    // the feed again): there is nothing left to show, so full screen ends.
+    if (fullLayer && fullVideoOn() && !fullLayer.video.isConnected && !fullScreenSettling()) leaveFullScreen('gone');
     const v = pageBarVideo();
     if (pageBar && (pageBar.video !== v || !pageBar.el.isConnected)) { pageBar.detach(); pageBar = null; }
     if (!v) return;
@@ -4788,7 +4796,7 @@
     document.addEventListener('scroll', () => { if (pageBar) queuePageBar(); }, { capture: true, passive: true });
     window.addEventListener('resize', () => queuePageBar(), { passive: true });
     // Layout moves that fire no event (a caption opening, Instagram's own transitions).
-    setInterval(() => { if (pageBar || /^(post|reel|direct)$/.test(route())) queuePageBar(); }, 1000);
+    setInterval(() => { if (pageBar || fullLayer || /^(post|reel|direct)$/.test(route())) queuePageBar(); }, 1000);
   }
 
   /* ------------------------------------------------------------------ *
