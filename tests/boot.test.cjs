@@ -50,8 +50,9 @@ ${cutOff ? sjs(config(3), true) : sjs(config(3)) + '\n' + END + '</body></html>'
 
 // Opens Instagram's Home with the page script, on Playwright's clock (paused
 // once the page is in). abort: start-up files that fail; stall: files that
-// never answer; init: a script run before SimpleGram's.
-async function openBoot(html, { abort = [], stall = [], cfg = {}, init = null } = {}) {
+// never answer; hang: paths on Instagram's host never answered (a request of
+// the page's that stays on its way); init: a script run before SimpleGram's.
+async function openBoot(html, { abort = [], stall = [], hang = [], cfg = {}, init = null } = {}) {
   const context = await getBrowser().newContext({ viewport: { width: 412, height: 915 }, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true });
   const page = await context.newPage();
   const served = [];
@@ -65,6 +66,7 @@ async function openBoot(html, { abort = [], stall = [], cfg = {}, init = null } 
       return route.fulfill({ status: 200, contentType: 'application/javascript', body: '/* start-up file ' + i + ' */' });
     }
     if (u.hostname === 'www.instagram.com' && u.pathname === '/') return route.fulfill({ status: 200, contentType: 'text/html', body: html });
+    if (u.hostname === 'www.instagram.com' && hang.includes(u.pathname)) return undefined;
     return route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><body></body>' });
   });
   await page.clock.install();
@@ -78,6 +80,16 @@ async function openBoot(html, { abort = [], stall = [], cfg = {}, init = null } 
 }
 const record = page => page.evaluate(() => window.__sg.bootRecord());
 const token = page => page.evaluate(() => window.__sg.stats.boot.token);
+// A page whose visibility the test switches (hidden from the start, or not).
+function visibilityInit(hidden) {
+  return `(function () {
+    let hidden = ${hidden};
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (hidden ? 'hidden' : 'visible') });
+    window.__hide = () => { hidden = true; document.dispatchEvent(new Event('visibilitychange')); };
+    window.__show = () => { hidden = false; document.dispatchEvent(new Event('visibilitychange')); };
+  })();`;
+}
 // Nothing in a boot message may name a file, a host or a module.
 function shapesOnly(o) {
   const json = JSON.stringify(o);
@@ -101,6 +113,7 @@ test('boot (a): one start-up file fails and the logo stays: bootStuck with rule 
   assert.deepEqual(r.scripts, { n: 6, loaded: 5, errored: 1, pending: 0, retries: 0 });
   assert.equal(r.logo.present, true);
   assert.equal(r.logo.up, true);
+  assert.equal(r.logo.display, '', 'no inline display on the logo');
   assert.equal(r.dcl, true);
   assert.equal(r.endMarker, true);
   assert.equal(r.ready, 'complete');
@@ -209,18 +222,68 @@ test('boot: the logo hidden rather than removed (PolarisSplashScreenController) 
   assert.ok(m, 'boot posted');
   assert.equal(m.how, 'hidden');
   assert.ok(m.ms >= 1200 && m.ms < 2000, String(m.ms));
-  assert.equal((await record(page)).logo.up, false);
+  assert.deepEqual([(await record(page)).logo.up, (await record(page)).logo.display], [false, 'none']);
+  await context.close();
+});
+
+test('boot (c) waits for a request on its way: an XHR and a fetch Instagram sent count as progress for 20 s after they started', async () => {
+  // A start-up file stalls (no progress), and at 15 s Instagram asks for something that never answers.
+  const body = `<script>setTimeout(function () { var x = new XMLHttpRequest(); x.open('GET', '/api/v1/never/'); x.send(); fetch('/api/v1/never/'); }, 15000);</script>`;
+  const { page, context } = await openBoot(igHome({ body }), { stall: [3], hang: ['/api/v1/never/'] });
+  await page.clock.runFor(14000);
+  assert.deepEqual([(await record(page)).progress.requests, (await record(page)).progress.inflight], [0, 0]);
+  await page.clock.runFor(16000);
+  const r = await record(page);
+  assert.deepEqual([r.progress.requests, r.progress.inflight], [2, 2], 'both on their way');
+  assert.ok(r.progress.quiet < 1000, 'a request on its way is progress: ' + r.progress.quiet);
+  assert.equal((await sent(page, 'bootStuck')).length, 0, 'not at 30 s: Instagram is still asking');
+  await page.clock.runFor(14000);
+  assert.equal((await sent(page, 'bootStuck')).length, 0, 'not at 44 s either');
+  await page.clock.runFor(2000);
+  const [m] = await sent(page, 'bootStuck');
+  assert.ok(m, 'then the rule: a request on its way for 20 s is a stall');
+  assert.equal(m.rule, 'c');
+  assert.ok(m.record.progress.quiet >= 10000, String(m.record.progress.quiet));
+  assert.equal(m.record.progress.inflight, 2);
+  await context.close();
+});
+
+test('boot: the clock never credits time away: frozen in the background for 8 minutes (no ticks), back on screen the page is not stuck', async () => {
+  // A normal start under way (the logo up 2 s, the files just loaded) when Cam switches apps; Android
+  // freezes the app, or the timer is throttled while hidden, so no tick runs until the page is back.
+  const { page, context } = await openBoot(igHome(), { init: visibilityInit(false) });
+  await page.clock.runFor(2000);
+  const before = await record(page);
+  assert.ok(before.vis >= 2000 && before.vis < 3000, String(before.vis));
+  await page.evaluate(() => window.__hide());
+  await page.clock.runFor(1000);
+  await page.clock.setSystemTime(await page.evaluate(() => Date.now()) + 8 * 60 * 1000);
+  await page.evaluate(() => window.__show());
+  await page.clock.runFor(300);   // the one tick that was due
+  const after = await record(page);
+  assert.ok(after.vis < before.vis + 1000, 'the time away never counted: ' + after.vis);
+  assert.equal((await sent(page, 'bootStuck')).length, 0);
+  assert.equal((await sent(page, 'bootRecord')).length, 0, 'not 10 s on screen yet');
+  // The same with no visibility change at all (the tick itself comes late): two ticks' worth at most.
+  await page.clock.setSystemTime(await page.evaluate(() => Date.now()) + 5 * 60 * 1000);
+  await page.clock.runFor(300);
+  const later = await record(page);
+  assert.ok(later.vis < after.vis + 1000, 'a late tick credits two ticks\' worth at most: ' + later.vis);
+  assert.equal((await sent(page, 'bootStuck')).length, 0);
+  // Back on screen the clock runs again, and the start still counts when it comes.
+  await page.clock.runFor(1000);
+  assert.ok((await record(page)).vis >= later.vis + 900, 'on screen: the clock runs');
+  await page.evaluate(() => document.getElementById('splash-screen').remove());
+  await page.clock.runFor(300);
+  const [m] = await sent(page, 'boot');
+  assert.ok(m, 'boot posted');
+  assert.equal(m.how, 'removed');
+  assert.equal((await sent(page, 'bootStuck')).length, 0);
   await context.close();
 });
 
 test('boot: a page that is hidden keeps the clock paused; visible again, a failed file is reported after 3 s on screen', async () => {
-  const init = () => {
-    let hidden = true;
-    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
-    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (hidden ? 'hidden' : 'visible') });
-    window.__show = () => { hidden = false; document.dispatchEvent(new Event('visibilitychange')); };
-  };
-  const { page, context } = await openBoot(igHome(), { abort: [0], init });
+  const { page, context } = await openBoot(igHome(), { abort: [0], init: visibilityInit(true) });
   await page.clock.runFor(12000);
   assert.equal((await sent(page, 'bootStuck')).length, 0, 'nothing while hidden');
   assert.equal((await sent(page, 'bootRecord')).length, 0, 'no 10 s record while hidden');
@@ -269,10 +332,23 @@ test('boot: a page without Instagram\'s logo screen posts boot with how none at 
   shapesOnly(st.stats.boot);
 });
 
-test('boot: the comments page (role comments) has no watch', async () => {
+test('boot: the comments page (role comments) has no watch: no boot, and nothing kept about the files it loads', async () => {
   const page = await open('https://www.instagram.com/p/ABCDEFG/comments/', BLANK, { role: 'comments' });
+  await page.route('https://static.cdninstagram.com/**', route => route.fulfill({ status: 200, contentType: 'application/javascript', body: '/* f */' }));
+  // Files from Instagram's static host with loader hashes, loaded and removed, as the panel's own routes do.
+  await page.evaluate(() => new Promise(res => {
+    let n = 0;
+    for (let i = 0; i < 5; i++) {
+      const s = document.createElement('script');
+      s.src = 'https://static.cdninstagram.com/rsrc.php/v4/y' + i + '/r/g' + i + '.js';
+      s.setAttribute('data-bootloader-hash', 'H' + i);
+      s.onload = s.onerror = () => { s.remove(); if (++n === 5) res(); };
+      document.head.appendChild(s);
+    }
+  }));
   await page.waitForTimeout(600);
   assert.equal((await sent(page, 'boot')).length, 0);
+  assert.equal((await record(page)).scripts.n, 0, 'the watch\'s listeners are not installed here');
 });
 
 test('boot record: window errors and unhandled rejections are counted, the first three by kind, host kind and line', async () => {

@@ -149,6 +149,7 @@
   const BOOT_CAP_MS = 60000;        // (d) the logo up this long...
   const BOOT_CAP_QUIET = 15000;     // ...with no progress in this long
   const BOOT_RECORD_AT = [10000, 30000];
+  const BOOT_INFLIGHT_MS = 20000;   // a request on its way is progress this long after it started
   const BOOT_STATIC = /^https:\/\/static\.cdninstagram\.com\/rsrc\.php\//;
   const nativeSetTimeout = window.setTimeout, nativeClearTimeout = window.clearTimeout, NativeObserver = window.MutationObserver;
   // What the status report carries; the full record is bootRecord().
@@ -162,10 +163,12 @@
     own: { bootPayloads: 0, bootChanged: 0, bootKeys: [], requireInHook: 0 } });
   // The watch's own state. vis: ms on screen and online since document start;
   // hashes: start-up file hash -> { state: pending | loaded | error, errVis,
-  // hidden, tries }; snap: the last progress signature; errs/rejs: the first
-  // three window errors and unhandled rejections (kind, host kind, line).
+  // hidden, tries }; snap: the last progress signature; requests/inflight:
+  // Instagram's XHR and fetch requests started, and still on their way
+  // (reqVis: the clock at the last start); errs/rejs: the first three window
+  // errors and unhandled rejections (kind, host kind, line).
   const bw = { vis: 0, last: Date.now(), timer: 0, dcl: false, dclVis: -1, splashSeen: false, progressVis: 0, snap: '',
-    resources: 0, done: false, mo: null, splashMo: null, hashes: new Map(), errs: [], rejs: [], recordsSent: 0 };
+    resources: 0, requests: 0, inflight: 0, reqVis: 0, done: false, mo: null, splashMo: null, hashes: new Map(), errs: [], rejs: [], recordsSent: 0 };
   function bootSplash() { return document.getElementById('splash-screen'); }
   // Instagram hides the logo (PolarisSplashScreenController: display none) or removes it (CometSSRContentRevealer).
   function bootLogoUp() {
@@ -207,28 +210,35 @@
     if (e.type === 'load') s.state = 'loaded';
     else { s.state = 'error'; s.errVis = bw.vis; s.hidden = !!document.hidden; }
   }
-  document.addEventListener('load', safe(bootResource), true);
-  document.addEventListener('error', safe(bootResource), true);
   // A script error (the ErrorEvent at the window), not a file that failed to load.
-  window.addEventListener('error', safe(e => {
+  function bootError(e) {
     if (e.target && e.target !== window) return;
     boot.errors++;
     if (bw.errs.length < 3) bw.errs.push({ kind: shapeToken(e.error && e.error.name) || 'Error', host: bootHost(e.filename), line: e.lineno | 0 });
-  }));
-  window.addEventListener('unhandledrejection', safe(e => {
+  }
+  function bootRejection(e) {
     boot.rejections++;
     const r = e.reason;
     if (bw.rejs.length < 3) bw.rejs.push({ kind: shapeToken(r && typeof r === 'object' ? r.name : typeof r) || '?' });
-  }));
+  }
+  // Instagram's requests (XHR sends and fetch calls, counted by the wrappers
+  // next to the data hooks): one starting, and one still on its way.
+  function bootRequest() {
+    bw.requests++;
+    bw.inflight++;
+    bw.reqVis = bw.vis;
+  }
+  function bootSettled() { bw.inflight = Math.max(0, bw.inflight - 1); }
   // Progress while the logo is up: a new or processed start-up payload
   // (script[data-sjs]), a resource completing (a file, a fetch or an XHR),
-  // the document's readyState changing, a payload through the data hooks.
+  // the document's readyState changing, a payload through the data hooks, a
+  // request started; one still on its way counts for 20 s after its start
+  // (Instagram's own give up at 60 s: a stall is no progress).
   function bootProgress() {
     const sig = [document.readyState, document.querySelectorAll('script[data-sjs]').length,
-      document.querySelectorAll('script[data-sjs][data-processed]').length, bw.resources, stats.payloads].join(',');
-    if (sig === bw.snap) return;
-    bw.snap = sig;
-    bw.progressVis = bw.vis;
+      document.querySelectorAll('script[data-sjs][data-processed]').length, bw.resources, stats.payloads, bw.requests].join(',');
+    if (sig !== bw.snap) { bw.snap = sig; bw.progressVis = bw.vis; }
+    else if (bw.inflight > 0 && bw.vis - bw.reqVis < BOOT_INFLIGHT_MS) bw.progressVis = bw.vis;
   }
   // The stuck rules, on time on screen and online: (a) a start-up file failed,
   // no retry of any file is on its way, and the logo is still up 3 s later;
@@ -273,14 +283,14 @@
     return {
       token: boot.token, rule: boot.rule, ms: Math.round(performance.now()), vis: Math.round(bw.vis),
       hidden: !!document.hidden, online: navigator.onLine !== false,
-      logo: { present: !!splash, up: bootLogoUp(), display: splash ? shapeToken(splash.style.display) || '' : '', how: boot.how, ms: boot.ms },
+      logo: { present: !!splash, up: bootLogoUp(), display: splash ? (splash.style.display ? shapeToken(splash.style.display) : '') : '', how: boot.how, ms: boot.ms },
       ready: document.readyState, dcl: bw.dcl, endMarker: !!document.getElementById('has-finished-comet-page'),
       require: typeof window.require, stubs: { d: stub(window.__d_stub), rl: stub(window.__rl_stub) },
       sjs: { n: sjs.length, processed: document.querySelectorAll('script[data-sjs][data-processed]').length,
         lastLen: last ? last.textContent.length : 0, lastWant: last ? (+last.getAttribute('data-content-len') || 0) : 0 },
       scripts: sc, files: files,
       errors: { n: boot.errors, first: bw.errs.slice() }, rejections: { n: boot.rejections, first: bw.rejs.slice() },
-      progress: { quiet: Math.round(bw.vis - bw.progressVis), snap: bw.snap },
+      progress: { quiet: Math.round(bw.vis - bw.progressVis), snap: bw.snap, requests: bw.requests, inflight: bw.inflight },
       own: { hooks: CFG.plainBoot !== true, plain: CFG.plainBoot === true, payloads: stats.payloads, errors: stats.errors,
         bootPayloads: boot.own.bootPayloads, bootChanged: boot.own.bootChanged, bootKeys: boot.own.bootKeys.slice(),
         requireInHook: boot.own.requireInHook, cont: stats.cont ? stats.cont.state : '' },
@@ -316,7 +326,11 @@
     bw.timer = 0;
     if (bw.done) return;
     const now = Date.now();
-    if (!document.hidden && navigator.onLine !== false) bw.vis += Math.max(0, now - bw.last);
+    // On screen and online, at most two ticks' worth: a tick that comes late
+    // (the app frozen in the background, its timer throttled while hidden)
+    // credits none of the time away, and coming back on screen or online
+    // starts the count from then (the listeners below).
+    if (!document.hidden && navigator.onLine !== false) bw.vis += Math.max(0, Math.min(now - bw.last, BOOT_TICK * 2));
     bw.last = now;
     bootCheck();
     if (!bw.done && bootLogoUp()) {
@@ -338,6 +352,14 @@
     if (!bw.done) bw.timer = nativeSetTimeout.call(window, safe(bootTick), BOOT_TICK);
   }
   if (CFG.role === 'main') {
+    // The listeners too: the comments panel keeps nothing of the watch.
+    document.addEventListener('load', safe(bootResource), true);
+    document.addEventListener('error', safe(bootResource), true);
+    window.addEventListener('error', safe(bootError));
+    window.addEventListener('unhandledrejection', safe(bootRejection));
+    // Back on screen or online: the time away never counts, whatever the tick's timer did meanwhile.
+    document.addEventListener('visibilitychange', safe(() => { bw.last = Date.now(); }));
+    window.addEventListener('online', safe(() => { bw.last = Date.now(); }));
     try {
       bw.mo = new NativeObserver(safe(records => {
         let touched = false;
@@ -1712,10 +1734,13 @@
   function serverJsRoot(o) {
     return Array.isArray(o.require) || Array.isArray(o.define) || !!(o.__bbox && typeof o.__bbox === 'object');
   }
-  // The counters the rules move: a payload they left as it was moves none.
+  // The counters the rules move: a payload they left as it was moves none (a
+  // feed page with nothing dropped is a page, not a change).
   function ruleMoves() {
-    return stats.ads + stats.chainingTrimmed + stats.exploreBlanked + stats.suggestionsBlanked + stats.searchStopped +
-      stats.feed.pages + (stats.feed.inMarker || 0) + stats.dmReel.trimmed;
+    const f = stats.feed;
+    return stats.ads + stats.chainingTrimmed + stats.exploreBlanked + stats.suggestionsBlanked + stats.searchStopped + stats.dmReel.trimmed +
+      f.ad + f.notFollowed + f.suggested + f.repost + f.unit + (f.exploreTitle || 0) + (f.alreadySeen || 0) +
+      (f.eof || 0) + (f.afterEnd || 0) + (f.inMarker || 0) + (stats.cont ? stats.cont.swaps : 0);
   }
   function noteBootKey(k) {
     const t = shapeToken(k);
@@ -1877,6 +1902,25 @@
         },
       });
     }
+  }
+  // B33: Instagram's requests on their way are boot progress (bootProgress).
+  // The wrappers only count and always call through; the main page only, and
+  // never on a plain load (nothing of SimpleGram's on Instagram's network then).
+  if (CFG.role === 'main' && !CFG.plainBoot) {
+    try {
+      const XP = XMLHttpRequest.prototype, nativeSend = XP.send;
+      XP.send = function send() {
+        try { this.addEventListener('loadend', bootSettled, { once: true }); bootRequest(); } catch (e) { /* counting only */ }
+        try { return nativeSend.apply(this, arguments); } catch (e) { bootSettled(); throw e; }
+      };
+    } catch (e) { /* left as it was */ }
+    try {
+      window.fetch = function fetch() {
+        const p = nativeFetch.apply(this, arguments);
+        try { bootRequest(); p.then(bootSettled, bootSettled); } catch (e) { /* counting only */ }
+        return p;
+      };
+    } catch (e) { /* left as it was */ }
   }
 
   // Instagram loads the next batch when the end of the list comes into
