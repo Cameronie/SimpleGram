@@ -220,13 +220,27 @@ public class B28Probe {
                 + "window.__mark=performance.now();return o.join('\\n')})()");
         log("--- " + label + "  [ms scrollY viewport fullscreen B-lifted IG-active A B C box-tops; P/>=paused/playing m/S=muted/sound]");
         log(t);
+        log("holds: " + jsText("String(window.__holds)"));
         log("IG: " + jsText("JSON.stringify({active:__ig.active,sound:__ig.sound,singles:__ig.singles,likes:__ig.likes,plays:__ig.plays,pauses:__ig.pauses,changes:__ig.changes.slice(-6)})"));
         log("bridge: " + jsText("(function(){var m=window.__msgs||[],k=window.__msgMark||0,o=m.slice(k);window.__msgMark=m.length;return JSON.stringify(o)})()"));
         log("SG: fs=" + (field("customView") != null) + " " + jsText("(function(){try{var d=__sg.stats.diag;return JSON.stringify({fullVideo:d.fullVideo})}catch(e){return 'n/a '+e}})()"));
     }
 
+    // A fix candidate, tried from outside SimpleGram: while the page is full
+    // screen, its scroll position is put back wherever the web view moves it.
+    static final String HOLD = "(function(){var last=scrollY,y=null;window.__holds=0;"
+            + "function fix(){if(y!=null&&document.fullscreenElement&&Math.abs(scrollY-y)>2){__holds++;scrollTo(0,y)}}"
+            + "document.addEventListener('fullscreenchange',function(){y=document.fullscreenElement===document.documentElement?last:null;fix()},true);"
+            + "addEventListener('scroll',function(){if(!document.fullscreenElement)last=scrollY;else fix()},true);"
+            + "addEventListener('resize',function(){fix();requestAnimationFrame(fix)});return 'hold on'})()";
+
     void run(String mode) {
+        run(mode, false);
+    }
+
+    void run(String mode, boolean hold) {
         loadFeed(mode);
+        if (hold) log("hold: " + jsText(HOLD));
         // Sound on while A plays, as if Cam had turned it on in the feed.
         js("(function(){var b=document.querySelector('.box[data-id=A]').getBoundingClientRect();scrollTo(0,scrollY+b.top-120)})()");
         SystemClock.sleep(1500);
@@ -287,6 +301,12 @@ public class B28Probe {
     public void box() {
         name = "box";
         run("box");
+    }
+
+    @Test
+    public void boxHold() {
+        name = "boxHold";
+        run("box", true);
     }
 
     @Test
