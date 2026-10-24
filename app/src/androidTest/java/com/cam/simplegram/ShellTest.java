@@ -536,10 +536,12 @@ public class ShellTest {
         }
     }
 
+    /** The text a user can see in a view: hidden children (a button not offered yet) don't count. */
     private static String textOf(ViewGroup g) {
         StringBuilder b = new StringBuilder();
         for (int i = 0; i < g.getChildCount(); i++) {
             View c = g.getChildAt(i);
+            if (c.getVisibility() != View.VISIBLE) continue;
             if (c instanceof android.widget.TextView) b.append(((android.widget.TextView) c).getText()).append(' ');
             else if (c instanceof ViewGroup) b.append(textOf((ViewGroup) c));
         }
