@@ -175,6 +175,21 @@ public class B28Test {
         return false;
     }
 
+    /** The windows on screen, topmost first (what a touch would land in). */
+    String windows() {
+        StringBuilder b = new StringBuilder();
+        try {
+            for (android.view.accessibility.AccessibilityWindowInfo w : inst.getUiAutomation().getWindows()) {
+                android.graphics.Rect r = new android.graphics.Rect();
+                w.getBoundsInScreen(r);
+                b.append(w.getType()).append(':').append(w.getTitle()).append(w.isFocused() ? "*" : "").append(r.toShortString()).append(' ');
+            }
+        } catch (RuntimeException e) {
+            b.append("n/a ").append(e);
+        }
+        return b.toString();
+    }
+
     void log(String s) {
         Log.i(TAG, name + ": " + s);
         out.append(s).append('\n');
@@ -282,6 +297,7 @@ public class B28Test {
 
         // The real tap on B: R10's full screen.
         float[] p = center(".box[data-id=B]");
+        log("windows before the tap: " + windows());
         long t0 = SystemClock.uptimeMillis();
         tapAt(p[0], p[1]);
         log("the tap took " + (SystemClock.uptimeMillis() - t0) + " ms to send");   // R10 wants a tap under 0.9 s
