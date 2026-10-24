@@ -1625,8 +1625,9 @@
     nudgeTimer = setTimeout(safe(() => {
       const se = document.scrollingElement;
       const fs = currentFeed();
-      // Never after the end of a feed or while the app is in the background.
-      if (!se || route() !== 'home' || document.hidden || fs.ended) return;
+      // Never after the end of a feed, while the app is in the background, or
+      // under a full screen (B28: the page is held still there).
+      if (!se || route() !== 'home' || document.hidden || fs.ended || document.fullscreenElement) return;
       if (tries && fs.lastPageAt !== at) return;   // a retry is only for the page it was made for
       if (skipping() && skipThrottled()) return;
       const trying = keepsTrying(fs);
@@ -4357,14 +4358,30 @@
    * underneath and continues where it was. A swipe down (or Back) returns; a
    * swipe up opens the Reel's comments (B29). No second full-screen request
    * is made: Instagram ends the Story when its own full screen ends.
+   * B28: in page mode the web view scrolls the page under the lifted video
+   * to the very top. Instagram's player judges what is on screen from where
+   * the posts sit, so it paused the full-screen video and played the one at
+   * the top of Home, with sound. The page is now held where it was for as
+   * long as the full screen is up, only the full-screen video plays, its
+   * sound is set on the element itself, and what you did in full screen
+   * (a pause) is kept when you come back.
    * ------------------------------------------------------------------ */
   const FV_SWIPE = 60;                 // px of mostly vertical travel
   // r10: full screens from a tap; r10Doubles: taps that turned out to be a double tap
   // (Instagram's like); r10Skipped: single taps that started nothing (a switch settling,
   // a stale lift, a finger already down); r10Menu: from ⋮; r10Restored: feed videos put
   // back as they were; liftFailed: the video couldn't be lifted (full screen left at once).
+  // B28: scrollHeld, scrolls of the page under the full screen put back (scrollHeldMax:
+  // the largest, px); othersPaused: other videos that started and were paused; replays:
+  // the full-screen video played again after a pause that wasn't a tap's (replaysGaveUp:
+  // full screens where that stopped at 6); remuted: Instagram muted it and it was set
+  // back; r10KeptPaused: pauses kept after Back; r10DeadZone: taps and swipes refused
+  // around the ⋮ tab (B27); framesStalled: quarter seconds the clock ran with no new
+  // frame; exitsBy: why each full screen was left, by reason.
   const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0, r9Pressed: 0,
-    r10: 0, r10Doubles: 0, r10Skipped: 0, r10Menu: 0, r10MenuNone: 0, r10Restored: 0, liftFailed: 0 };
+    r10: 0, r10Doubles: 0, r10Skipped: 0, r10Menu: 0, r10MenuNone: 0, r10Restored: 0, liftFailed: 0,
+    scrollHeld: 0, scrollHeldMax: 0, othersPaused: 0, replays: 0, replaysGaveUp: 0, remuted: 0, r10KeptPaused: 0,
+    r10DeadZone: 0, framesStalled: 0, exitsBy: {} };
   let gesture = null;                  // the current one-finger touch
   let storyPress = null;               // a touch Instagram's Story saw start
   let appHeld = false;                 // the app is holding a finger on the page (appHold)
@@ -4391,6 +4408,12 @@
   const downIds = new Set();           // touch identifiers the page saw go down and not up
   let lastTouchEndAt = 0, lastFsChangeAt = 0;
   let reelBox = null;                  // R9's Reel layer
+  // B28: the page's scroll position held under the full screen (page mode), a
+  // pause made by a tap in full screen (kept), and the full screen's run: its
+  // sound and replay budgets and the frame check (fullRunStart).
+  let scrollHold = null;               // { y }: the scrolling element's scrollTop at the request
+  let fullUserPaused = false;
+  let fullRun = null;
   function searchOpen() { return typeof search !== 'undefined' && !!search.open; }
   function isField(el) {
     return !!(el && el.closest && el.closest('input,textarea,[contenteditable="true"],[contenteditable=""]'));
@@ -4443,6 +4466,9 @@
     return true;
   }
   function togglePlay(v) {
+    // B28: a pause by a tap in SimpleGram's full screen is yours: it isn't
+    // played again under the full screen, nor on the way back.
+    if (v === r8El) fullUserPaused = !v.paused;
     if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } else v.pause();
   }
 
@@ -4463,7 +4489,11 @@
     if (fullVideoOn()) g.exit = true;
     else if ((r === 'post' || r === 'reel') && !fs && !searchOpen()) {
       const v = videoAt(g.x, g.y);
-      if (v && ownTouch(v, e.target) && atTop(v)) { g.video = v; g.r8 = 'pending'; }
+      if (v && ownTouch(v, e.target) && atTop(v)) {
+        // B27: a swipe from beside the ⋮ tab is aimed at the tab, not the video.
+        if (inMenuZone(g.x, g.y)) fvStats.r10DeadZone++;
+        else { g.video = v; g.r8 = 'pending'; }
+      }
     } else if (r === 'story' && !reelBox) {
       g.story = true;
       storyPress = { target: e.target, x: g.x, y: g.y };
@@ -4631,6 +4661,119 @@
     else window.removeEventListener('touchmove', fullHoldMove, true);
   }
 
+  /* B28: the scroll hold. Android's web view scrolls the page under a full
+   * screen on <html> to the very top (and puts it back on exit). Instagram's
+   * feed player watches each post's media box, not the lifted video, so it
+   * saw the tapped post leave: it paused the full-screen video and played the
+   * one at the top of Home. From the request (page mode) to the exit's
+   * processing, the scrolling element's scrollTop is put back whenever it
+   * moves by more than a pixel, synchronously inside the scroll event
+   * (scroll events run before IntersectionObserver updates in the same frame,
+   * so the player never sees the post at 0%), at landing, on a resize (the
+   * bars hiding) and in the 150 ms check. Off before the exit is processed,
+   * so the web view's own restore on exit finds the page where it left it.
+   * SimpleGram's own scroll writes (ownScrollAt) are left alone, and Home's
+   * nudges don't run under a full screen. */
+  function scrollHoldOn() {
+    const se = document.scrollingElement || document.documentElement;
+    scrollHold = { y: se ? se.scrollTop : 0 };
+    scrollHoldListen();
+  }
+  function scrollHoldOff() {
+    scrollHold = null;
+    scrollHoldListen();
+  }
+  function scrollHoldCheck() {
+    const h = scrollHold;
+    const se = document.scrollingElement || document.documentElement;
+    if (!h || !se) return;
+    const moved = se.scrollTop - h.y;
+    if (Math.abs(moved) <= 1 || Date.now() - ownScrollAt < 100) return;
+    se.scrollTop = h.y;
+    fvStats.scrollHeld++;
+    fvStats.scrollHeldMax = Math.max(fvStats.scrollHeldMax, Math.round(Math.abs(moved)));
+  }
+  let scrollHoldOnDoc = false;
+  const scrollHoldScroll = safe(e => { if (e.target === document) scrollHoldCheck(); });
+  const scrollHoldResize = safe(() => { scrollHoldCheck(); requestAnimationFrame(safe(scrollHoldCheck)); });
+  function scrollHoldListen() {
+    const want = !!scrollHold;
+    if (want === scrollHoldOnDoc) return;
+    scrollHoldOnDoc = want;
+    if (want) {
+      document.addEventListener('scroll', scrollHoldScroll, { capture: true, passive: true });
+      window.addEventListener('resize', scrollHoldResize, { passive: true });
+    } else {
+      document.removeEventListener('scroll', scrollHoldScroll, true);
+      window.removeEventListener('resize', scrollHoldResize);
+    }
+  }
+
+  /* B28: only the full-screen video plays, and it has the sound. Another video
+   * Instagram starts under it (page mode: the page runs on under the lifted
+   * video) is paused at once. The full-screen video paused by anyone but a tap
+   * in full screen is played again, 6 times a full screen at most: Instagram
+   * pauses a video it thinks is off screen every time, and fighting on would
+   * show a still picture anyway. Its sound goes on the element itself, never
+   * through Instagram's control (that flips the feed-wide setting, and with
+   * the page scrolled under the full screen it could be another post's); when
+   * Instagram mutes it again (its effect runs on every paused change) it is
+   * set back, 8 times at most. The run also notes, every 250 ms, whether the
+   * video presents new frames while its clock runs (framesStalled). */
+  function fullRunStart(v) {
+    fullRunStop();
+    const run = { v: v, sounds: 0, replays: 0, gaveUp: false, frames: 0, seen: 0, clock: v.currentTime, cb: 0, timer: 0 };
+    fullRun = run;
+    if (typeof v.requestVideoFrameCallback !== 'function') return;
+    const onFrame = () => { run.frames++; if (fullRun === run) { try { run.cb = v.requestVideoFrameCallback(onFrame); } catch (e) { run.cb = 0; } } };
+    try { run.cb = v.requestVideoFrameCallback(onFrame); } catch (e) { return; }
+    run.timer = setInterval(safe(() => {
+      if (fullRun !== run || !fullVideoOn()) { fullRunStop(run); return; }
+      const t = v.currentTime;
+      if (!v.paused && t - run.clock > 0.1 && run.frames === run.seen) fvStats.framesStalled++;
+      run.clock = t;
+      run.seen = run.frames;
+    }), 250);
+  }
+  function fullRunStop(run) {
+    const r = run || fullRun;
+    if (!r) return;
+    if (fullRun === r) fullRun = null;
+    clearInterval(r.timer);
+    try { if (r.cb) r.v.cancelVideoFrameCallback(r.cb); } catch (e) { /* gone */ }
+  }
+  // Sound for SimpleGram's own full-screen video: on the element, within the run's budget.
+  function fullSound(v) {
+    const run = fullRun;
+    if (!v.muted) return;
+    if (run) {
+      if (run.sounds >= 9) return;
+      if (run.sounds) fvStats.remuted++;
+      run.sounds++;
+    }
+    v.muted = false;
+  }
+  document.addEventListener('play', safe(e => {
+    const v = e.target;
+    if (!(v instanceof HTMLVideoElement) || v.dataset.sgOwn || v === r8El || !fullVideoOn() || r8Mode !== 'page') return;
+    v.pause();
+    fvStats.othersPaused++;
+  }), true);
+  document.addEventListener('pause', safe(e => {
+    const v = e.target, run = fullRun;
+    if (!run || v !== r8El || !fullVideoOn() || r8Mode !== 'page' || fullUserPaused || v.ended || !v.isConnected) return;
+    if (run.replays >= 6) { if (!run.gaveUp) { run.gaveUp = true; fvStats.replaysGaveUp++; } return; }
+    run.replays++;
+    fvStats.replays++;
+    const p = v.play();
+    if (p && p.catch) p.catch(() => {});
+  }), true);
+  document.addEventListener('volumechange', safe(e => {
+    const v = e.target;
+    if (!fullRun || v !== r8El || !v.muted || !fullVideoOn() || soundBlocked(v) || !wantsSound(v)) return;
+    fullSound(v);
+  }), true);
+
   /* B25 touch rules for full screen (R8 now; R10's tap and R11's bar build on
    * them): leaveFullScreen is the one way out; nothing starts while a switch
    * settles (fullScreenSettling); a lift handled too late switches nothing
@@ -4639,7 +4782,7 @@
   // A full-screen switch R8 asked for or was told of hasn't landed yet. Each
   // wait has a limit, so a request that never answers can't block R8 for good.
   function fullScreenSettling() {
-    if (r8Pending && performance.now() - r8PendingAt > 3000) { r8Pending = false; syncFullHold(); }
+    if (r8Pending && performance.now() - r8PendingAt > 3000) { r8Pending = false; syncFullHold(); if (!r8On) scrollHoldOff(); }
     if (r8ExitAt && Date.now() - r8ExitAt > 1500) r8ExitAt = 0;
     const fs = document.fullscreenElement;
     return r8Pending || (r8On && !fs) || (!!r8ExitAt && !!fs);
@@ -4655,8 +4798,10 @@
   // leaves full screen itself only when there is no app to ask (a browser).
   function leaveFullScreen(why) {
     if (!document.fullscreenElement) return false;
+    why = /^[a-z]{1,12}$/.test(why) ? why : 'other';
+    bump(fvStats.exitsBy, why);        // B28: Copy details says why each full screen ended
     r8ExitAt = Date.now();             // before asking: the app may be done before post() returns
-    if (post('fullVideoExitRequest', { why: /^[a-z]{1,12}$/.test(why) ? why : 'other' })) {
+    if (post('fullVideoExitRequest', { why: why })) {
       fsCounts.exitAsked++;
       return true;
     }
@@ -4681,7 +4826,7 @@
     const fail = () => {
       fvStats.r8Failed++;
       if (r8El === v) r8Pending = false;
-      if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; fullKind = ''; r10Snap = null; }
+      if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; fullKind = ''; r10Snap = null; scrollHoldOff(); }
       syncFullHold();
     };
     r8El = v;
@@ -4691,6 +4836,7 @@
     r8PendingAt = performance.now();
     v.dataset.sgFull = '1';
     syncFullHold();
+    if (page) scrollHoldOn();          // B28: the page stays where it is under the full screen
     // The app hides its ⋮ tab only for a full screen that is ours (Instagram's
     // Story asks for one on Home before its route says "story").
     post('fullVideoStart');
@@ -4712,6 +4858,7 @@
   }
   document.addEventListener('fullscreenchange', safe(() => {
     const el = document.fullscreenElement;
+    const was = r8El;                  // B28: the video this switch is about, for the log
     let via = 'other';
     const landed = r8El && el && (r8Mode === 'page' ?
       el === document.documentElement && (r8Pending || r8On || !!r8El.dataset.sgFull) : el === r8El);
@@ -4722,17 +4869,22 @@
         r8On = true;
         bump(fvStats, fullKind === 'r8' ? 'r8' : 'r10');
         const v = r8El, kind = fullKind;
+        fullUserPaused = false;
         if (r8Mode === 'page' && !liftVideo(v)) {
           // Full screen with nothing lifted over it would show the feed: leave at once.
           fvStats.liftFailed++;
           leaveFullScreen('lift');
+        } else {
+          fullRunStart(v);
+          scrollHoldCheck();
         }
         // A landscape video small in the post played muted; full screen is
         // the sound rule's "opened video". Checked once the layout settles.
         // R10: a tap opens it playing, with sound (its play brings the sound).
         setTimeout(safe(() => {
           if (!fullVideoOn() || r8El !== v) return;
-          if (kind !== 'r8' && v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+          scrollHoldCheck();
+          if (kind !== 'r8' && v.paused && !v.ended && !fullUserPaused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
           else if (v.muted && !soundBlocked(v) && !v.paused && wantsSound(v)) unmute(v);
         }), 150);
       }
@@ -4743,11 +4895,14 @@
       // leaves it the safe way and the browser's controls stay hidden.
       if (r8El && r8El !== el) delete r8El.dataset.sgFull;
       dropLift();
+      scrollHoldOff();
+      fullRunStop();
       r8El = el;
       r8On = true;
       r8Mode = 'element';
       fullKind = 'r8';
       r10Snap = null;
+      fullUserPaused = false;
       el.dataset.sgFull = '1';
       fsCounts.r8Adopted++;
       via = 'r8-adopted';
@@ -4756,6 +4911,7 @@
       if (r8On) fvStats.exits++;
       r8On = false;
       dropLift();
+      fullRunStop();
       if (r8Pending && !el) {
         // B25: an exit from before, arriving while the next request is on its
         // way. That request stays tracked (it used to land untracked).
@@ -4764,19 +4920,22 @@
       } else {
         via = 'r8';
         r8Pending = false;
+        // B28: the hold ends first, so the web view's own restore of the scroll finds the page as it left it.
+        scrollHoldOff();
         if (r8El) delete r8El.dataset.sgFull;
         // R10: out of full screen the feed video goes back to how it was.
         const snap = r10Snap;
         r10Snap = null;
-        if (snap && wasOn && snap.v === r8El) restoreAfterFull(snap);
+        if (snap && wasOn && snap.v === r8El) restoreAfterFull(snap, fullUserPaused);
         r8El = null;
         fullKind = '';
+        fullUserPaused = false;
       }
     }
     if (!el) r8ExitAt = 0;
     syncFullHold();
     queuePageBar();
-    noteFsPage(el, via);
+    noteFsPage(el, via, r8El || was);
     // The full screen R9's layer lived in ended: Instagram is closing the Story.
     if (reelBox && reelBox.inFull && (!el || !el.contains(reelBox.box))) closeStoryReel('ended');
   }));
@@ -4793,12 +4952,16 @@
    * within 40 px of the first), and the like runs in the second tap's click;
    * the single-tap action runs 300 ms after a click that no second click
    * followed (polarisOnlyHandleSingleClick, MULTI_CLICK_DELAY 300). Its video
-   * players toggle sound or pause on a click of their tap layer. So R10
-   * never takes a tap from Instagram: every touch and click still reaches
-   * it (its double tap still likes), and R10 waits out the same 300 ms. A
-   * second touch in that time is a double tap (or something else): no full
-   * screen. Whatever Instagram's single tap toggled on the feed video is
-   * put back when full screen ends.
+   * players toggle sound or pause on a click of their tap layer. R10 waits
+   * out the same 300 ms. B28: R10 takes the tap. Every touch still reaches
+   * Instagram (its double tap is counted from them), but the click is held:
+   * its single tap must not flip the feed's sound (or pause a Reel) just as
+   * full screen opens, and used to. A second touch in the window at the same
+   * spot is a double tap: Instagram is then given the first click (made on
+   * its target) just before the real second one, so its timer arms and
+   * clears and it likes; no full screen. Anything else in the window ends
+   * the wait with no full screen, and Instagram never sees that click.
+   * Instagram's own icons on the video keep their taps (videoControl).
    * ------------------------------------------------------------------ */
   const R10_WAIT = 300;                // Instagram's MULTI_CLICK_DELAY
   const R10_SLOP = 12;                 // px a tap may wander
@@ -4841,7 +5004,7 @@
   }), { capture: true, passive: true });
   window.addEventListener('touchstart', safe(e => {
     if (!e.isTrusted) return;
-    let second = false;
+    let second = false, first = null;
     if (r10Wait) {
       // A new touch ends the wait: a second tap (Instagram's double tap: it likes) or anything else.
       const w = r10Wait;
@@ -4850,12 +5013,13 @@
       const t0 = e.touches[0];
       second = !!t0 && Math.hypot(t0.clientX - w.x, t0.clientY - w.y) <= 40;
       fvStats[second ? 'r10Doubles' : 'r10Skipped']++;
+      if (second) first = { target: w.target, x: w.x, y: w.y };   // B28: the click Instagram is owed
     }
     if (e.touches.length !== 1) { if (tapSeq) tapSeq.multi = true; return; }
     const t = e.touches[0];
     const s = tapSeq && tapSeq.fresh ? tapSeq : { snap: stillAt(t.clientX, t.clientY) };
     tapSeq = { fresh: false, x: t.clientX, y: t.clientY, at: performance.now(), moved: false, multi: false,
-      second: second, snap: s.snap };
+      second: second, first: first, snap: s.snap };
   }), { capture: true, passive: true });
   window.addEventListener('touchmove', safe(e => {
     const s = tapSeq;
@@ -4870,16 +5034,34 @@
     const s = tapSeq;
     tapSeq = null;
     if (menuArm && menuTapped(e)) return;
-    if (!s || s.fresh || s.multi || s.moved || s.second || performance.now() - s.at > 900) return;
+    if (!s || s.fresh || s.multi || s.moved || performance.now() - s.at > 900) return;
+    // B28: the second tap of a double tap. R10 held the first tap's click, so
+    // Instagram gets it now, just before this one: click, click (its single-tap
+    // timer arms and clears; its touch-counted double tap likes).
+    if (s.second) { if (s.first) replayClick(s.first); return; }
     const v = r10Video(e.target, e.clientX, e.clientY);
     if (!v) return;
     // B25: no switch while one settles, and none from a lift handled too late.
     if (fullScreenSettling() || staleTouch(e)) { fvStats.r10Skipped++; return; }
+    // B27: a tap beside the ⋮ tab is for the tab (a near miss): Instagram's tap, never a full screen.
+    if (inMenuZone(e.clientX, e.clientY)) { fvStats.r10DeadZone++; return; }
+    // B28: R10 takes the tap: Instagram's single tap never runs for it.
+    e.stopImmediatePropagation();
+    e.preventDefault();
     const snap = s.snap && s.snap.v === v ? s.snap : stillOf(v);
-    const w = { v: v, snap: snap, x: e.clientX, y: e.clientY, timer: 0 };
+    const w = { v: v, snap: snap, x: e.clientX, y: e.clientY, target: e.target, timer: 0 };
     w.timer = setTimeout(safe(() => fireR10(w)), R10_WAIT);
     r10Wait = w;
   }), true);
+  // The click Instagram was owed (R10 held it), made on its own target.
+  function replayClick(c) {
+    const t = c.target;
+    if (!t || !t.isConnected) return;
+    try {
+      t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window,
+        clientX: c.x, clientY: c.y, screenX: c.x, screenY: c.y, detail: 1 }));
+    } catch (err) { /* Instagram's like still runs on the real click */ }
+  }
   // The double-tap window passed with no second touch: a single tap. Still
   // within the tap's user activation (a few seconds), so full screen is allowed.
   function fireR10(w) {
@@ -4892,29 +5074,20 @@
     r10Snap = w.snap;
     if (!enterR8(v, 'r10')) r10Snap = null;
   }
-  // Instagram's single tap may have toggled the feed video's sound or paused
-  // it: put it back as it was before the tap. Sound goes off through
-  // Instagram's own sound control, so its icon and its feed-wide sound
-  // setting agree with the video.
-  function restoreAfterFull(s) {
+  // Out of full screen the feed video's sound goes back to how it was before
+  // the tap (set on the element: Instagram's feed-wide setting was never
+  // touched, so its icon still agrees). B28: what you did in full screen is
+  // kept: a pause you made there stays (userPaused; it used to play on), and
+  // a video that was playing before the tap and is paused now plays again.
+  function restoreAfterFull(s, userPaused) {
     setTimeout(safe(() => {
       const v = s.v;
       if (!v.isConnected || document.fullscreenElement) return;     // gone, or full screen again
-      if (s.muted && !v.muted) muteBack(v);
-      if (s.paused && !v.paused) v.pause();
+      if (v.muted !== s.muted) v.muted = s.muted;
+      if (userPaused) { if (v.paused) fvStats.r10KeptPaused++; }
       else if (!s.paused && v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
       fvStats.r10Restored++;
     }), 120);
-  }
-  function muteBack(v) {
-    const toggle = findControl(v, /audio|sound|mute/i, false);
-    const label = toggle ? controlState(toggle) : '';
-    if (toggle && /playing|is on|^mute$|turn off/i.test(label)) {
-      try { press(toggle); } catch (e) { /* ignore */ }
-      setTimeout(() => { if (!v.muted && !fullVideoOn()) v.muted = true; }, 300);
-    } else {
-      v.muted = true;
-    }
   }
   // ⋮ → Full-screen video. A native menu gives the page no user activation, so
   // the page can't ask for full screen itself: it names a spot on the video
@@ -4967,6 +5140,26 @@
     r10Snap = stillOf(m.v);
     if (!enterR8(m.v, 'menu')) r10Snap = null;
     return true;
+  }
+  // B27: a dead zone around the app's ⋮ tab. The tab is slim and flush with
+  // the edge, so a thumb aimed at it often lands on the page beside it, and
+  // over a video that was R10's full screen. The app says where the tab is
+  // (menuTab: side, top and height as fractions of its root; on:false when it
+  // is hidden): a trusted touch within 56 CSS px of the tab's edge, from 24 px
+  // above it to 24 px below, opens no full screen and arms no R8 swipe. The
+  // app's own tap for ⋮ → Full-screen video is never refused (menuTapped
+  // runs first). The tap itself is still Instagram's, as any tap off a video.
+  let menuZone = null;
+  function menuTabSet(cmd) {
+    const y = cmd ? +cmd.yFrac : NaN, h = cmd ? +cmd.hFrac : NaN;
+    if (!cmd || !cmd.on || !(y >= 0 && y <= 1) || !(h > 0 && h <= 1)) { menuZone = null; return; }
+    menuZone = { left: cmd.side === 'left', y: y, h: h };
+  }
+  function inMenuZone(x, y) {
+    const z = menuZone;
+    if (!z) return false;
+    if (z.left ? x > 56 : x < innerWidth - 56) return false;
+    return y >= z.y * innerHeight - 24 && y <= (z.y + z.h) * innerHeight + 24;
   }
 
   function sharedReelHere() {
@@ -5850,10 +6043,21 @@
     }
     return best;
   }
+  // B28: the lifted video no longer shows: taken out of the page (Instagram
+  // drew the feed again), dropped out of the top layer, or hidden. Full screen
+  // would then show the feed under it, so it ends, saying which.
+  function liftLost(v) {
+    if (!v.isConnected) return 'gone';
+    try { if (!v.matches(':popover-open')) return 'unlifted'; } catch (e) { /* no popovers: nothing was lifted */ }
+    if (getComputedStyle(v).display === 'none') return 'hidden';
+    const r = v.getBoundingClientRect();
+    return r.width < 40 || r.height < 40 ? 'hidden' : '';
+  }
   function syncPageBar() {
-    // The full-screen video was taken out of the page under it (Instagram drew
-    // the feed again): there is nothing left to show, so full screen ends.
-    if (fullLayer && fullVideoOn() && !fullLayer.video.isConnected && !fullScreenSettling()) leaveFullScreen('gone');
+    // The full-screen video was taken out of the page under it (or stopped
+    // showing, B28): there is nothing left to show, so full screen ends.
+    const lost = fullLayer && fullVideoOn() && !fullScreenSettling() ? liftLost(fullLayer.video) : '';
+    if (lost) leaveFullScreen(lost);
     // Mid-swipe (a finger down, or the page or a carousel still moving) the bar
     // stays on its video: swapping it then strands a snapping carousel halfway.
     if (pageBar && pageBar.el.isConnected && pageBar.video.isConnected &&
@@ -5925,12 +6129,29 @@
   // phase). The search screen's list is in a shadow root: it has its own.
   document.addEventListener('scroll', noteScroll, { capture: true, passive: true });
 
-  function noteFsPage(el, via) {
+  function noteFsPage(el, via, fullV) {
     const now = performance.now();
+    const se = document.scrollingElement || document.documentElement;
     fsPageLog.push({ tag: el ? String(el.tagName || '?').toLowerCase() : null, route: route(), via: via, on: !!el,
-      msSinceTouchEnd: lastTouchEndAt ? Math.round(now - lastTouchEndAt) : -1, touchActive: downIds.size > 0 });
+      msSinceTouchEnd: lastTouchEndAt ? Math.round(now - lastTouchEndAt) : -1, touchActive: downIds.size > 0,
+      // B28: where the page stood, the viewport, the time, and what played (to line up with Home's jumps).
+      y: se ? Math.round(se.scrollTop) : -1, vh: innerHeight, t: Math.round(now / 100) / 10, playing: videoCensus(fullV) });
     if (fsPageLog.length > 8) fsPageLog.shift();
     lastFsChangeAt = now;
+  }
+  // How many videos play, whether the full-screen one (`fullV`) does, and
+  // whether any other plays with its sound on (what Cam heard). Shapes only.
+  function videoCensus(fullV) {
+    let n = 0, full = false, otherSound = false;
+    const list = document.getElementsByTagName('video');
+    for (let i = 0; i < list.length && i < 60; i++) {
+      const v = list[i];
+      if (v.dataset.sgOwn || v.paused) continue;
+      n++;
+      if (v === fullV) full = true;
+      else if (!v.muted) otherSound = true;
+    }
+    return { n: n, full: full, otherSound: otherSound };
   }
   function allowsPanY(v) {
     return !v || v === 'auto' || v === 'manipulation' || /(^|\s)pan-y(\s|$)/.test(v);
@@ -6291,6 +6512,9 @@
     else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
   }
   function unmute(m) {
+    // B28: SimpleGram's own full-screen video gets its sound on the element
+    // itself, never through Instagram's control (fullSound).
+    if (m === r8El && fullVideoOn()) { fullSound(m); return; }
     const used = unmuteBudget.get(m) || { n: 0, t: Date.now() };
     if (Date.now() - used.t > 10000) { used.n = 0; used.t = Date.now(); }
     if (used.n >= 4) return;
@@ -6314,6 +6538,7 @@
     if (CFG.role !== 'main') { m.pause(); m.muted = true; return; }
     if (m.closest('[data-sg-dm-hide]')) { m.pause(); return; }       // B24: a suggested Reel stays still
     queueAwake();
+    if (fullVideoOn() && m !== r8El) return;                         // B28: under SimpleGram's full screen only its video has sound
     if (m.muted && !soundBlocked(m) && wantsSound(m)) unmute(m);
   }), true);
   document.addEventListener('volumechange', safe(e => {
@@ -8529,6 +8754,7 @@
       case 'appHold': appHold(!!cmd.on); break;
       case 'fullVideoExit': exitFullVideo('back'); break;
       case 'fullVideoMenu': fullVideoMenu(); break;
+      case 'menuTab': menuTabSet(cmd); break;                      // B27: where the ⋮ tab is
       case 'gestureReset': gestureReset(); break;
       case 'scrollStuckAck': stuckAck(cmd); break;
       // The app's chip is still up from an earlier page: the first drag here that scrolls clears it.

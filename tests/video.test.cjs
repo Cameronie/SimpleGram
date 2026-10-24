@@ -203,10 +203,12 @@ test('R8: a swipe that starts outside the video, or goes sideways, does nothing'
   await drag(page, [380, 250], [60, 290]);           // a carousel swipe
   await drag(page, [380, 250], [300, 330]);          // short and diagonal
   assert.deepEqual(await page.evaluate(() => window.__fs), []);
-  // Taps still reach Instagram (its tap toggles sound or pauses).
+  // A tap is R10's (one tap opens full screen; B28: Instagram's own tap action
+  // never runs for it), not a swipe: nothing of R8's.
   await tapAt(page, 200, 250);
-  assert.equal(await page.evaluate(() => window.__igTaps), 1);
-  assert.equal((await fv(page)).r8, 0);
+  await page.waitForTimeout(500);
+  assert.deepEqual([await page.evaluate(() => window.__igTaps), await page.evaluate(() => window.__fs)], [0, ['page:v']]);
+  assert.deepEqual([(await fv(page)).r8, (await fv(page)).r10], [0, 1]);
 });
 
 test('R8: in full screen a swipe up or down returns; a tap pauses or plays', async () => {
