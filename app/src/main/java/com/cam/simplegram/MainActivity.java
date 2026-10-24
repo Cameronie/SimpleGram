@@ -209,7 +209,19 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         downloads = new Downloads(this, this::toast);
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
 
-        root = new FrameLayout(this);
+        root = new FrameLayout(this) {
+            // B27: a touch that lands just beside the ⋮ tab (its dead zone) is the
+            // tab's. The page view under it would take the touch first, so the
+            // tab's delegate is asked before the children are.
+            @Override
+            public boolean dispatchTouchEvent(MotionEvent ev) {
+                if (tabDelegate != null && menuButton != null && menuButton.getVisibility() == View.VISIBLE
+                        && tabDelegate.onTouchEvent(ev)) {
+                    return true;
+                }
+                return super.dispatchTouchEvent(ev);
+            }
+        };
         root.setBackgroundColor(dark ? Color.BLACK : Color.WHITE);
 
         web = newWebView("main");
@@ -1959,6 +1971,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         updateFeedBar();
     }
 
+    /**
+     * B26: only the status bar (clock, battery) ever hides. The Android buttons
+     * at the bottom (Back, Home, Recent apps) stay in every full screen (R8/R10,
+     * R9's Reel layer, Instagram's own Stories) and in screenshot mode: hiding
+     * them needs a swipe up from the bottom edge to get them back, and that
+     * swipe reaches the page too. The window keeps its room above the buttons,
+     * so nothing is drawn under them.
+     */
     @SuppressWarnings("deprecation")
     private void setSystemBarsHidden(boolean hidden) {
         if (Build.VERSION.SDK_INT >= 30) {
@@ -1966,15 +1986,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (c == null) return;
             if (hidden) {
                 c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-                c.hide(WindowInsets.Type.systemBars());
+                c.hide(WindowInsets.Type.statusBars());
             } else {
-                c.show(WindowInsets.Type.systemBars());
+                c.show(WindowInsets.Type.statusBars());
             }
         } else {
             View d = getWindow().getDecorView();
-            d.setSystemUiVisibility(hidden
-                    ? View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    : 0);
+            d.setSystemUiVisibility(hidden ? View.SYSTEM_UI_FLAG_FULLSCREEN : 0);
         }
     }
 

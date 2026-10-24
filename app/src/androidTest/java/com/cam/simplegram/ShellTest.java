@@ -1598,6 +1598,75 @@ public class ShellTest {
         }
     }
 
+    /**
+     * B26: the Android buttons never go. A full-screen view (a video, a Story)
+     * and screenshot mode hide only the status bar: the navigation bar stays and
+     * the view shown ends above it, so nothing is drawn under the buttons.
+     */
+    @Test
+    public void fullScreenAndScreenshotModeKeepTheNavigationBar() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            MainActivity a = act.get();
+            View video = new View(InstrumentationRegistry.getInstrumentation().getTargetContext());
+            s.onActivity(x -> {
+                try {
+                    chromeOf(x).onShowCustomView(video, () -> { });
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(700);        // the status bar animates away
+            idle();
+            assertNavigationBarKept(a, video, "full screen");
+            s.onActivity(MainActivity::onBackPressed);
+            SystemClock.sleep(400);
+            idle();
+            assertNull(fieldOf(s, "customView"));
+            s.onActivity(x -> {
+                try {
+                    call(x, "enterScreenshot", new Class<?>[]{});
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(700);
+            idle();
+            assertNavigationBarKept(a, (View) fieldOf(s, "screenshotShield"), "screenshot mode");
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void assertNavigationBarKept(MainActivity a, View shown, String when) {
+        View decor = a.getWindow().getDecorView();
+        int[] flags = new int[1];
+        int[] edges = new int[3];      // the view's bottom edge in the window, the room kept for the buttons, the window's height
+        boolean[] navVisible = {true};
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+            flags[0] = decor.getSystemUiVisibility();
+            int[] loc = new int[2];
+            shown.getLocationInWindow(loc);
+            edges[0] = loc[1] + shown.getHeight();
+            edges[2] = decor.getHeight();
+            WindowInsets in = decor.getRootWindowInsets();
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                navVisible[0] = in == null || in.isVisible(WindowInsets.Type.navigationBars());
+                edges[1] = in == null ? 0 : in.getInsets(WindowInsets.Type.navigationBars()).bottom;
+            } else {
+                edges[1] = in == null ? 0 : in.getSystemWindowInsetBottom();
+            }
+        });
+        assertEquals(when + ": the navigation bar isn't hidden", 0, flags[0] & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+        assertEquals(when + ": no immersive mode", 0,
+                flags[0] & (View.SYSTEM_UI_FLAG_IMMERSIVE | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY));
+        assertTrue(when + ": the navigation bar is visible", navVisible[0]);
+        assertTrue(when + ": the view ends above the buttons (bottom " + edges[0] + ", room " + edges[1] + " of " + edges[2] + ")",
+                edges[0] <= edges[2] - edges[1] + 1);
+    }
+
     private static Object fieldOf(ActivityScenario<MainActivity> s, String name) {
         Object[] r = new Object[1];
         s.onActivity(x -> {
