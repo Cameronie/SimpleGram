@@ -5520,7 +5520,9 @@
     const s = tapSeq;
     tapSeq = null;
     if (menuArm && menuTapped(e)) return;
-    if (!s || s.fresh || s.multi || s.moved || performance.now() - s.at > 900) return;
+    // A tap, not a long press. CFG.tapMaxMs: the on-device tests on a slow emulator
+    // take over a second to deliver one.
+    if (!s || s.fresh || s.multi || s.moved || performance.now() - s.at > (CFG.tapMaxMs || 900)) return;
     // B28: the second tap of a double tap. R10 held the first tap's click, so
     // Instagram gets it now, just before this one: click, click (its single-tap
     // timer arms and clears; its touch-counted double tap likes).
