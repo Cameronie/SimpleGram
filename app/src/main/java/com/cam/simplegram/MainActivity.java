@@ -207,6 +207,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // booted; the app watches each page start on its own clock and recovers.
     // Package-private timings: ShellTest shortens them.
     static long bootWatchMs = 30_000, bootProbeMs = 2_000, bootReloadFollowMs = 3_000, bootSettleMs = 1_000;
+    static long bootResumeMinShownMs = 8_000;     // the resume check reloads a logo only after this much time on screen
     private static final int RELOADS_PER_10_MIN = 2;
     private int bootSeq;                  // the native token of the newest main-frame page start (kept in prefs: unique across restarts)
     private BootWatch watch;              // the page start being watched, or null
@@ -898,7 +899,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
                         handBackSearch();
-                        sendMenuTab();       // B27: the new page learns where the tab is
+                        sendMenuTab(true);   // B27: the new page learns where the tab is
                         // The chip is still up: the new page says scrollOk on its first drag that scrolls.
                         if (stuckChipWanted) js("stuckChipUp");
                         if (!prefs.getBoolean("tabTip", false)) {
@@ -1439,6 +1440,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // Where the tab is, as the page last heard it (fractions of root's height).
     private boolean tabLeft;
     private float tabTop, tabHeight;
+    private String menuTabSent = "";       // the last menuTab message, so a layout pass that moved nothing sends none
 
     @SuppressLint("ClickableViewAccessibility")
     private TextView makeMenuButton() {
@@ -1532,7 +1534,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         tabLeft = left;
         tabTop = y / (float) h;
         tabHeight = tabH / (float) h;
-        sendMenuTab();
+        sendMenuTab(false);
     }
 
     /**
@@ -1540,15 +1542,21 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
      * no swipe arm there, wherever the tab was dragged). It is told where the
      * tab is after every layout and drag, when the tab is hidden or shown, and
      * when a new page is ready. Fractions of root's height, so the page needs
-     * no pixel ratio.
+     * no pixel ratio. Only a change is sent (the keyboard and the comments
+     * panel bring a layout pass per frame while they animate), except to a new
+     * page, which knows nothing yet ({@code force}).
      */
-    private void sendMenuTab() {
+    private void sendMenuTab(boolean force) {
         try {
-            js(new JSONObject().put("type", "menuTab")
+            JSONObject m = new JSONObject().put("type", "menuTab")
                     .put("on", menuButton.getVisibility() == View.VISIBLE)
                     .put("side", tabLeft ? "left" : "right")
                     .put("yFrac", Math.round(tabTop * 10000) / 10000.0)
-                    .put("hFrac", Math.round(tabHeight * 10000) / 10000.0));
+                    .put("hFrac", Math.round(tabHeight * 10000) / 10000.0);
+            String text = m.toString();
+            if (!force && text.equals(menuTabSent)) return;
+            menuTabSent = text;
+            js(m);
         } catch (JSONException ignored) {
             // Not reachable with constant keys.
         }
@@ -1559,7 +1567,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         int v = on ? View.VISIBLE : View.GONE;
         if (menuButton.getVisibility() == v) return;
         menuButton.setVisibility(v);
-        sendMenuTab();
+        sendMenuTab(false);
     }
 
     /** Rounded on the side facing the screen, square against the edge. */
@@ -1765,6 +1773,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     private int statusWanted;             // 0 none, 1 Filter status, 2 Copy details alone
     private Runnable statusFallback;
+    private AlertDialog statusShownAlone; // the Filter status dialog shown without the page's answer, while it is up
     String lastDetails;                   // what Copy details last put on the clipboard (ShellTest reads it)
 
     /**
@@ -1790,8 +1799,17 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
         int want = statusWanted;
         statusWanted = 0;
-        if (want == 2) copyDetails(stats, deviceDiagnostics());
-        else if (want == 1 || stats != null) showStatus(stats);
+        if (want == 2) {
+            copyDetails(stats, deviceDiagnostics());
+        } else if (want == 1) {
+            showStatus(stats);
+        } else if (stats != null && statusShownAlone != null && statusShownAlone.isShowing()) {
+            // The page answered after its second: its full status takes the place
+            // of the app-only dialog (a second one would stack over it).
+            statusShownAlone.dismiss();
+            showStatus(stats);
+        }
+        // Any later answer the page sends on its own is nothing to show.
     }
 
     private void showStatus(JSONObject stats) {
@@ -2010,9 +2028,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         appendBootStatus(b);
         b.append("\nCounts since the page last loaded. No account names or post details are kept.");
         final JSONObject page = pageAnswered ? stats : null;
-        dialog().setTitle("Filter status").setMessage(b.toString())
-                .setNeutralButton("Copy details", (d, w) -> copyDetails(page, device))
+        AlertDialog d = dialog().setTitle("Filter status").setMessage(b.toString())
+                .setNeutralButton("Copy details", (x, w) -> copyDetails(page, device))
                 .setPositiveButton("OK", null).show();
+        statusShownAlone = pageAnswered ? null : d;
     }
 
     /** Filter status: a short "Starting Instagram" section (B33). */
@@ -2541,6 +2560,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
      * settle, then the page is asked whether the logo is still up. If it is,
      * or the page is WebView's error page, one reload through the watchdog's
      * budget (never restoreState). No answer: busy, Try again offered, no reload.
+     * A page only a moment into its start shows the logo too (a glance at a
+     * notification 300 ms into a slow boot): the logo counts as stuck only once
+     * the page has had {@link #bootResumeMinShownMs} on screen; until then the
+     * check waits, and the watchdog's cap runs on regardless.
      */
     private void scheduleResumeRecovery(BootWatch w) {
         w.recovering = true;
@@ -2585,6 +2608,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             boolean logo = answer.optBoolean("logo");
             boolean blank = answer.optInt("kids", -1) == 0 && !"complete".equals(answer.optString("ready"));
             if (!logo && !answer.optBoolean("error") && !blank) return;     // started after all: the watch goes on
+            if (!answer.optBoolean("error") && w.shown() < bootResumeMinShownMs) {
+                // Too soon to tell a hurt page from a slow start: asked again once it has had its stretch.
+                w.recovering = true;
+                ui.postDelayed(() -> resumeCheck(w, tries), bootResumeMinShownMs - w.shown());
+                return;
+            }
             w.stuck = true;
             String rule = answer.optBoolean("error") ? "errorPage" : logo ? "logo" : "blank";
             bootOutcome(w, "stuck: " + rule + " (resume) after " + w.shown() + " ms shown");
@@ -2967,7 +2996,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         chip.setOnClickListener(v -> {
             stuckChipWanted = false;
             updateStuckChip();
-            rebuildWebView("Scrolling chip", "scroll");
+            rebuildWebView();
         });
         return chip;
     }
@@ -3644,6 +3673,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         stuckChipWanted = false;
         updateStuckChip();
         rebuildWebView("Fix scrolling", chip);
+    }
+
+    /** B25's chip (B25Test asks for a rebuild through this too). */
+    private void rebuildWebView() {
+        rebuildWebView("Scrolling chip", "scroll");
     }
 
     /** Which chip is up: B33's kind, B25's "scroll", or none. */
