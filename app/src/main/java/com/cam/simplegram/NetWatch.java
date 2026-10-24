@@ -49,6 +49,7 @@ final class NetWatch {
     private ConnectivityManager.NetworkCallback callback;
     private Network net;
     private boolean known, blocked, metered, validated;
+    private boolean blockedPending;    // a network arrived; its blocked status (sent right after) hasn't
     private String transport = "none";
     private boolean resumed, lastOk;
     private long resumedAt;        // the last onResume, until the network was usable after it
@@ -66,9 +67,14 @@ final class NetWatch {
         callback = new ConnectivityManager.NetworkCallback() {
             @Override
             public void onAvailable(Network network) {
+                // Whether the app may use the new network isn't known yet: Android sends
+                // onCapabilitiesChanged and then onBlockedStatusChanged right after this
+                // (in the same handler message), and only the last one decides. (Taking
+                // it for usable here started a reload on a network still blocked for the
+                // app, and spent the ladder's one reload on it.)
                 net = network;
                 known = true;
-                blocked = false;        // onBlockedStatusChanged follows at once with the real value
+                blockedPending = true;
                 note("avail", "");
             }
 
@@ -76,6 +82,7 @@ final class NetWatch {
             public void onLost(Network network) {
                 if (net == null || net.equals(network)) net = null;
                 known = true;
+                blockedPending = false;
                 note("lost", "");
             }
 
@@ -97,6 +104,7 @@ final class NetWatch {
                 net = network;
                 known = true;
                 blocked = isBlocked;
+                blockedPending = false;
                 note("blocked", String.valueOf(isBlocked));
             }
         };
@@ -122,7 +130,7 @@ final class NetWatch {
     /** Usable now: the callback's word once it has spoken, else whether there is an active network at all. */
     boolean netOk() {
         if (testNetOk != null) return testNetOk;
-        if (known) return net != null && !blocked;
+        if (known) return net != null && !blocked && !blockedPending;
         return !activeNull();
     }
 
@@ -201,6 +209,7 @@ final class NetWatch {
         } catch (JSONException ignored) {
             // Not reachable with constant keys.
         }
+        if (blockedPending) return;        // the word on the new network comes with onBlockedStatusChanged
         boolean ok = netOk();
         if (ok && resumed) markResumeOk();
         if (ok != lastOk) {
