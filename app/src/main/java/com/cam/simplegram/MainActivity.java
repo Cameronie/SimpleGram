@@ -4,10 +4,12 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.res.Configuration;
@@ -17,11 +19,14 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.ConnectivityManager;
 import android.net.Uri;
+import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.TypedValue;
@@ -29,6 +34,7 @@ import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.TouchDelegate;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -40,9 +46,12 @@ import android.webkit.CookieManager;
 import android.webkit.GeolocationPermissions;
 import android.webkit.PermissionRequest;
 import android.webkit.RenderProcessGoneDetail;
+import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -94,6 +103,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private WebView web;
     private CommentsPanel comments;
     private TextView menuButton;
+    private TouchDelegate tabDelegate;      // B27: the tab's extra room (its dead zone); asked before the page view is
     private TextView zoomChip;
     private View feedBar;
     private TextView feedTitle;
@@ -129,6 +139,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // R10 from the menu: the taps the app made on the page's video for it, and the ones it held back.
     private int videoTaps, videoTapsHeld;
     private Downloads downloads;
+    // B33: what Android lets the network do (Data Saver, the background block).
+    private NetWatch netWatch;
+    private boolean restrictReceiverOn;
+    private final BroadcastReceiver restrictReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            readRestrictStatus("changed");
+        }
+    };
 
     private String route = "other";
     private String pageUrl = "";
@@ -184,6 +203,25 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // The page's search screen, read before a rebuild and handed to the new page once.
     private JSONObject searchHandBack;
 
+    // B33: Instagram didn't start (the logo screen stays). The page says when it
+    // booted; the app watches each page start on its own clock and recovers.
+    // Package-private timings: ShellTest shortens them.
+    static long bootWatchMs = 30_000, bootProbeMs = 2_000, bootReloadFollowMs = 3_000, bootSettleMs = 1_000;
+    static long bootResumeMinShownMs = 8_000;     // the resume check reloads a logo only after this much time on screen
+    private static final int RELOADS_PER_10_MIN = 2;
+    private BootWatch watch;              // the page start being watched, or null
+    private BootChain chain;              // the ladder's place for the current page; survives its reloads and rebuilds
+    private String startHow = "";         // how the next main-frame page start began, set by whoever starts it
+    private Runnable watchTick, reloadFollow, probeTimeout;
+    private boolean pendingNetReload;     // the automatic reload waits for the network
+    private Runnable resumeReload;        // the automatic reload that came due while the app was away
+    private String bootChipKind = "";     // "" (off), "offline", "stuck", "still"
+    private int bootChipsShown, bootLate;
+    private android.widget.LinearLayout bootChip;
+    private TextView bootChipText, bootChipRetry, bootChipPlain;
+    private boolean tipDue;               // a stuck page was tied to a block: the Data Saver tip may show
+    private boolean plainBootOn;          // the page script's data hooks are off for the page being loaded
+
     /** A WebView's injected page script, re-registered when the signed-in account changes. */
     private static final class Script {
         final WebView view;
@@ -208,8 +246,25 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         viewerId = readViewerId();
         downloads = new Downloads(this, this::toast);
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
+        netWatch = new NetWatch(this, ui, this::onNetOk);
+        netWatch.start();
+        registerRestrictReceiver();
+        readRestrictStatus("create");
+        lifecycle(state == null ? "create" : "restore");
 
-        root = new FrameLayout(this);
+        root = new FrameLayout(this) {
+            // B27: a touch that lands just beside the ⋮ tab (its dead zone) is the
+            // tab's. The page view under it would take the touch first, so the
+            // tab's delegate is asked before the children are.
+            @Override
+            public boolean dispatchTouchEvent(MotionEvent ev) {
+                if (tabDelegate != null && menuButton != null && menuButton.getVisibility() == View.VISIBLE
+                        && tabDelegate.onTouchEvent(ev)) {
+                    return true;
+                }
+                return super.dispatchTouchEvent(ev);
+            }
+        };
         root.setBackgroundColor(dark ? Color.BLACK : Color.WHITE);
 
         web = newWebView("main");
@@ -244,6 +299,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         stuckLp.topMargin = dp(56);
         root.addView(stuckChip, stuckLp);
 
+        // B33's chip has the same slot: one chip at a time.
+        bootChip = makeBootChip();
+        FrameLayout.LayoutParams bootLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        bootLp.topMargin = dp(56);
+        bootLp.leftMargin = bootLp.rightMargin = dp(16);
+        root.addView(bootChip, bootLp);
+
         menuButton = makeMenuButton();
         root.addView(menuButton, new FrameLayout.LayoutParams(dp(TAB_W), dp(TAB_H)));
 
@@ -253,6 +316,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
         // A restored page (after a renderer restart or process death) keeps its
         // place; the launch intent was already handled the first time.
+        startHow = "restore";
         if (state == null || web.restoreState(state) == null) handleIntent(getIntent(), true);
     }
 
@@ -295,6 +359,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             c.put("searchPages", 3);
             c.put("viewerId", viewerId == null ? JSONObject.NULL : viewerId);
             c.put("continueHome", continueHome());
+            // B33's last step: one load with the page script's data hooks off (the bridge stays).
+            if ("main".equals(role) && plainBootOn) c.put("plainBoot", true);
             return c.toString();
         } catch (JSONException e) {
             return "{}";
@@ -407,6 +473,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
             injectFallback(view);
+            if ("main".equals(role) && view == web) onMainPageStarted(view, url);
             if ("main".equals(role)) {
                 startsAll++;
                 // Only a Back that starts a new page counts as one: most stay in the page.
@@ -439,6 +506,27 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
 
         @Override
+        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+            super.onReceivedError(view, request, error);
+            if ("main".equals(role)) netError(request.getUrl(), request.isForMainFrame(), "net", error.getErrorCode(), String.valueOf(error.getDescription()));
+        }
+
+        @Override
+        public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
+            super.onReceivedHttpError(view, request, response);
+            if ("main".equals(role)) netError(request.getUrl(), request.isForMainFrame(), "http", response.getStatusCode(), "");
+        }
+
+        @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            // The default stays: a page with a bad certificate (a captive portal, a
+            // VPN, a wrong clock) is never shown. Until now it was cancelled in silence.
+            handler.cancel();
+            Uri u = error.getUrl() == null ? null : Uri.parse(error.getUrl());
+            if ("main".equals(role)) netError(u, u != null && u.toString().equals(view.getUrl()), "ssl", error.getPrimaryError(), "");
+        }
+
+        @Override
         public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
             // Both WebViews share the renderer and each reports it: act once.
             if (restarting) return true;
@@ -449,8 +537,104 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     .putString("rendererGoneLast", (detail.didCrash() ? "crashed" : "stopped by Android")
                             + ", priority " + detail.rendererPriorityAtExit() + ", " + clock())
                     .apply();
-            ui.post(MainActivity.this::recreate);
+            // B33: a new page started in the background would load with the network
+            // blocked (Data Saver, Android 15+). The place is saved now (the history
+            // lives outside the renderer) and the restart waits for the next onResume.
+            Bundle keep = new Bundle();
+            pendingState = web.saveState(keep) != null ? keep : null;
+            if (resumed) ui.post(MainActivity.this::recreate);
+            else pendingRecreate = true;
+            lifecycle(resumed ? "recreate" : "recreate deferred");
             return true;
+        }
+    }
+
+    private boolean pendingRecreate;
+    private Bundle pendingState;          // the page's history, saved before the dead renderer's WebView goes
+    private Runnable deferredSwap;        // a rebuild's swap that waits for the next onResume
+
+    /**
+     * B33: a failed load of the page or one of its files (shapes only: host kind,
+     * file kind, the error's name and code, whether the app was on screen and
+     * whether Android had it blocked). A start-up file that fails leaves
+     * Instagram's logo up for good; one that stalls leaves no error at all.
+     */
+    private void netError(Uri url, boolean mainFrame, String kind, int code, String name) {
+        try {
+            JSONObject e = new JSONObject()
+                    .put("at", NetWatch.clock())
+                    .put("kind", kind)
+                    .put("code", code)
+                    .put("main", mainFrame)
+                    .put("host", hostKind(url))
+                    .put("res", resKind(url))
+                    .put("resumed", resumed)
+                    .put("blocked", netWatch.isBlocked());
+            if (!name.isEmpty()) e.put("name", name.length() > 60 ? name.substring(0, 60) : name);
+            BootWatch w = watch;
+            if (w != null) e.put("t", SystemClock.uptimeMillis() - w.startedAt).put("seq", w.seq);
+            ring("netErrors", 20, e);
+            // The document itself or one of Instagram's start-up scripts: a mark on the page.
+            if (w != null && !w.booted && (mainFrame || ("static".equals(e.optString("host")) && "js".equals(e.optString("res"))))) {
+                markHurt("netError");
+            }
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /** main / api / static / media / other: an address's host, by what it serves. */
+    static String hostKind(Uri u) {
+        if (u == null) return "other";
+        String h = Links.host(u);
+        String p = u.getPath() == null ? "" : u.getPath();
+        if (h.equals("www.instagram.com") || h.equals("instagram.com") || h.equals("m.instagram.com")) {
+            return p.startsWith("/api/") || p.startsWith("/graphql") || p.startsWith("/ajax/") ? "api" : "main";
+        }
+        if (h.equals("i.instagram.com") || h.equals("graph.instagram.com")) return "api";
+        if (h.startsWith("static.")) return "static";    // Instagram's script and style files
+        if (Links.isMediaFile(u)) return "media";
+        return "other";
+    }
+
+    /** js / css / json / html / image / video / font / none / other: a file by its extension. */
+    static String resKind(Uri u) {
+        String p = u == null || u.getLastPathSegment() == null ? "" : u.getLastPathSegment();
+        int dot = p.lastIndexOf('.');
+        if (dot < 0) return "none";
+        switch (p.substring(dot + 1).toLowerCase(Locale.ROOT)) {
+            case "js":
+            case "mjs":
+                return "js";
+            case "css":
+                return "css";
+            case "json":
+                return "json";
+            case "html":
+            case "htm":
+                return "html";
+            case "jpg":
+            case "jpeg":
+            case "png":
+            case "webp":
+            case "gif":
+            case "heic":
+            case "avif":
+            case "svg":
+                return "image";
+            case "mp4":
+            case "m4v":
+            case "m4s":
+            case "webm":
+            case "m3u8":
+            case "mpd":
+                return "video";
+            case "woff":
+            case "woff2":
+            case "ttf":
+                return "font";
+            default:
+                return "other";
         }
     }
 
@@ -592,7 +776,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (("post".equals(route) || "reel".equals(route) || own)
                     && !"story".equals(route) && !"direct".equals(route)) {
                 fullHidTab = true;
-                menuButton.setVisibility(View.GONE);
+                setTabShown(false);
                 zoomChip.setVisibility(View.GONE);
             }
             // Comments over R9's Reel are raised above any full-screen view: they stay.
@@ -646,7 +830,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             }
             if (fullHidTab) {
                 fullHidTab = false;
-                if (!screenshotMode && !pageVideo) menuButton.setVisibility(View.VISIBLE);
+                if (!screenshotMode && !pageVideo) setTabShown(true);
                 onZoomChanged(zoom.scale());     // also re-reads the skip note and the end card
             } else {
                 // A Story's route message can come while its full screen is still up:
@@ -702,7 +886,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         // A full screen that started before its route said Story (or DMs):
                         // the tab is how Stories are saved, so it comes back.
                         fullHidTab = false;
-                        if (!screenshotMode && !pageVideo) menuButton.setVisibility(View.VISIBLE);
+                        if (!screenshotMode && !pageVideo) setTabShown(true);
                         onZoomChanged(zoom.scale());
                     }
                     if ("ready".equals(action)) {
@@ -714,6 +898,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
                         handBackSearch();
+                        sendMenuTab(true);   // B27: the new page learns where the tab is
                         // The chip is still up: the new page says scrollOk on its first drag that scrolls.
                         if (stuckChipWanted) js("stuckChipUp");
                         if (!prefs.getBoolean("tabTip", false)) {
@@ -789,6 +974,16 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             case "scrollStuck":
                 if (main) onScrollStuck(m);
                 break;
+            case "boot":
+                // B33: Instagram's logo went (removed / hidden / never there).
+                if (main) onBoot(m);
+                break;
+            case "bootStuck":
+                if (main) onBootStuck(m);
+                break;
+            case "bootRecord":
+                if (main) onBootRecord(m);
+                break;
             case "scrollOk":
                 // Drags scroll again (the page saw one): the chip has nothing to fix.
                 if (main && stuckChipWanted) {
@@ -819,7 +1014,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 if (main) chooseDownload(m.optJSONArray("choices"));
                 break;
             case "status":
-                if (main) showStatus(m.optJSONObject("stats"));
+                if (main) deliverStatus(m.optJSONObject("stats"));
                 break;
             case "toast": {
                 String text = m.optString("message");
@@ -873,14 +1068,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (pageVideo == on) return;
         pageVideo = on;
         if (on) {
-            menuButton.setVisibility(View.GONE);
+            setTabShown(false);
             zoomChip.setVisibility(View.GONE);
             updateStuckChip();       // the stuck chip stays off the Reel layer too
             setSystemBarsHidden(true);
         } else {
             // R12: the Reel's comments go with the Reel.
             if (commentsOverFull) closeComments();
-            if (!screenshotMode && !fullHidTab) menuButton.setVisibility(View.VISIBLE);
+            if (!screenshotMode && !fullHidTab) setTabShown(true);
             if (customView == null && !screenshotMode) setSystemBarsHidden(false);
             onZoomChanged(zoom.scale());
         }
@@ -1238,6 +1433,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // The menu is a slim tab on the screen edge, clear of Instagram's own
     // buttons (a post's Save icon sits a little in from the edge).
     private static final int TAB_W = 16, TAB_H = 48;
+    // B27: how far the tab's hit area reaches past it (inward, above and below).
+    private static final int TAB_REACH = 8;
+    private Rect tabHit;
+    // Where the tab is, as the page last heard it (fractions of root's height).
+    private boolean tabLeft;
+    private float tabTop, tabHeight;
+    private String menuTabSent = "";       // the last menuTab message, so a layout pass that moved nothing sends none
 
     @SuppressLint("ClickableViewAccessibility")
     private TextView makeMenuButton() {
@@ -1307,15 +1509,64 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (w == 0 || h == 0) return;
         int tabW = dp(TAB_W), tabH = dp(TAB_H);
         boolean left = prefs.getBoolean("menuLeft", false);
-        float y = prefs.getFloat("menuY", 0.58f) * h;
+        int x = left ? 0 : w - tabW;
+        int y = Math.round(clamp(prefs.getFloat("menuY", 0.58f) * h, dp(56), h - tabH - dp(60)));
         menuButton.setBackground(tabBackground(left));
         menuButton.animate().cancel();
-        menuButton.animate().x(left ? 0 : w - tabW)
-                .y(clamp(y, dp(56), h - tabH - dp(60))).setDuration(120).start();
-        if (Build.VERSION.SDK_INT >= 29) {
-            // Dragging the tab must not start the system Back gesture.
-            menuButton.setSystemGestureExclusionRects(Collections.singletonList(new Rect(0, 0, tabW, tabH)));
+        menuButton.animate().x(x).y(y).setDuration(120).start();
+        // B27: a thumb aimed at a 16 dp tab often lands just beside it (over a
+        // video, that was R10's one tap). The tab's hit area reaches 8 dp inward
+        // and 8 dp above and below; the tab itself stays slim, and Instagram's own
+        // edge icons start about 16 dp in, so their taps are never taken.
+        int reach = dp(TAB_REACH);
+        Rect hit = new Rect(x - (left ? 0 : reach), y - reach, x + tabW + (left ? reach : 0), y + tabH + reach);
+        if (!hit.equals(tabHit)) {
+            // Kept while it is unchanged: a new delegate forgets a touch it is in the middle of.
+            tabHit = hit;
+            tabDelegate = new TouchDelegate(hit, menuButton);
         }
+        if (Build.VERSION.SDK_INT >= 29) {
+            // Dragging the tab (from its extra room too) must not start the system Back gesture.
+            menuButton.setSystemGestureExclusionRects(Collections.singletonList(new Rect(0, 0, tabW, tabH)));
+            root.setSystemGestureExclusionRects(Collections.singletonList(hit));
+        }
+        tabLeft = left;
+        tabTop = y / (float) h;
+        tabHeight = tabH / (float) h;
+        sendMenuTab(false);
+    }
+
+    /**
+     * B27: the page keeps a dead zone around the tab (no one-tap full screen and
+     * no swipe arm there, wherever the tab was dragged). It is told where the
+     * tab is after every layout and drag, when the tab is hidden or shown, and
+     * when a new page is ready. Fractions of root's height, so the page needs
+     * no pixel ratio. Only a change is sent (the keyboard and the comments
+     * panel bring a layout pass per frame while they animate), except to a new
+     * page, which knows nothing yet ({@code force}).
+     */
+    private void sendMenuTab(boolean force) {
+        try {
+            JSONObject m = new JSONObject().put("type", "menuTab")
+                    .put("on", menuButton.getVisibility() == View.VISIBLE)
+                    .put("side", tabLeft ? "left" : "right")
+                    .put("yFrac", Math.round(tabTop * 10000) / 10000.0)
+                    .put("hFrac", Math.round(tabHeight * 10000) / 10000.0);
+            String text = m.toString();
+            if (!force && text.equals(menuTabSent)) return;
+            menuTabSent = text;
+            js(m);
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /** Shows or hides the tab, and tells the page when that changes. */
+    private void setTabShown(boolean on) {
+        int v = on ? View.VISIBLE : View.GONE;
+        if (menuButton.getVisibility() == v) return;
+        menuButton.setVisibility(v);
+        sendMenuTab(false);
     }
 
     /** Rounded on the side facing the screen, square against the edge. */
@@ -1392,6 +1643,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     updateFeedBar();
                     startsReload++;
                     goBackAt = 0;
+                    startHow = "Refresh";
                     web.reload();
                     break;
                 case 7:
@@ -1425,7 +1677,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         dialog().setItems(items, (x, which) -> {
             switch (which) {
                 case 0:
-                    js("status");
+                    askStatus(false);
                     break;
                 case 1:
                     toggleContinueHome();
@@ -1449,6 +1701,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private void loadMain(String url) {
+        if (startHow.isEmpty()) startHow = "menu";
         feedWanted = false;
         skipKind = "";       // the note belongs to the page being left
         updateFeedBar();
@@ -1517,11 +1770,54 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 .setNegativeButton("Cancel", null).show();
     }
 
+    private int statusWanted;             // 0 none, 1 Filter status, 2 Copy details alone
+    private Runnable statusFallback;
+    private AlertDialog statusShownAlone; // the Filter status dialog shown without the page's answer, while it is up
+    String lastDetails;                   // what Copy details last put on the clipboard (ShellTest reads it)
+
+    /**
+     * Filter status, or Copy details alone (the chip's Details): the page is
+     * asked; a page that doesn't answer within a second (stuck on the logo, or
+     * dead) gets the app's own part shown or copied without it.
+     */
+    private void askStatus(boolean copy) {
+        statusWanted = copy ? 2 : 1;
+        if (statusFallback != null) ui.removeCallbacks(statusFallback);
+        statusFallback = () -> {
+            statusFallback = null;
+            deliverStatus(null);
+        };
+        ui.postDelayed(statusFallback, 1000);
+        js("status");
+    }
+
+    private void deliverStatus(JSONObject stats) {
+        if (statusFallback != null) {
+            ui.removeCallbacks(statusFallback);
+            statusFallback = null;
+        }
+        int want = statusWanted;
+        statusWanted = 0;
+        if (want == 2) {
+            copyDetails(stats, deviceDiagnostics());
+        } else if (want == 1) {
+            showStatus(stats);
+        } else if (stats != null && statusShownAlone != null && statusShownAlone.isShowing()) {
+            // The page answered after its second: its full status takes the place
+            // of the app-only dialog (a second one would stack over it).
+            statusShownAlone.dismiss();
+            showStatus(stats);
+        }
+        // Any later answer the page sends on its own is nothing to show.
+    }
+
     private void showStatus(JSONObject stats) {
-        if (stats == null) return;
+        boolean pageAnswered = stats != null;
+        if (!pageAnswered) stats = new JSONObject();
         JSONObject feed = stats.optJSONObject("feed");
         JSONObject dom = stats.optJSONObject("dom");
         StringBuilder b = new StringBuilder();
+        if (!pageAnswered) b.append("The page didn't answer, so only the app's own counts are here.\n\n");
         if (feed != null) {
             b.append("Home feed\n")
                     .append("  Posts shown: ").append(feed.optInt("kept")).append('\n')
@@ -1728,10 +2024,41 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 .append("  Back presses in the page: ").append(backPresses).append('\n')
                 .append("  Comment box: ").append(commentsLine(commentsLayout)).append('\n');
         appendTouchStatus(b, stats.optJSONObject("b25"));
+        appendBootStatus(b);
         b.append("\nCounts since the page last loaded. No account names or post details are kept.");
-        dialog().setTitle("Filter status").setMessage(b.toString())
-                .setNeutralButton("Copy details", (d, w) -> copyDetails(stats, device))
+        final JSONObject page = pageAnswered ? stats : null;
+        AlertDialog d = dialog().setTitle("Filter status").setMessage(b.toString())
+                .setNeutralButton("Copy details", (x, w) -> copyDetails(page, device))
                 .setPositiveButton("OK", null).show();
+        statusShownAlone = pageAnswered ? null : d;
+    }
+
+    /** Filter status: a short "Starting Instagram" section (B33). */
+    private void appendBootStatus(StringBuilder b) {
+        JSONArray log = ringOf("bootLog");
+        int booted = 0, stuck = 0;
+        for (int i = 0; i < log.length(); i++) {
+            JSONObject e = log.optJSONObject(i);
+            String o = e == null ? "" : e.optString("outcome");
+            if (o.startsWith("booted")) booted++;
+            else if (o.startsWith("stuck") || o.startsWith("busy")) stuck++;
+        }
+        String lastStuck = prefs.getString("lastStuck", "");
+        String when = "";
+        try {
+            if (!lastStuck.isEmpty()) when = new JSONObject(lastStuck).optString("at");
+        } catch (JSONException ignored) {
+            // Shown without a time.
+        }
+        b.append("\nStarting Instagram\n")
+                .append("  Last ").append(log.length()).append(" page starts: ").append(booted).append(" started, ")
+                .append(stuck).append(" stuck").append(when.isEmpty() ? "" : " (last at " + when + ")").append('\n')
+                .append("  Reloads by itself: ").append(ringOf("reloadLog").length())
+                .append(" · page view rebuilt: ").append(ringOf("rebuildLog").length())
+                .append(" · loads without filters: ").append(prefs.getInt("plainBoots", 0)).append('\n')
+                .append("  Network errors kept: ").append(ringOf("netErrors").length())
+                .append(" · network now: ").append(netWatch.netOk() ? "usable" : "blocked or none")
+                .append(" · Data Saver: ").append(netWatch.restrictStatus()).append('\n');
     }
 
     /** Milliseconds as "12.3 s". */
@@ -1820,6 +2147,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             n.put("continueHome", continueHome());
             n.put("rendererGone", prefs.getInt("rendererGone", 0));
             n.put("rendererGoneLast", prefs.getString("rendererGoneLast", ""));
+            n.put("resumed", resumed);
+            n.put("clock", NetWatch.clock());
             if (commentsLayout != null) n.put("comments", commentsLayout);
             n.put("pageStarts", new JSONObject().put("all", startsAll).put("loadUrl", startsLoadUrl)
                     .put("goBack", startsGoBack).put("reload", startsReload).put("backPresses", backPresses));
@@ -1835,39 +2164,117 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private static final int TRAIL_MAX = 40;
 
     private JSONArray trail() {
+        return ringOf("feedTrail");
+    }
+
+    private void keepTrail(JSONObject entry) {
+        if (entry == null || entry.toString().length() > 800) return;
+        ring("feedTrail", TRAIL_MAX, entry);
+    }
+
+    /** A ring of entries kept in prefs (counts and shapes only), newest last; it survives a rebuild. */
+    private void ring(String key, int max, JSONObject entry) {
+        if (entry == null || entry.toString().length() > 2000) return;
+        JSONArray old = ringOf(key);
+        JSONArray kept = new JSONArray();
+        for (int i = Math.max(0, old.length() - (max - 1)); i < old.length(); i++) kept.put(old.opt(i));
+        kept.put(entry);
+        prefs.edit().putString(key, kept.toString()).apply();
+    }
+
+    private JSONArray ringOf(String key) {
         try {
-            return new JSONArray(prefs.getString("feedTrail", "[]"));
+            return new JSONArray(prefs.getString(key, "[]"));
         } catch (JSONException e) {
             return new JSONArray();
         }
     }
 
-    private void keepTrail(JSONObject entry) {
-        if (entry == null || entry.toString().length() > 800) return;
-        JSONArray old = trail();
-        JSONArray kept = new JSONArray();
-        for (int i = Math.max(0, old.length() - (TRAIL_MAX - 1)); i < old.length(); i++) kept.put(old.opt(i));
-        kept.put(entry);
-        prefs.edit().putString("feedTrail", kept.toString()).apply();
-    }
-
-    /** Counts and data shapes only, for pasting into a bug report. */
+    /** Counts and data shapes only, for pasting into a bug report. Works without the page (stats null). */
     private void copyDetails(JSONObject stats, JSONObject device) {
         JSONObject all = new JSONObject();
         try {
             all.put("device", device);
-            // The page's trail is the newest part of the kept one.
-            JSONObject page = new JSONObject(stats.toString());
-            page.remove("trail");
-            all.put("page", page);
+            if (stats != null) {
+                // The page's trail is the newest part of the kept one.
+                JSONObject page = new JSONObject(stats.toString());
+                page.remove("trail");
+                all.put("page", page);
+            } else {
+                all.put("page", JSONObject.NULL);
+            }
             all.put("trail", trail());
+            all.put("net", netBlock());
+            all.put("boot", bootBlock());
         } catch (JSONException e) {
             return;
         }
+        lastDetails = all.toString();
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         if (cm == null) return;
-        cm.setPrimaryClip(ClipData.newPlainText("SimpleGram details", all.toString()));
-        toast("Details copied: paste them into your message");
+        cm.setPrimaryClip(ClipData.newPlainText("SimpleGram details", lastDetails));
+        toast(stats == null ? "Details copied (the page didn't answer): paste them into your message"
+                : "Details copied: paste them into your message");
+    }
+
+    /** The net block: what Android let the network do, built by the app alone (B33). */
+    private JSONObject netBlock() throws JSONException {
+        JSONArray errors = ringOf("netErrors");
+        JSONObject byHost = new JSONObject();
+        for (int i = 0; i < errors.length(); i++) {
+            JSONObject e = errors.optJSONObject(i);
+            String k = e == null ? "other" : e.optString("host", "other");
+            byHost.put(k, byHost.optInt(k) + 1);
+        }
+        BootWatch w = watch;
+        JSONObject hurt = new JSONObject();
+        if (w != null) hurt.put("seq", w.seq).put("hurt", w.hurt).put("why", w.hurtWhy);
+        return new JSONObject()
+                .put("now", netWatch.state())
+                .put("restrictChanges", ringOf("netStatus"))
+                .put("netErrors", errors)
+                .put("errorsByHost", byHost)
+                .put("hurt", hurt)
+                .put("tip", new JSONObject().put("shown", prefs.getBoolean("dataSaverTip", false))
+                        .put("at", prefs.getString("dataSaverTipAt", "")).put("due", tipDue));
+    }
+
+    /** The boot block: page starts, the stuck record, reloads and rebuilds (B33). */
+    private JSONObject bootBlock() throws JSONException {
+        BootWatch w = watch;
+        JSONObject now = new JSONObject();
+        if (w != null) {
+            now.put("seq", w.seq).put("how", w.how).put("shownMs", w.shown()).put("booted", w.booted)
+                    .put("stuck", w.stuck).put("hurt", w.hurtWhy).put("pageToken", !w.pageToken.isEmpty())
+                    .put("hasRecord", w.record != null);
+        }
+        JSONObject c = new JSONObject();
+        if (chain != null) c.put("reloads", chain.reloads).put("tryAgains", chain.tryAgains).put("plain", chain.plain);
+        JSONObject b = new JSONObject()
+                .put("bootLog", ringOf("bootLog"))
+                .put("lifecycle", ringOf("lifecycle"))
+                .put("reloadLog", ringOf("reloadLog"))
+                .put("rebuildLog", ringOf("rebuildLog"))
+                .put("watch", now)
+                .put("chain", c)
+                .put("chip", bootChipKind)
+                .put("chipsShown", bootChipsShown)
+                .put("lateMessages", bootLate)
+                .put("pendingNetReload", pendingNetReload)
+                .put("pendingResumeReload", resumeReload != null)
+                .put("plainBoots", prefs.getInt("plainBoots", 0))
+                .put("plainNext", plainBootOn)
+                .put("autoReloads10min", ringOf("autoReloads").length());
+        for (String k : new String[]{"lastStuck", "rebuildRecord"}) {
+            String v = prefs.getString(k, "");
+            if (v.isEmpty()) continue;
+            try {
+                b.put(k, new JSONObject(v));
+            } catch (JSONException e) {
+                b.put(k, "unreadable");
+            }
+        }
+        return b;
     }
 
     /* ------------------------------------------------------------------ *
@@ -1937,7 +2344,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (screenshotMode) return;
         screenshotMode = true;
         if (storyMode()) zoom.hold();
-        menuButton.setVisibility(View.GONE);
+        setTabShown(false);
         zoomChip.setVisibility(View.GONE);
         updateFeedBar();                      // hidden while screenshotMode, back afterwards
         setSystemBarsHidden(true);
@@ -1952,13 +2359,21 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         screenshotMode = false;
         if (screenshotShield != null) root.removeView(screenshotShield);
         screenshotShield = null;
-        if (!fullHidTab) menuButton.setVisibility(View.VISIBLE);
+        if (!fullHidTab) setTabShown(true);
         if (customView == null) setSystemBarsHidden(false);
         onZoomChanged(zoom.scale());
         zoom.releaseHold();
         updateFeedBar();
     }
 
+    /**
+     * B26: only the status bar (clock, battery) ever hides. The Android buttons
+     * at the bottom (Back, Home, Recent apps) stay in every full screen (R8/R10,
+     * R9's Reel layer, Instagram's own Stories) and in screenshot mode: hiding
+     * them needs a swipe up from the bottom edge to get them back, and that
+     * swipe reaches the page too. The window keeps its room above the buttons,
+     * so nothing is drawn under them.
+     */
     @SuppressWarnings("deprecation")
     private void setSystemBarsHidden(boolean hidden) {
         if (Build.VERSION.SDK_INT >= 30) {
@@ -1966,15 +2381,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (c == null) return;
             if (hidden) {
                 c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-                c.hide(WindowInsets.Type.systemBars());
+                c.hide(WindowInsets.Type.statusBars());
             } else {
-                c.show(WindowInsets.Type.systemBars());
+                c.show(WindowInsets.Type.statusBars());
             }
         } else {
             View d = getWindow().getDecorView();
-            d.setSystemUiVisibility(hidden
-                    ? View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    : 0);
+            d.setSystemUiVisibility(hidden ? View.SYSTEM_UI_FLAG_FULLSCREEN : 0);
         }
     }
 
@@ -1991,8 +2404,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (target == null) toast("That isn't an Instagram link");
         }
         if (target != null) {
+            startHow = "link";
             loadMain(target);
         } else if (fresh) {
+            startHow = "cold";
             load(web, Links.HOME);
         }
     }
@@ -2074,9 +2489,19 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        lifecycle("start");
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         resumed = false;
+        netWatch.setResumed(false);
+        lifecycle("pause");
+        pauseWatchClock();
+        markHurt("pause");
         setAwake(false);
         web.onPause();
         comments.web().onPause();
@@ -2087,8 +2512,196 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     protected void onResume() {
         super.onResume();
         resumed = true;
+        netWatch.setResumed(true);
+        lifecycle("resume");
+        readRestrictStatus("resume");
+        resumeWatchClock();
         web.onResume();
         comments.web().onResume();
+        if (pendingRecreate) {
+            // The renderer went while the app was away: start over now, on screen.
+            pendingRecreate = false;
+            ui.post(this::recreate);
+            return;
+        }
+        if (deferredSwap != null) {
+            Runnable swap = deferredSwap;
+            deferredSwap = null;
+            ui.post(swap);
+        }
+        if (resumeReload != null) {
+            // The ladder's reload came due while Cam was away: after a moment to settle.
+            Runnable reload = resumeReload;
+            resumeReload = null;
+            if (chain != null) chain.deferred = 0;
+            ui.postDelayed(reload, bootSettleMs);
+        }
+        BootWatch w = watch;
+        if (w != null && w.hurt && !w.booted && !w.stuck && !w.recovering) scheduleResumeRecovery(w);
+    }
+
+    /**
+     * B33: a page that hasn't booted when the app leaves the screen (or its
+     * network is blocked or lost) is marked hurt: its files may have failed or
+     * stalled, which leaves Instagram's logo up for good. Checked on resume.
+     */
+    private void markHurt(String why) {
+        BootWatch w = watch;
+        if (w == null || w.booted) return;
+        w.hurt = true;
+        if (!w.hurtWhy.contains(why) && w.hurtWhy.length() < 60) w.hurtWhy += (w.hurtWhy.isEmpty() ? "" : " ") + why;
+        if (w.log != null) bootOutcome(w, w.log.optString("outcome", "loading"));
+    }
+
+    /**
+     * Recovery on resume for a hurt page: once the network is usable (or a
+     * second has passed with no word from the callback), another second to
+     * settle, then the page is asked whether the logo is still up. If it is,
+     * or the page is WebView's error page, one reload through the watchdog's
+     * budget (never restoreState). No answer: busy, Try again offered, no reload.
+     * A page only a moment into its start shows the logo too (a glance at a
+     * notification 300 ms into a slow boot): the logo counts as stuck only once
+     * the page has had {@link #bootResumeMinShownMs} on screen; until then the
+     * check waits, and the watchdog's cap runs on regardless.
+     */
+    private void scheduleResumeRecovery(BootWatch w) {
+        w.recovering = true;
+        final long since = SystemClock.uptimeMillis();
+        Runnable[] wait = new Runnable[1];
+        wait[0] = () -> {
+            if (watch != w || w.booted || w.stuck || !resumed || isDestroyed()) {
+                w.recovering = false;
+                return;
+            }
+            boolean ok = netWatch.netOk() || (!netWatch.isKnown() && SystemClock.uptimeMillis() - since >= bootSettleMs);
+            if (!ok) {
+                ui.postDelayed(wait[0], 500);        // the watchdog's cap runs on regardless
+                return;
+            }
+            ui.postDelayed(() -> resumeCheck(w, 0), bootSettleMs);
+        };
+        ui.post(wait[0]);
+    }
+
+    private void resumeCheck(BootWatch w, int tries) {
+        if (watch != w || w.booted || w.stuck || !resumed || isDestroyed()) {
+            w.recovering = false;
+            return;
+        }
+        if (reloadGate() != null) {
+            if (tries < 30) ui.postDelayed(() -> resumeCheck(w, tries + 1), bootSettleMs);
+            else w.recovering = false;
+            return;
+        }
+        probe(w, answer -> {
+            w.recovering = false;
+            if (watch != w || w.booted || w.stuck) return;
+            if (answer == null) {
+                w.stuck = true;
+                bootOutcome(w, "busy on resume after " + w.shown() + " ms shown");
+                keepLastStuck(w, "resume", "busy");
+                showBootChip("stuck");
+                return;
+            }
+            w.probe = answer;
+            boolean logo = answer.optBoolean("logo");
+            boolean blank = answer.optInt("kids", -1) == 0 && !"complete".equals(answer.optString("ready"));
+            if (!logo && !answer.optBoolean("error") && !blank) return;     // started after all: the watch goes on
+            if (!answer.optBoolean("error") && w.shown() < bootResumeMinShownMs) {
+                // Too soon to tell a hurt page from a slow start: asked again once it has had its stretch.
+                w.recovering = true;
+                ui.postDelayed(() -> resumeCheck(w, tries), bootResumeMinShownMs - w.shown());
+                return;
+            }
+            w.stuck = true;
+            String rule = answer.optBoolean("error") ? "errorPage" : logo ? "logo" : "blank";
+            bootOutcome(w, "stuck: " + rule + " (resume) after " + w.shown() + " ms shown");
+            keepLastStuck(w, "resume", rule);
+            recover(w, "resume " + rule);
+        });
+    }
+
+    /**
+     * Shown once, never during a start-up (only once a page has booted, or with
+     * the chip up), and only after a stuck page tied to a block, while Data
+     * Saver cuts this app off in the background and the network is metered.
+     */
+    private void maybeShowDataSaverTip() {
+        if (!tipDue || prefs.getBoolean("dataSaverTip", false) || menuOpen || !hasWindowFocus() || isFinishing()) return;
+        if (!"enabled".equals(netWatch.restrictStatus()) || !netWatch.isMetered()) return;
+        tipDue = false;
+        prefs.edit().putBoolean("dataSaverTip", true).putString("dataSaverTipAt", NetWatch.clock()).apply();
+        dialog().setTitle("Data Saver")
+                .setMessage("Data Saver is on, so Android cuts SimpleGram off the moment you switch apps. "
+                        + "That can leave Instagram stuck on its logo. Let SimpleGram use data while Data Saver is on?\n\n"
+                        + "(Android still pauses apps in the background after a while; SimpleGram now reloads by itself when that happens.)")
+                .setPositiveButton("Open settings", (d, which) -> openDataSaverSettings())
+                .setNegativeButton("Not now", null)
+                .show();
+    }
+
+    private void openDataSaverSettings() {
+        Intent i = new Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS, Uri.parse("package:" + getPackageName()));
+        String manual = "Settings → Connections → Data usage → Data saver → Allowed to use data while Data saver is on";
+        try {
+            if (i.resolveActivity(getPackageManager()) == null) {
+                toast(manual);
+                return;
+            }
+            startActivity(i);
+        } catch (RuntimeException e) {
+            toast(manual);
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        // The screen going off stops the Activity too: told apart for the record.
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        boolean off = pm != null && !pm.isInteractive();
+        lifecycle(off ? "screenOff" : "stop");
+        markHurt(off ? "screenOff" : "stop");
+    }
+
+    /**
+     * B33: the ring of pause/resume/stop/start/memory events (times only, kept in
+     * prefs). A page that was loading when the app left the screen is the
+     * likeliest to be stuck on Instagram's logo.
+     */
+    private void lifecycle(String event) {
+        try {
+            ring("lifecycle", 20, new JSONObject().put("ev", event).put("at", NetWatch.clock()));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /**
+     * Data Saver's status for this app, re-read when the app comes back and when
+     * Android says it changed (a protected broadcast: registered here, not in the
+     * manifest). Changes are kept with their times.
+     */
+    private void registerRestrictReceiver() {
+        try {
+            IntentFilter f = new IntentFilter(ConnectivityManager.ACTION_RESTRICT_BACKGROUND_CHANGED);
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(restrictReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+            else registerReceiver(restrictReceiver, f);
+            restrictReceiverOn = true;
+        } catch (RuntimeException ignored) {
+            // Without it the status is still read on every resume.
+        }
+    }
+
+    private void readRestrictStatus(String why) {
+        String now = netWatch.restrictStatus();
+        if (now.equals(prefs.getString("restrictStatus", ""))) return;
+        prefs.edit().putString("restrictStatus", now).apply();
+        try {
+            ring("netStatus", 10, new JSONObject().put("status", now).put("why", why).put("at", NetWatch.clock()));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
     }
 
     @Override
@@ -2120,9 +2733,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (level == TRIM_MEMORY_UI_HIDDEN) return;   // only "the app left the screen"
+        if (level == TRIM_MEMORY_UI_HIDDEN) {         // only "the app left the screen"
+            lifecycle("uiHidden");
+            return;
+        }
         String name = level >= 80 ? "complete" : level >= 60 ? "moderate" : level >= 40 ? "background"
                 : level >= 15 ? "critical" : level >= 10 ? "low" : "running moderate";
+        lifecycle("trim " + name);
         trimLog.add(name + " at " + clock());
         if (trimLog.size() > 10) trimLog.remove(0);
     }
@@ -2130,7 +2747,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     @Override
     protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out);
-        web.saveState(out);
+        if (pendingState != null) out.putAll(pendingState);
+        else web.saveState(out);
     }
 
     @Override
@@ -2139,8 +2757,20 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             ui.removeCallbacks(pendingRebuild);
             pendingRebuild = null;
         }
+        deferredSwap = null;
         rebuilding = false;
+        closeWatch("destroyed");
+        if (statusFallback != null) ui.removeCallbacks(statusFallback);
         downloads.release();
+        netWatch.stop();
+        if (restrictReceiverOn) {
+            restrictReceiverOn = false;
+            try {
+                unregisterReceiver(restrictReceiver);
+            } catch (RuntimeException ignored) {
+                // Already gone.
+            }
+        }
         if (touchLast != null) {
             touchLast.recycle();
             touchLast = null;
@@ -2370,9 +3000,600 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     private void updateStuckChip() {
-        if (stuckChip == null) return;
-        boolean show = stuckChipWanted && customView == null && !pageVideo && !screenshotMode && !zoom.isZoomed();
-        stuckChip.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (stuckChip == null || bootChip == null) return;
+        boolean clear = customView == null && !pageVideo && !screenshotMode && !zoom.isZoomed();
+        boolean boot = !bootChipKind.isEmpty() && clear;
+        if (boot) {
+            boolean offline = "offline".equals(bootChipKind), still = "still".equals(bootChipKind);
+            bootChipText.setText(offline ? "No connection. SimpleGram will reload when you're back online"
+                    : still ? "Still not starting. Check your connection, then Try again." : "Instagram didn't start");
+            // Try again stays on the offline chip too: a wrong word from the network
+            // callback (a stale loss, a VPN) may delay the reload, never leave Cam stuck.
+            bootChipRetry.setVisibility(View.VISIBLE);
+            bootChipPlain.setVisibility(still && (chain == null || !chain.plain) ? View.VISIBLE : View.GONE);
+        }
+        bootChip.setVisibility(boot ? View.VISIBLE : View.GONE);
+        // One chip at a time: B33's has the slot while it is up.
+        stuckChip.setVisibility(!boot && stuckChipWanted && clear ? View.VISIBLE : View.GONE);
+    }
+
+    /* ------------------------------------------------------------------ *
+     * B33: Instagram didn't start
+     * ------------------------------------------------------------------ */
+
+    /**
+     * One main-frame page start on an Instagram host, watched until the page
+     * says Instagram booted (or it is left for another page). Its clock counts
+     * on-screen time only: a page that loads while the app is in the
+     * background is given its 30 s once it is back.
+     */
+    private final class BootWatch {
+        final int seq;
+        final WebView view;
+        final String url, how;
+        final long startedAt = SystemClock.uptimeMillis();
+        long shownMs, shownSince;         // on-screen time so far; when the current stretch began (0 off screen)
+        boolean booted, stuck, hurt, recovering;
+        String hurtWhy = "", pageToken = "";
+        int probeMisses;                  // misses in the current probe round (two make a busy page)
+        JSONObject probe;                 // the app's own probe's last answer
+        JSONObject record;                // the page's latest boot record (shapes only)
+        JSONObject log;                   // its bootLog entry, rewritten as the outcome changes
+
+        BootWatch(WebView view, String url, String how) {
+            // The logs are matched by this number, so it must never repeat: a new
+            // Activity (a recreate, a fresh process) carries on from the last one.
+            seq = prefs.getInt("bootSeq", 0) + 1;
+            prefs.edit().putInt("bootSeq", seq).apply();
+            this.view = view;
+            this.url = url;
+            this.how = how;
+        }
+
+        long shown() {
+            return shownMs + (shownSince == 0 ? 0 : SystemClock.uptimeMillis() - shownSince);
+        }
+    }
+
+    /** The ladder's place for one page: kept across its automatic reloads and Try again rebuilds. */
+    private static final class BootChain {
+        int reloads, tryAgains, deferred;
+        boolean plain;
+    }
+
+    private static boolean isRecoveryStart(String how) {
+        return how.startsWith("reload ") || "Try again".equals(how) || "Load without filters".equals(how);
+    }
+
+    /** Every main-frame page start: the bootLog entry, the watch (Instagram hosts only) and the ladder's chain. */
+    private void onMainPageStarted(WebView view, String url) {
+        String how = !startHow.isEmpty() ? startHow
+                : goBackAt != 0 && SystemClock.uptimeMillis() - goBackAt < 1500 ? "Back" : "page";
+        startHow = "";
+        if (reloadFollow != null) {
+            ui.removeCallbacks(reloadFollow);         // the reload did start a page
+            reloadFollow = null;
+        }
+        if (plainBootOn && !"Load without filters".equals(how)) {
+            // The one load without filters is over (it never said so): back to the normal script.
+            plainBootOn = false;
+            for (Script sc : scripts) registerScript(sc);
+        }
+        closeWatch("left");
+        if (!isRecoveryStart(how)) chain = null;
+        boolean ig = url != null && Links.isInstagram(Uri.parse(url));
+        if (!ig) {
+            watch = null;
+            netWatch.setPageToken(0);
+            try {
+                ring("bootLog", 10, new JSONObject().put("how", how).put("at", NetWatch.clock()).put("outcome", "other host"));
+            } catch (JSONException ignored) {
+                // Not reachable with constant keys.
+            }
+            return;
+        }
+        watch = new BootWatch(view, url, how);
+        netWatch.setPageToken(watch.seq);
+        try {
+            watch.log = new JSONObject().put("seq", watch.seq).put("how", how).put("at", NetWatch.clock())
+                    .put("route", route).put("home", Links.HOME.equals(url) || url.startsWith(Links.HOME + "?"))
+                    .put("resumed", resumed).put("outcome", "loading");
+            if (plainBootOn) watch.log.put("plain", true);
+            ring("bootLog", 10, watch.log);
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+        pendingNetReload = false;
+        resumeReload = null;
+        if (!bootChipKind.isEmpty()) {
+            bootChipKind = "";           // the new page gets its chance
+            updateStuckChip();
+        }
+        if (resumed) {
+            watch.shownSince = SystemClock.uptimeMillis();
+            scheduleWatchTick();
+        }
+    }
+
+    /** The watched page is being left (a new page, a rebuild): its entry gets its outcome. */
+    private void closeWatch(String outcome) {
+        BootWatch w = watch;
+        if (watchTick != null) {
+            ui.removeCallbacks(watchTick);
+            watchTick = null;
+        }
+        if (probeTimeout != null) {
+            ui.removeCallbacks(probeTimeout);
+            probeTimeout = null;
+        }
+        if (w == null) return;
+        if (!w.booted && !w.stuck) bootOutcome(w, outcome + " after " + w.shown() + " ms shown");
+        watch = null;
+    }
+
+    private void bootOutcome(BootWatch w, String outcome) {
+        if (w.log == null) return;
+        try {
+            w.log.put("outcome", outcome);
+            if (w.hurt) w.log.put("hurt", w.hurtWhy);
+            JSONArray old = ringOf("bootLog");
+            JSONArray kept = new JSONArray();
+            boolean found = false;
+            for (int i = 0; i < old.length(); i++) {
+                JSONObject e = old.optJSONObject(i);
+                if (e != null && e.optInt("seq", -1) == w.seq) {
+                    kept.put(w.log);
+                    found = true;
+                } else {
+                    kept.put(old.opt(i));
+                }
+            }
+            if (!found) kept.put(w.log);
+            prefs.edit().putString("bootLog", kept.toString()).apply();
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    private void pauseWatchClock() {
+        BootWatch w = watch;
+        if (w != null && w.shownSince != 0) {
+            w.shownMs += SystemClock.uptimeMillis() - w.shownSince;
+            w.shownSince = 0;
+        }
+        if (watchTick != null) {
+            ui.removeCallbacks(watchTick);
+            watchTick = null;
+        }
+    }
+
+    private void resumeWatchClock() {
+        BootWatch w = watch;
+        if (w == null || w.booted || w.stuck) return;
+        if (w.shownSince == 0) w.shownSince = SystemClock.uptimeMillis();
+        scheduleWatchTick();
+    }
+
+    /** The cap: 30 s of on-screen time with no word from the page. The network state never delays it. */
+    private void scheduleWatchTick() {
+        if (watchTick != null) ui.removeCallbacks(watchTick);
+        watchTick = null;
+        final BootWatch w = watch;
+        if (w == null || w.booted || w.stuck || !resumed) return;
+        Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                if (watchTick == this) watchTick = null;
+                if (watch != w || w.booted || w.stuck || !resumed || isDestroyed()) return;
+                onWatchFired(w);
+            }
+        };
+        watchTick = tick;
+        ui.postDelayed(tick, Math.max(0, bootWatchMs - w.shown()));
+    }
+
+    /**
+     * The page's token: its own per-document id, adopted from its first boot
+     * message. A message with another token is from another document (one
+     * already left) and must never act on this page. Nor may a late message
+     * from the old document be taken for the new one's first: a "stuck" or a
+     * record within the first second of a start (no rule fires that soon), or
+     * a "booted" that took longer than the page has existed, is left aside.
+     */
+    private boolean pageTokenOk(BootWatch w, JSONObject m, long minAgeMs) {
+        String token = m.optString("token", "");
+        long age = SystemClock.uptimeMillis() - w.startedAt;
+        if (!w.pageToken.isEmpty()) {
+            if (token.equals(w.pageToken)) return true;
+            bootLate++;
+            return false;
+        }
+        if (age < minAgeMs || (m.has("ms") && m.optLong("ms") > age + 1000)) {
+            bootLate++;
+            return false;
+        }
+        w.pageToken = token;
+        return true;
+    }
+
+    private void onBoot(JSONObject m) {
+        BootWatch w = watch;
+        if (w == null || w.booted || !pageTokenOk(w, m, 0)) return;
+        w.booted = true;
+        if (watchTick != null) {
+            ui.removeCallbacks(watchTick);
+            watchTick = null;
+        }
+        String how = m.optString("how", "");
+        bootOutcome(w, "booted in " + Math.max(0, Math.min(600_000, m.optLong("ms"))) + " ms (" + (how.length() > 12 ? "?" : how) + ")");
+        chain = null;
+        pendingNetReload = false;
+        resumeReload = null;
+        if (!bootChipKind.isEmpty()) {
+            bootChipKind = "";
+            updateStuckChip();
+        }
+        if (plainBootOn) {
+            // The one load without filters has started: the next page is a normal one.
+            plainBootOn = false;
+            for (Script s : scripts) registerScript(s);
+        }
+        maybeShowDataSaverTip();
+    }
+
+    private void onBootStuck(JSONObject m) {
+        BootWatch w = watch;
+        if (w == null || w.booted || !pageTokenOk(w, m, 1000)) return;
+        String rule = m.optString("rule", "?");
+        if (rule.length() > 24) rule = rule.substring(0, 24);
+        JSONObject record = capped(m.optJSONObject("record"));
+        if (record != null) w.record = record;
+        if (w.stuck) {
+            // The app's own probe spoke first (its cap and the page's rule (c) share
+            // the 30 s mark): the ladder is already running, but the page's record is
+            // the fuller evidence, so it joins what was kept.
+            String after = w.probe != null ? "after probe" : "after busy";
+            bootOutcome(w, "stuck: " + rule + " (page, " + after + ") after " + w.shown() + " ms shown");
+            keepLastStuck(w, "page " + after, rule);
+            return;
+        }
+        w.stuck = true;
+        bootOutcome(w, "stuck: " + rule + " after " + w.shown() + " ms shown");
+        keepLastStuck(w, "page", rule);
+        recover(w, "page " + rule);
+    }
+
+    private void onBootRecord(JSONObject m) {
+        BootWatch w = watch;
+        if (w == null || !pageTokenOk(w, m, 1000)) return;
+        w.record = capped(m.optJSONObject("record"));
+    }
+
+    /** The page's record, as sent (shapes and counts by design), but never a large one. */
+    private static JSONObject capped(JSONObject record) {
+        if (record == null || record.toString().length() > 6000) return null;
+        return record;
+    }
+
+    /** The stuck page's state (the page's record, the app's probe, or both), kept in prefs for Copy details. */
+    private void keepLastStuck(BootWatch w, String from, String rule) {
+        try {
+            JSONObject e = new JSONObject().put("from", from).put("rule", rule).put("at", NetWatch.clock())
+                    .put("seq", w.seq).put("how", w.how).put("shownMs", w.shown()).put("hurt", w.hurtWhy)
+                    .put("resumed", resumed).put("netOk", netWatch.netOk());
+            if (w.probe != null) e.put("probe", w.probe);
+            if (w.record != null) e.put("record", w.record);
+            prefs.edit().putString("lastStuck", e.toString()).apply();
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    // What the app can see of a page without its script: the logo and whether
+    // it is shown, the document's state, Instagram's loader, the host (never the
+    // address), and whether the page is WebView's error page.
+    private static final String PROBE = "(function(){try{var s=document.getElementById('splash-screen');"
+            + "return JSON.stringify({splash:!!s,logo:!!s&&getComputedStyle(s).display!=='none',ready:document.readyState,"
+            + "req:typeof require,d:typeof window.__d,dLen:(window.__d&&window.__d.length)||0,"
+            + "kids:document.body?document.body.children.length:-1,host:String(location.host).slice(0,40),"
+            + "error:String(location.href).indexOf('chrome-error')===0,sg:!!window.__sg})}"
+            + "catch(e){return JSON.stringify({err:String(e).slice(0,60)})}})()";
+
+    /** The cap passed with no word from the page: ask the page itself. */
+    private void onWatchFired(BootWatch w) {
+        probe(w, answer -> {
+            if (watch != w || w.booted || w.stuck) return;
+            if (answer == null) {
+                // No answer twice: a page too busy to speak. Recorded; Cam decides.
+                w.stuck = true;
+                bootOutcome(w, "busy after " + w.shown() + " ms shown");
+                keepLastStuck(w, "probe", "busy");
+                showBootChip("stuck");
+                return;
+            }
+            w.probe = answer;
+            boolean logo = answer.optBoolean("logo");
+            boolean blank = answer.optInt("kids", -1) == 0 && !"complete".equals(answer.optString("ready"));
+            if (!logo && !answer.optBoolean("error") && !blank && !answer.has("err")) {
+                // Booted without a word (the page script didn't run, or its message was lost).
+                w.booted = true;
+                bootOutcome(w, "booted quietly (probe) after " + w.shown() + " ms shown");
+                chain = null;
+                return;
+            }
+            w.stuck = true;
+            String rule = answer.optBoolean("error") ? "errorPage" : logo ? "logo" : blank ? "blank" : "probeError";
+            bootOutcome(w, "stuck: " + rule + " (probe) after " + w.shown() + " ms shown");
+            keepLastStuck(w, "probe", rule);
+            recover(w, "probe " + rule);
+        });
+    }
+
+    /** Asks the page about itself; null after two misses of {@code bootProbeMs} in this round. */
+    private void probe(BootWatch w, ValueCallback<JSONObject> cb) {
+        w.probeMisses = 0;              // a miss in an earlier round (one the page answered) doesn't count
+        probeOnce(w, cb);
+    }
+
+    private void probeOnce(BootWatch w, ValueCallback<JSONObject> cb) {
+        if (w.view != web || isDestroyed()) return;
+        final boolean[] done = {false};
+        Runnable timeout = () -> {
+            if (done[0]) return;
+            done[0] = true;
+            probeTimeout = null;
+            w.probeMisses++;
+            if (w.probeMisses >= 2) {
+                cb.onReceiveValue(null);
+            } else {
+                probeOnce(w, cb);
+            }
+        };
+        probeTimeout = timeout;
+        try {
+            w.view.evaluateJavascript(PROBE, v -> {
+                if (done[0]) return;
+                done[0] = true;
+                ui.removeCallbacks(timeout);
+                probeTimeout = null;
+                cb.onReceiveValue(parseProbe(v));
+            });
+        } catch (RuntimeException e) {
+            // A view already destroyed answers nothing.
+        }
+        ui.postDelayed(timeout, bootProbeMs);
+    }
+
+    private static JSONObject parseProbe(String v) {
+        try {
+            Object o = v == null ? null : new JSONTokener(v).nextValue();
+            if (o instanceof String) return new JSONObject((String) o);
+        } catch (JSONException ignored) {
+            // Fall through: an answer that isn't the probe's.
+        }
+        try {
+            return new JSONObject().put("err", "unreadable");
+        } catch (JSONException e) {
+            return new JSONObject();
+        }
+    }
+
+    /**
+     * The recovery ladder for a page that didn't start; each step is recorded
+     * before it runs. 1: one automatic reload per page (at most two per ten
+     * minutes); offline, it waits for the network. 2: the chip, with Try again (a
+     * new page view) and Details. 3: the same chip with a load without
+     * SimpleGram's filters. Never a reload while a dialog, a full screen,
+     * screenshot mode, the comments or a focused field is up.
+     */
+    private void recover(BootWatch w, String why) {
+        if (watch != w || w.booted || isDestroyed()) return;
+        if (chain == null) chain = new BootChain();
+        if (w.hurt) tipDue = true;        // a stuck page tied to a block
+        if (chain.tryAgains > 0) {
+            showBootChip("still");
+        } else if (chain.reloads > 0) {
+            showBootChip("stuck");
+        } else if (!netWatch.netOk()) {
+            pendingNetReload = true;
+            logReload("wait " + why, 1);
+            showBootChip("offline");
+        } else {
+            autoReload(w, why);
+        }
+    }
+
+    /** NetWatch: the network became usable, or stopped being. */
+    private void onNetOk(boolean ok) {
+        BootWatch w = watch;
+        if (!ok) {
+            markHurt("netLost");
+            return;
+        }
+        if (!pendingNetReload || w == null || w.booted) return;
+        pendingNetReload = false;
+        tipDue = true;                    // an automatic reload after an unblock
+        autoReload(w, "online");
+    }
+
+    /** Why an automatic reload must wait, or null. */
+    private String reloadGate() {
+        if (!resumed) return "paused";
+        if (menuOpen || !hasWindowFocus()) return "dialog";
+        if (customView != null) return "fullScreen";
+        if (pageVideo) return "pageVideo";
+        if (screenshotMode) return "screenshot";
+        if (comments.isOpen() || zoom.isSplit()) return "comments";
+        if (searchOpen) return "search";
+        if (keyboardUp()) return "typing";
+        if (rebuilding) return "rebuilding";
+        return null;
+    }
+
+    /** A text field has the keyboard (the page's input connection, or the window shrunk for it). */
+    private boolean keyboardUp() {
+        InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null && imm.isAcceptingText() && web.hasFocus()) return true;
+        return fullHeight > 0 && root.getHeight() < fullHeight * 0.8f;
+    }
+
+    /** Step 1: the one automatic reload, through the budget and the gate. */
+    private void autoReload(BootWatch w, String why) {
+        if (watch != w || w.booted || isDestroyed()) return;
+        if (chain == null) chain = new BootChain();
+        String gate = reloadGate();
+        if ("paused".equals(gate)) {
+            // Off screen: a page started now would load with the network blocked, and
+            // half a minute away must not end in the chip. The reload waits for the
+            // next onResume, which runs the ladder again (offline, it waits for the
+            // network as before).
+            if (resumeReload == null) logReload("wait paused " + why, 1);
+            resumeReload = () -> recover(w, why);
+            return;
+        }
+        if (gate != null) {
+            // Not now: again in a moment, for up to half a minute; then the chip.
+            if (chain.deferred++ < 30) {
+                ui.postDelayed(() -> autoReload(w, why), bootSettleMs);
+                return;
+            }
+            logReload("held " + gate + " " + why, 1);
+            showBootChip("stuck");
+            return;
+        }
+        if (!takeReloadBudget()) {
+            logReload("budget " + why, 1);
+            showBootChip("stuck");
+            return;
+        }
+        chain.reloads++;
+        logReload("reload " + why, 1);
+        startsReload++;
+        goBackAt = 0;
+        startHow = "reload " + why;
+        w.view.reload();
+        // A reload that starts no page in time: the address from the page start
+        // instead (not loadMain, which closes the comments).
+        final int seq = w.seq;
+        reloadFollow = () -> {
+            reloadFollow = null;
+            if (watch != w || w.seq != seq || isDestroyed()) return;
+            logReload("loadUrl " + why, 1);
+            startHow = "reload " + why;
+            w.view.loadUrl(w.url);
+        };
+        ui.postDelayed(reloadFollow, bootReloadFollowMs);
+    }
+
+    /** Two automatic reloads per ten minutes, however many pages (kept in prefs). */
+    private boolean takeReloadBudget() {
+        long now = System.currentTimeMillis();
+        JSONArray old = ringOf("autoReloads");
+        JSONArray kept = new JSONArray();
+        for (int i = 0; i < old.length(); i++) {
+            long t = old.optLong(i);
+            if (t > 0 && now - t < 10 * 60_000L) kept.put(t);
+        }
+        if (kept.length() >= RELOADS_PER_10_MIN) return false;
+        kept.put(now);
+        prefs.edit().putString("autoReloads", kept.toString()).apply();
+        return true;
+    }
+
+    private void logReload(String what, int step) {
+        try {
+            ring("reloadLog", 10, new JSONObject().put("what", what).put("step", step).put("at", NetWatch.clock())
+                    .put("seq", watch == null ? 0 : watch.seq).put("route", route).put("netOk", netWatch.netOk())
+                    .put("resumed", resumed));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    private void showBootChip(String kind) {
+        if (!kind.equals(bootChipKind)) bootChipsShown++;
+        bootChipKind = kind;
+        updateStuckChip();
+        if (!"offline".equals(kind)) maybeShowDataSaverTip();
+    }
+
+    /** "Instagram didn't start": Try again (a new page view), Details, and later a load without filters. */
+    private android.widget.LinearLayout makeBootChip() {
+        android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(dp(16), dp(10), dp(16), dp(10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xF2262626);
+        bg.setCornerRadius(dp(18));
+        box.setBackground(bg);
+        box.setElevation(dp(8));
+        box.setClickable(true);           // solid: a tap on it never reaches the page
+        box.setContentDescription("Instagram didn't start");
+        bootChipText = new TextView(this);
+        bootChipText.setTextColor(Color.WHITE);
+        bootChipText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        bootChipText.setTypeface(Typeface.DEFAULT_BOLD);
+        bootChipText.setGravity(Gravity.CENTER);
+        box.addView(bootChipText);
+        android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+        row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_HORIZONTAL);
+        row.setPadding(0, dp(8), 0, 0);
+        bootChipRetry = chipButton("Try again", this::tryAgain);
+        row.addView(bootChipRetry);
+        row.addView(chipButton("Details", () -> askStatus(true)));
+        bootChipPlain = chipButton("Load without filters", this::loadWithoutFilters);
+        row.addView(bootChipPlain);
+        box.addView(row);
+        box.setVisibility(View.GONE);
+        return box;
+    }
+
+    private TextView chipButton(String label, Runnable action) {
+        TextView b = new TextView(this);
+        b.setText(label);
+        b.setContentDescription(label);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(12), dp(7), dp(12), dp(7));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFF0095F6);
+        bg.setCornerRadius(dp(10));
+        b.setBackground(bg);
+        android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = lp.rightMargin = dp(4);
+        b.setLayoutParams(lp);
+        b.setOnClickListener(v -> action.run());
+        return b;
+    }
+
+    /** Step 2's button: a new page view, loaded from the address (never restoreState: that is what failed). */
+    private void tryAgain() {
+        if (rebuilding) return;           // a second tap while the first is under way
+        if (chain == null) chain = new BootChain();
+        chain.tryAgains++;
+        String chip = bootChipKind;       // for the rebuild log: the chip Cam answered
+        bootChipKind = "";
+        updateStuckChip();
+        rebuildWebView("Try again", chip);
+    }
+
+    /** Step 3's button: one load with the page script's data hooks and boot-time DOM rules off. */
+    private void loadWithoutFilters() {
+        if (rebuilding) return;
+        if (chain == null) chain = new BootChain();
+        chain.plain = true;
+        chain.tryAgains++;
+        String chip = bootChipKind;
+        bootChipKind = "";
+        updateStuckChip();
+        prefs.edit().putInt("plainBoots", prefs.getInt("plainBoots", 0) + 1).apply();
+        plainBootOn = true;
+        rebuildWebView("Load without filters", chip);
     }
 
     /**
@@ -2443,50 +3664,134 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     /** ⋮ → Fix scrolling. */
     private void fixScrolling() {
         manualFix++;
+        String chip = chipNow();
         stuckChipWanted = false;
         updateStuckChip();
-        rebuildWebView();
+        rebuildWebView("Fix scrolling", chip);
+    }
+
+    /** B25's chip (B25Test asks for a rebuild through this too). */
+    private void rebuildWebView() {
+        rebuildWebView("Scrolling chip", "scroll");
+    }
+
+    /** Which chip is up: B33's kind, B25's "scroll", or none. */
+    private String chipNow() {
+        return !bootChipKind.isEmpty() ? bootChipKind : stuckChipWanted ? "scroll" : "";
     }
 
     /**
      * A new main WebView in the old one's place: the only thing that clears
-     * the web engine's stuck touch state. The page's search screen is read
-     * first and handed to the new page; the rest comes back from the saved
-     * history (or the address).
+     * the web engine's stuck touch state, and B33's fresh start. The page's
+     * search screen and its boot record are read first (the search screen is
+     * handed to the new page; the record is kept, so the evidence of a page
+     * stuck on the logo doesn't go with it); the rest comes back from the saved
+     * history, or from the address for Try again. The rebuild is logged with
+     * why it was chosen and what was up ({@code chip}: the one Cam answered,
+     * read before the tap took it down). A swap due while the app is off
+     * screen waits for the next onResume (its page would load blocked).
      */
-    private void rebuildWebView() {
+    private void rebuildWebView(String why, String chip) {
         if (rebuilding || isFinishing()) return;
         rebuilding = true;
+        final JSONObject entry = rebuildEntry(why, chip);
+        final long asked = SystemClock.uptimeMillis();
         final boolean[] done = {false};
-        Runnable go = () -> {
-            if (done[0]) return;
-            done[0] = true;
-            pendingRebuild = null;
-            swapWebView();
+        final long[] answered = {-1};
+        Runnable go = new Runnable() {
+            @Override
+            public void run() {
+                if (done[0] || isDestroyed()) return;
+                if (!resumed) {
+                    pendingRebuild = null;
+                    deferredSwap = this;
+                    return;
+                }
+                done[0] = true;
+                pendingRebuild = null;
+                deferredSwap = null;
+                try {
+                    entry.put("answered", answered[0] >= 0).put("answerMs", answered[0]);
+                } catch (JSONException ignored) {
+                    // Not reachable with constant keys.
+                }
+                ring("rebuildLog", 5, entry);
+                swapWebView(why);
+            }
         };
-        web.evaluateJavascript("(function(){try{return window.__sg&&window.__sg.searchState?window.__sg.searchState():null}catch(e){return null}})()",
-                v -> {
-                    if (done[0] || isDestroyed()) return;
-                    searchHandBack = parseSearchState(v);
-                    searchHandBackUntil = SystemClock.uptimeMillis() + 30_000L;
-                    ui.post(go);         // not from inside the old WebView's own callback
-                });
-        // A page too busy to answer is rebuilt without its search screen.
+        web.evaluateJavascript(READ_OLD_PAGE, v -> {
+            if (done[0] || isDestroyed()) return;
+            answered[0] = SystemClock.uptimeMillis() - asked;
+            JSONObject old = parseOldPage(v);
+            searchHandBack = searchStateOf(old == null ? null : old.opt("search"));
+            searchHandBackUntil = SystemClock.uptimeMillis() + 30_000L;
+            keepRebuildRecord(why, old == null ? null : old.opt("boot"));
+            ui.post(go);         // not from inside the old WebView's own callback
+        });
+        // A page too busy to answer is rebuilt without its search screen or record.
         pendingRebuild = go;
         ui.postDelayed(go, 700);
     }
 
+    // The old page's search screen and boot record, read in one go before it is destroyed.
+    private static final String READ_OLD_PAGE = "(function(){var r={};"
+            + "try{r.search=window.__sg&&window.__sg.searchState?window.__sg.searchState():null}catch(e){r.search=null}"
+            + "try{r.boot=window.__sg&&window.__sg.bootRecord?window.__sg.bootRecord():null}catch(e){r.boot=null}"
+            + "try{return JSON.stringify(r)}catch(e){return null}})()";
+
+    /** What was up when a rebuild was chosen (kinds only). */
+    private JSONObject rebuildEntry(String why, String chip) {
+        JSONObject e = new JSONObject();
+        try {
+            BootWatch w = watch;
+            e.put("why", why).put("at", NetWatch.clock()).put("route", route)
+                    .put("logoUp", w != null && !w.booted).put("stuck", w != null && w.stuck)
+                    .put("fullScreen", customView != null || pageVideo)
+                    .put("chip", chip)
+                    .put("seq", w == null ? 0 : w.seq).put("resumed", resumed);
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+        return e;
+    }
+
     private long searchHandBackUntil;
 
-    private static JSONObject parseSearchState(String v) {
+    private static JSONObject parseOldPage(String v) {
         if (v == null || "null".equals(v)) return null;
         try {
             Object o = new JSONTokener(v).nextValue();
-            if (!(o instanceof String)) return null;
-            JSONObject st = new JSONObject((String) o);
-            return st.optBoolean("open") || st.optBoolean("suspended") ? st : null;
+            return o instanceof String ? new JSONObject((String) o) : null;
         } catch (JSONException e) {
             return null;
+        }
+    }
+
+    /** The page's search state: an object, or the JSON text of one; only when it has something to hand back. */
+    private static JSONObject searchStateOf(Object o) {
+        try {
+            JSONObject st = o instanceof JSONObject ? (JSONObject) o
+                    : o instanceof String ? new JSONObject((String) o) : null;
+            return st != null && (st.optBoolean("open") || st.optBoolean("suspended")) ? st : null;
+        } catch (JSONException e) {
+            return null;
+        }
+    }
+
+    /** The old page's boot record (shapes only), kept in prefs for Copy details. */
+    private void keepRebuildRecord(String why, Object o) {
+        JSONObject record = null;
+        try {
+            record = o instanceof JSONObject ? (JSONObject) o : o instanceof String ? new JSONObject((String) o) : null;
+        } catch (JSONException ignored) {
+            // Not a record.
+        }
+        if (record == null || record.toString().length() > 6000) return;
+        try {
+            prefs.edit().putString("rebuildRecord", new JSONObject().put("why", why).put("at", NetWatch.clock())
+                    .put("seq", watch == null ? 0 : watch.seq).put("record", record).toString()).apply();
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
         }
     }
 
@@ -2502,12 +3807,17 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
     }
 
-    private void swapWebView() {
+    private void swapWebView(String why) {
         // A swap queued before the Activity went away would leave a WebView nobody destroys.
         if (isFinishing() || isDestroyed()) {
             rebuilding = false;
             return;
         }
+        // B33: Try again (and the load without filters) start from the address:
+        // restoring the history is what just failed.
+        boolean fromAddress = "Try again".equals(why) || "Load without filters".equals(why);
+        String watched = watch == null ? null : watch.url;
+        closeWatch("rebuilt");
         // Nothing that belongs to the old page view stays up.
         if (screenshotMode) exitScreenshot();
         if (customView != null) hideCustomView("rebuild");
@@ -2558,13 +3868,17 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         updateFeedBar();
         onZoomChanged(zoom.scale());
 
-        boolean restored = saved && fresh.restoreState(state) != null;
+        startHow = "rebuild restore";
+        boolean restored = !fromAddress && saved && fresh.restoreState(state) != null;
         if (restored) {
             // The restore's own onPageStarted adds it to startsAll: credit it to the app.
             startsLoadUrl++;
             goBackAt = 0;
         } else {
-            load(fresh, url != null && Links.isInstagram(Uri.parse(url)) ? url : Links.HOME);
+            startHow = fromAddress ? why : "rebuild loadUrl";
+            String target = url != null && Links.isInstagram(Uri.parse(url)) ? url
+                    : watched != null ? watched : Links.HOME;
+            load(fresh, target);
         }
         rebuilding = false;
     }
