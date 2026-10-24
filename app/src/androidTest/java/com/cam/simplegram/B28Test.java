@@ -233,10 +233,17 @@ public class B28Test {
         }
     }
 
+    /**
+     * A touch through the system's input pipeline. UiAutomation may inject into
+     * any window; Instrumentation's own injection is refused whenever the
+     * window under the finger isn't the app's (Android's starting window on a
+     * slow emulator, the moment after a full-screen switch), which has nothing
+     * to do with what is under test.
+     */
     void send(long down, int action, float x, float y) {
         MotionEvent e = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, x, y, 0);
         e.setSource(InputDevice.SOURCE_TOUCHSCREEN);
-        inst.sendPointerSync(e);
+        if (!inst.getUiAutomation().injectInputEvent(e, true)) inst.sendPointerSync(e);
         e.recycle();
     }
 

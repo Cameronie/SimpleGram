@@ -6,6 +6,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import android.app.Instrumentation;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -104,6 +105,34 @@ public class ShellTest {
         Method m = MainActivity.class.getDeclaredMethod(name, types);
         m.setAccessible(true);
         return m.invoke(a, args);
+    }
+
+    /**
+     * A Back key through the system. Right after a window change (a full-screen
+     * view going up, the status bar hiding) the window manager has no focused
+     * window for a moment and refuses the key as if it were for another app;
+     * a real press a moment later lands, so this one tries again too.
+     */
+    private static void pressBack() {
+        Instrumentation inst = InstrumentationRegistry.getInstrumentation();
+        long t = SystemClock.uptimeMillis();
+        KeyEvent down = new KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0);
+        KeyEvent up = new KeyEvent(t, t + 30, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK, 0);
+        // UiAutomation may inject into any window; the plain way is refused while
+        // the window manager has no focused window.
+        if (!inst.getUiAutomation().injectInputEvent(down, true) || !inst.getUiAutomation().injectInputEvent(up, true)) {
+            SecurityException last = null;
+            for (int i = 0; i < 20; i++) {
+                try {
+                    inst.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
+                    return;
+                } catch (SecurityException e) {
+                    last = e;
+                    SystemClock.sleep(250);
+                }
+            }
+            throw last;
+        }
     }
 
     private static void idle() {
@@ -1011,14 +1040,14 @@ public class ShellTest {
                 s.onActivity(a -> f[0] = a.hasWindowFocus());
                 return f[0];
             }, 45000));
-            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
+            pressBack();
             idle();
             assertEquals("Back never reached the full-screen view", 0, eaten[0]);
             assertFalse("the Story's full screen stays", hidden[0]);
             assertNotNull(story.getParent());
             assertEquals(View.VISIBLE, menuTab(act.get()).getVisibility());
             // The next Back ends the Story's full screen through the app.
-            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
+            pressBack();
             idle();
             assertTrue(hidden[0]);
             assertEquals(0, eaten[0]);
