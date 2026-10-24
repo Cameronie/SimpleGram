@@ -5272,7 +5272,8 @@
   // The event's own time (when the finger lifted) is far behind now.
   function staleTouch(e) {
     const lag = performance.now() - e.timeStamp;
-    return lag > R8_STALE_MS && lag < 60000;
+    // CFG.touchStaleMs: the on-device tests on a slow emulator raise the limit.
+    return lag > (CFG.touchStaleMs || R8_STALE_MS) && lag < 60000;
   }
   // The one way SimpleGram leaves a full screen it is in. The app does it as Back
   // does, its full-screen view first and then the browser, so a finger already

@@ -227,6 +227,9 @@ public class B28Test {
         // without them R10 uses the video's own full screen, which this doesn't cover.
         assumeTrue("needs the Popover API (WebView 114 or later) for page mode",
                 "function".equals(jsText("typeof HTMLElement.prototype.showPopover")));
+        // R10 ignores a tap whose touch is older than R8_STALE_MS (400 ms) by the time
+        // the click arrives; the emulator takes over a second to deliver one.
+        js("window.__sg.cfg.touchStaleMs=5000");
     }
 
     int[] webOnScreen() {

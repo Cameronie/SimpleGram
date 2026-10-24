@@ -22,6 +22,11 @@ only, never names, captions or links.
    screen. A tap just beside it does nothing either (the dead zone). Drag the
    tab somewhere else: the zone moves with it.
 6. Stories and screenshot mode keep the Android buttons too.
+6b. **Swipe up on a video as the very first touch** after opening the app (no
+   tap first), and again right after closing the comments panel: it should go
+   full screen. A current web view refuses that unless SimpleGram has given the
+   page focus first; 1.5 does (Copy details `page.diag.fullVideo.r8FailWhy`
+   would say `not granted` if not).
 
 ## Story Reels (B29, B30)
 

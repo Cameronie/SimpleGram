@@ -93,3 +93,23 @@ The emulator image's WebView is 74. To run the probe on a current one:
 2. Boot `sg29` normally. Then: `adb root`, push the APK to `/data/local/tmp/wv/webview.apk`, `setenforce 0`, `chcon -R u:object_r:system_file:s0 /data/local/tmp/wv`, `mount -o bind /data/local/tmp/wv /system/product/app/webview`, then `stop; start`. `dumpsys webviewupdate` should then show 158. The mount lasts until the emulator stops.
 3. Don't use `-writable-system` with `adb disable-verity`: the emulator stopped booting, and only deleting the AVD's `*.qcow2` overlays brought it back.
 4. `adb shell am instrument -w -r -e probe 1 -e class com.cam.simplegram.B28Probe#box com.cam.simplegram.test/androidx.test.runner.AndroidJUnitRunner`. Screenshots are in `/sdcard/Android/data/com.cam.simplegram/files/b28/`.
+
+## A current WebView's focus rule (found with the 1.5 device tests)
+
+On the emulator with WebView 158, R8's swipe never opened full screen: the page's
+request came back `not granted` while a tap (R10) worked. Chromium's browser side
+(`RenderFrameHostImpl::EnterFullscreen`) rejects a request from a WebView that
+doesn't hold Android's view focus (`SuppressFullscreenFromUnfocusedView`, stable,
+crbug 40052279); the page's own gesture check had passed, which is why the error
+isn't "API can only be initiated by a user gesture". Two Android facts make the
+WebView unfocused: an app targeting Android 9 or later gets no focused view at
+start while in touch mode (`ViewRootImpl` assigns none), and a swipe never
+focuses the WebView (Chromium leaves WebView out of its focus-on-touch-down
+workaround, so only a tap focuses it). So on a phone with a current WebView,
+swiping a video up as the very first touch after opening the app, or right after
+the comments panel (whose own WebView takes the focus) closed, would do nothing.
+The old emulator WebView (74) had no such rule, which is why the tests passed
+there. Fix in 1.5: the WebView takes focus in `onCreate`, after a full screen
+ends, when the comments panel closes and on resume when nothing holds the focus
+(`focusWeb`). Checked by `dumpsys activity top` (the `F` flag) and by B25Test's
+R8 cases on WebView 158.

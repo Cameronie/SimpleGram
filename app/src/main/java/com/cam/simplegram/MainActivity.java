@@ -311,6 +311,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         root.addView(menuButton, new FrameLayout.LayoutParams(dp(TAB_W), dp(TAB_H)));
 
         setContentView(root);
+        // Chromium (WebView 130 or so and later) refuses a page's full-screen
+        // request ("not granted") unless the WebView itself holds Android's view
+        // focus. An app targeting Android 9+ starts with no focused view in touch
+        // mode, and a swipe never focuses the WebView (a tap does), so R8's swipe
+        // would be refused until the first tap. The WebView takes focus now and
+        // whenever nothing else has it (focusWeb).
+        web.requestFocus();
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> onRootLayout(r - l, b - t));
         guardEdgeToEdge();
 
@@ -811,6 +818,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (!screenshotMode) setSystemBarsHidden(false);
             if (customViewCallback != null) customViewCallback.onCustomViewHidden();
             customViewCallback = null;
+            focusWeb();                                  // the next full screen needs it focused
             if (zoom.isHolding()) cancelHoldTo(web);
             // R12: comments that were up over the Story's full screen go with it.
             if (commentsOverFull) closeComments();
@@ -1364,11 +1372,25 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         closeComments();
     }
 
+    /**
+     * The main WebView takes Android's view focus when no view holds it. Chromium
+     * grants a page's full-screen request only to a focused WebView (see
+     * onCreate); a tap focuses it on its own, a swipe doesn't, and the comments
+     * panel's WebView takes the focus with it while it is up.
+     */
+    private void focusWeb() {
+        if (web == null || customView != null) return;
+        if (getCurrentFocus() == null) web.requestFocus();
+    }
+
     private void closeComments() {
         if (!comments.isOpen()) return;
         InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(root.getWindowToken(), 0);
         comments.close();
+        // The panel's WebView had the focus and keeps it while the panel slides
+        // away; the main WebView takes it back now (see focusWeb).
+        if (customView == null) web.requestFocus();
         if (commentsOverFull) {
             commentsOverFull = false;
             comments.setTranslationZ(0f);
@@ -2518,6 +2540,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         resumeWatchClock();
         web.onResume();
         comments.web().onResume();
+        focusWeb();
         if (pendingRecreate) {
             // The renderer went while the app was away: start over now, on screen.
             pendingRecreate = false;
