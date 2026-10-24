@@ -107,7 +107,21 @@ public class B25Test {
         AtomicReference<MainActivity> a = new AtomicReference<>();
         scenario.onActivity(a::set);
         act = a.get();
-        SystemClock.sleep(1500);
+        waitForWindow();
+    }
+
+    /**
+     * A touch sent while Android's starting window still covers the app lands
+     * in that (system) window and is refused. On a slow emulator the app's own
+     * window can take ten seconds or more to come up.
+     */
+    void waitForWindow() {
+        boolean[] f = new boolean[1];
+        waitFor(() -> {
+            inst.runOnMainSync(() -> f[0] = act.hasWindowFocus());
+            return f[0] && web().getWidth() > 0;
+        }, 45000, "the app's window to take focus");
+        SystemClock.sleep(800);
     }
 
     @After

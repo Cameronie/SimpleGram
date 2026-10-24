@@ -1005,6 +1005,12 @@ public class ShellTest {
             idle();
             assertTrue("the stand-in has focus", story.hasFocus());
             assertEquals(View.GONE, menuTab(act.get()).getVisibility());
+            // A key sent while Android's starting window still covers the app is refused.
+            assertTrue("the app's window has focus", waitFor(() -> {
+                boolean[] f = new boolean[1];
+                s.onActivity(a -> f[0] = a.hasWindowFocus());
+                return f[0];
+            }, 45000));
             InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
             idle();
             assertEquals("Back never reached the full-screen view", 0, eaten[0]);
