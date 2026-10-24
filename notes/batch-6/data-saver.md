@@ -41,7 +41,7 @@ workflow results; nothing was run on a device.
    runs only when the app holds `ACCESS_NETWORK_STATE`; SimpleGram holds only
    `INTERNET`. So `navigator.onLine` is meaningless and there are no
    online/offline events.
-7. **The APIs.** `getRestrictBackgroundStatus()` (no permission) reports the
+7. **The APIs.** `getRestrictBackgroundStatus()` (needs `ACCESS_NETWORK_STATE`: the service enforces it even though the method carries no annotation; without it the call throws `SecurityException`) reports the
    policy: DISABLED, ENABLED (Data Saver on and not exempt, or the app's own
    "background data" switch off), WHITELISTED (exempt). It says nothing about
    now. `registerDefaultNetworkCallback` with `onBlockedStatusChanged`
@@ -73,61 +73,87 @@ workflow results; nothing was run on a device.
 
 ## Design for 1.5 (stream A; refines plan.md's B33 native half)
 
-1. Add `ACCESS_NETWORK_STATE` to the manifest. **Side effect to test on the
-   emulator (WebView 158):** WebView's network-change notifier starts, so
-   `navigator.onLine` and online/offline events become live and Instagram's
-   code may react to them. The page's boot record notes every `online`/
-   `offline` event. If Instagram's start changes for the worse, keep the
-   permission (the callbacks need it) but check what the page does with the
-   events.
+**Read this before the plan's B33 section: a reviewer corrected the first
+draft, and these points win.**
+
+1. Add `ACCESS_NETWORK_STATE` to the manifest. Every ConnectivityManager call
+   (`getRestrictBackgroundStatus`, `getActiveNetwork`, the callbacks) goes
+   inside `try/catch (SecurityException | RuntimeException)` and records
+   `error` when it throws. **Side effect to test on the emulator (WebView
+   158):** WebView's network-change notifier starts, so `navigator.onLine`
+   and online/offline events become live, and DNS failures while blocked may
+   read `ERR_INTERNET_DISCONNECTED` instead of `ERR_NAME_NOT_RESOLVED`. The
+   page's boot record notes every `online`/`offline` event. Release check:
+   `adb shell cmd netpolicy set restrict-background true` on the emulator's
+   (metered) cellular network, send the app to the background during a local
+   page load, come back; confirm the lifecycle recovery below and that nothing
+   loops.
 2. `NetWatch`, a small class owned by MainActivity: the default network
-   callback (registered in `onCreate` on the UI handler, unregistered in
-   `onDestroy`), state `{net, blocked, known, metered, validated, transport}`,
-   `netOk()` = known ? (net != null && !blocked) : getActiveNetwork() != null,
-   a static event ring (last 30: time, avail/lost/caps/blocked, value,
-   resumed, page token) and, for the last 10 resumes, ms from `onResume` to
-   `netOk()`.
-3. `whenNetReady(why, go)` gates the app's own loads: `onCreate`'s first load
-   or restore, `onNewIntent`, the rebuild's load, ⋮ → Refresh, and the
-   automatic reload. Runs at once when `netOk()`; otherwise keeps the newest
-   pending runnable and runs it on the first callback that makes `netOk()`
-   true while resumed, with a cap of 1.5 s counted from `onResume` (in the
-   background it waits). Dropped in `onDestroy`. Never `setNetworkAvailable`.
-4. Tainted page starts: each main-frame page start gets a native token. If
-   the page hasn't reported `boot` and any of these happen, the token is
-   marked hurt: `onBlockedStatusChanged(true)`, `onLost`, a pause/stop, a
-   `netErrors` entry for a static-host script or the main document.
-5. Recovery on unblock: on a callback that makes `netOk()` true, or in
-   `onResume`, if the current token is hurt and has no `boot`: settle 1 s;
-   re-check resumed, `netOk()`, same token, the guards (no comments, no search
-   open, keyboard not up, no menu/dialog, no custom view, no screenshot mode,
-   an Instagram address); ask the page whether `#splash-screen` is still there
-   (700 ms); if it is, or there's no answer, or the page is WebView's error
-   page, one `reload()` through the same budget as the watchdog's.
-6. The watchdog's clock counts only time that is resumed **and** `netOk()`.
-   While blocked or offline it shows "No connection. SimpleGram will reload
-   when you're back online" and leaves the reload to step 5.
-7. The Data Saver tip shows once, only after a B33 event tied to a block (a
-   hurt page, or an automatic reload with why `unblock`), when the status is
-   ENABLED and the network is metered: "Data Saver is on, so Android cuts
-   SimpleGram off the moment you switch apps. That can leave Instagram stuck
-   on its logo. Let SimpleGram use data while Data Saver is on?" with
-   **Open settings** (the intent above, else the manual path in a toast) and
-   **Not now**. Re-read the status in `onResume` and on
+   callback (registered once per Activity in `onCreate` on the UI handler,
+   unregistered in `onDestroy` inside try/catch), state `{net, blocked, known,
+   metered, validated, transport}`, `netOk()` = known ? (net != null &&
+   !blocked) : getActiveNetwork() != null, a static event ring (last 30:
+   time, avail/lost/caps/blocked, value, resumed, page token) and, for the
+   last 10 resumes, ms from `onResume` to `netOk()`. Never
+   `setNetworkAvailable` (it switches Chromium's own detection off).
+3. **No gating of foreground loads.** Android unblocks the app before or
+   within 200 ms of `onCreate`/`onResume`, and deferring `onCreate`'s
+   `restoreState` would lose Cam's place (a WebView that hasn't restored saves
+   nothing). The only loads held back are ones that would start while the
+   Activity is **not resumed**: the `recreate()` after a lost renderer, and a
+   rebuild's delayed swap after Cam has left. They run on the next `onResume`;
+   a pending `Bundle` is kept and written out in `onSaveInstanceState`.
+4. **Tainted page starts, from the lifecycle.** Each main-frame page start
+   gets a native token. A page that hasn't reported `boot` when `onPause`,
+   `onStop` or screen-off (`PowerManager.isInteractive()` false at `onStop`)
+   happens is marked hurt. `onBlockedStatusChanged(true)`, `onLost` and a
+   `netErrors` entry for a static-host script or the main document also mark
+   it, as supporting evidence (frozen apps get their callbacks replayed and
+   collapsed, so a block can pass unseen).
+5. **Recovery on resume.** In `onResume`, if the current token is hurt and
+   has no `boot`: wait until `netOk()` (or 1 s after `onResume` when no
+   callback has arrived), settle 1 s, re-check resumed, same token and the
+   guards (no comments, no search open, keyboard not up, no menu/dialog, no
+   custom view, no screenshot mode, an Instagram address); ask the page
+   whether `#splash-screen` is still there (2 s). If it is, or the page is
+   WebView's error page, one `reload()` (fallback `loadUrl` of the start
+   address; **never** `restoreState`) through the same budget as the
+   watchdog's. If the page doesn't answer: record "busy", offer Try again, no
+   automatic reload (plan.md's rule).
+6. **The watchdog's cap counts on-screen (resumed) time only and ignores the
+   network state.** The network state changes only what is shown: while
+   blocked or offline the chip says "No connection. SimpleGram will reload
+   when you're back online" and the reload waits for `netOk()`; otherwise the
+   ladder runs as in plan.md. A wrong `netOk()` (a stale callback, a VPN
+   quirk) can therefore delay a reload but never prevent the chip.
+7. **The Data Saver tip** shows once, never during a start-up (only after a
+   page has booted, or with the stuck chip up), and only after a stuck page
+   tied to a block (a hurt page, or an automatic reload after an unblock),
+   when the status is ENABLED and the network is metered: "Data Saver is on,
+   so Android cuts SimpleGram off the moment you switch apps. That can leave
+   Instagram stuck on its logo. Let SimpleGram use data while Data Saver is
+   on? (Android still pauses apps in the background after a while; SimpleGram
+   now reloads by itself when that happens.)" with **Open settings** (the
+   intent above, guarded by `resolveActivity`, else the manual path in a
+   toast) and **Not now**. Coming back from Settings is a resume and goes
+   through step 5. Re-read the status in `onResume` and on
    `ACTION_RESTRICT_BACKGROUND_CHANGED` (a registered receiver; it is a
    protected broadcast and can't be in the manifest).
 8. `netErrors` (plan.md) keys each entry by host kind (main / static / media /
    api / other), the `net::ERR_*` name from `getDescription()` plus the code,
-   and whether the app was blocked at the time. Expected signatures:
-   `ERR_CONNECTION_REFUSED` and `ERR_NAME_NOT_RESOLVED` (Data Saver),
-   `ERR_CONNECTION_ABORTED` (sockets destroyed), `ERR_HTTP2_PING_FAILED` /
-   `ERR_QUIC_PROTOCOL_ERROR` (stale sessions). A start-up file with neither
-   an error nor a completion is a stall.
+   whether the app was resumed, and whether it was blocked at the time.
+   Record only; no logic branches on a code (the signatures below are
+   inferred, not measured): `ERR_CONNECTION_REFUSED` / `ERR_NAME_NOT_RESOLVED`
+   / `ERR_INTERNET_DISCONNECTED` (blocked), `ERR_CONNECTION_ABORTED` (sockets
+   destroyed), `ERR_HTTP2_PING_FAILED` / `ERR_QUIC_PROTOCOL_ERROR` (stale
+   sessions). A start-up file with neither an error nor a completion is a
+   stall.
 9. Copy details gets a `net` block built natively: restrict-background status
-   now and its changes, the default network now (transport, metered,
-   validated, blocked) and `getActiveNetwork()==null` at copy time, the event
-   ring, the resume-to-ok times, gate stats, `netErrors` by kind, and the
-   tip's state.
+   now (or `error`) and its changes, the default network now (transport,
+   metered, validated, blocked) and `getActiveNetwork()==null` at copy time,
+   the event ring, the resume-to-ok times, `netErrors` by kind, the hurt
+   marks with what caused them, and the tip's state. Every page start is on
+   the same clock as the lifecycle ring and the screen on/off events.
 
 ## To reproduce later on the emulator (not done)
 
