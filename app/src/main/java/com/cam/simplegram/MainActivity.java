@@ -29,6 +29,7 @@ import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.TouchDelegate;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -94,6 +95,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private WebView web;
     private CommentsPanel comments;
     private TextView menuButton;
+    private TouchDelegate tabDelegate;      // B27: the tab's extra room (its dead zone), asked before the page is
     private TextView zoomChip;
     private View feedBar;
     private TextView feedTitle;
@@ -604,7 +606,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (("post".equals(route) || "reel".equals(route) || own)
                     && !"story".equals(route) && !"direct".equals(route)) {
                 fullHidTab = true;
-                menuButton.setVisibility(View.GONE);
+                setTabShown(false);
                 zoomChip.setVisibility(View.GONE);
             }
             // Comments over R9's Reel are raised above any full-screen view: they stay.
@@ -658,7 +660,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             }
             if (fullHidTab) {
                 fullHidTab = false;
-                if (!screenshotMode && !pageVideo) menuButton.setVisibility(View.VISIBLE);
+                if (!screenshotMode && !pageVideo) setTabShown(true);
                 onZoomChanged(zoom.scale());     // also re-reads the skip note and the end card
             } else {
                 // A Story's route message can come while its full screen is still up:
@@ -714,7 +716,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         // A full screen that started before its route said Story (or DMs):
                         // the tab is how Stories are saved, so it comes back.
                         fullHidTab = false;
-                        if (!screenshotMode && !pageVideo) menuButton.setVisibility(View.VISIBLE);
+                        if (!screenshotMode && !pageVideo) setTabShown(true);
                         onZoomChanged(zoom.scale());
                     }
                     if ("ready".equals(action)) {
@@ -726,6 +728,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                         setAwake(false);     // the old page's playing video is gone
                         refreshViewer();
                         handBackSearch();
+                        sendMenuTab();       // B27: the new page learns where the tab is
                         // The chip is still up: the new page says scrollOk on its first drag that scrolls.
                         if (stuckChipWanted) js("stuckChipUp");
                         if (!prefs.getBoolean("tabTip", false)) {
@@ -885,14 +888,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (pageVideo == on) return;
         pageVideo = on;
         if (on) {
-            menuButton.setVisibility(View.GONE);
+            setTabShown(false);
             zoomChip.setVisibility(View.GONE);
             updateStuckChip();       // the stuck chip stays off the Reel layer too
             setSystemBarsHidden(true);
         } else {
             // R12: the Reel's comments go with the Reel.
             if (commentsOverFull) closeComments();
-            if (!screenshotMode && !fullHidTab) menuButton.setVisibility(View.VISIBLE);
+            if (!screenshotMode && !fullHidTab) setTabShown(true);
             if (customView == null && !screenshotMode) setSystemBarsHidden(false);
             onZoomChanged(zoom.scale());
         }
@@ -1250,6 +1253,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // The menu is a slim tab on the screen edge, clear of Instagram's own
     // buttons (a post's Save icon sits a little in from the edge).
     private static final int TAB_W = 16, TAB_H = 48;
+    // B27: how far the tab's hit area reaches past it (inward, above and below).
+    private static final int TAB_REACH = 8;
+    private Rect tabHit;
+    // Where the tab is, as the page last heard it (fractions of root's height).
+    private boolean tabLeft;
+    private float tabTop, tabHeight;
 
     @SuppressLint("ClickableViewAccessibility")
     private TextView makeMenuButton() {
@@ -1319,15 +1328,58 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (w == 0 || h == 0) return;
         int tabW = dp(TAB_W), tabH = dp(TAB_H);
         boolean left = prefs.getBoolean("menuLeft", false);
-        float y = prefs.getFloat("menuY", 0.58f) * h;
+        int x = left ? 0 : w - tabW;
+        int y = Math.round(clamp(prefs.getFloat("menuY", 0.58f) * h, dp(56), h - tabH - dp(60)));
         menuButton.setBackground(tabBackground(left));
         menuButton.animate().cancel();
-        menuButton.animate().x(left ? 0 : w - tabW)
-                .y(clamp(y, dp(56), h - tabH - dp(60))).setDuration(120).start();
-        if (Build.VERSION.SDK_INT >= 29) {
-            // Dragging the tab must not start the system Back gesture.
-            menuButton.setSystemGestureExclusionRects(Collections.singletonList(new Rect(0, 0, tabW, tabH)));
+        menuButton.animate().x(x).y(y).setDuration(120).start();
+        // B27: a thumb aimed at a 16 dp tab often lands just beside it (over a
+        // video, that was R10's one tap). The tab's hit area reaches 8 dp inward
+        // and 8 dp above and below; the tab itself stays slim, and Instagram's own
+        // edge icons start about 16 dp in, so their taps are never taken.
+        int reach = dp(TAB_REACH);
+        Rect hit = new Rect(x - (left ? 0 : reach), y - reach, x + tabW + (left ? reach : 0), y + tabH + reach);
+        if (!hit.equals(tabHit)) {
+            // Kept while it is unchanged: a new delegate forgets a touch it is in the middle of.
+            tabHit = hit;
+            tabDelegate = new TouchDelegate(hit, menuButton);
         }
+        if (Build.VERSION.SDK_INT >= 29) {
+            // Dragging the tab (from its extra room too) must not start the system Back gesture.
+            menuButton.setSystemGestureExclusionRects(Collections.singletonList(new Rect(0, 0, tabW, tabH)));
+            root.setSystemGestureExclusionRects(Collections.singletonList(hit));
+        }
+        tabLeft = left;
+        tabTop = y / (float) h;
+        tabHeight = tabH / (float) h;
+        sendMenuTab();
+    }
+
+    /**
+     * B27: the page keeps a dead zone around the tab (no one-tap full screen and
+     * no swipe arm there, wherever the tab was dragged). It is told where the
+     * tab is after every layout and drag, when the tab is hidden or shown, and
+     * when a new page is ready. Fractions of root's height, so the page needs
+     * no pixel ratio.
+     */
+    private void sendMenuTab() {
+        try {
+            js(new JSONObject().put("type", "menuTab")
+                    .put("on", menuButton.getVisibility() == View.VISIBLE)
+                    .put("side", tabLeft ? "left" : "right")
+                    .put("yFrac", Math.round(tabTop * 10000) / 10000.0)
+                    .put("hFrac", Math.round(tabHeight * 10000) / 10000.0));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /** Shows or hides the tab, and tells the page when that changes. */
+    private void setTabShown(boolean on) {
+        int v = on ? View.VISIBLE : View.GONE;
+        if (menuButton.getVisibility() == v) return;
+        menuButton.setVisibility(v);
+        sendMenuTab();
     }
 
     /** Rounded on the side facing the screen, square against the edge. */
@@ -1949,7 +2001,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (screenshotMode) return;
         screenshotMode = true;
         if (storyMode()) zoom.hold();
-        menuButton.setVisibility(View.GONE);
+        setTabShown(false);
         zoomChip.setVisibility(View.GONE);
         updateFeedBar();                      // hidden while screenshotMode, back afterwards
         setSystemBarsHidden(true);
@@ -1964,7 +2016,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         screenshotMode = false;
         if (screenshotShield != null) root.removeView(screenshotShield);
         screenshotShield = null;
-        if (!fullHidTab) menuButton.setVisibility(View.VISIBLE);
+        if (!fullHidTab) setTabShown(true);
         if (customView == null) setSystemBarsHidden(false);
         onZoomChanged(zoom.scale());
         zoom.releaseHold();
