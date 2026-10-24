@@ -6,7 +6,9 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.net.Uri;
@@ -17,18 +19,24 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
+import org.json.JSONTokener;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1667,6 +1675,296 @@ public class ShellTest {
                 edges[0] <= edges[2] - edges[1] + 1);
     }
 
+    /**
+     * B27: the page is told where the tab is (fractions of root's height) after
+     * a drag, and a tap just inside the tab's inner edge (its extra room, not
+     * the tab itself) opens the menu instead of reaching the page.
+     */
+    @Test
+    public void menuTabIsToldToThePageAndItsExtraRoomOpensTheMenu() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            MainActivity a = act.get();
+            SharedPreferences prefs = a.getSharedPreferences("simplegram", Context.MODE_PRIVATE);
+            try {
+                blankPage(s);
+                pageJs(s, "window.__sg = { onNative: function (c) { (window.__cmds = window.__cmds || []).push(JSON.stringify(c)); } }; 1");
+                View tab = menuTab(a);
+                ViewGroup root = (ViewGroup) tab.getParent();
+                SystemClock.sleep(400);        // placement animates for 120 ms
+                idle();
+                float x0 = tab.getX() + tab.getWidth() / 2f, y0 = tab.getY() + tab.getHeight() / 2f;
+                float dy = root.getHeight() / 4f;
+                // A drag down by a quarter of the screen (the tab reads raw coordinates).
+                s.onActivity(x -> {
+                    long d = SystemClock.uptimeMillis();
+                    tab.dispatchTouchEvent(event(d, MotionEvent.ACTION_DOWN, new float[][]{{x0, y0}}));
+                    for (int i = 1; i <= 8; i++) {
+                        tab.dispatchTouchEvent(event(d, MotionEvent.ACTION_MOVE, new float[][]{{x0, y0 + dy * i / 8f}}));
+                    }
+                    tab.dispatchTouchEvent(event(d, MotionEvent.ACTION_UP, new float[][]{{x0, y0 + dy}}));
+                });
+                SystemClock.sleep(500);
+                idle();
+                assertTrue("the tab moved", tab.getY() > y0 - tab.getHeight() / 2f + dpOf(a, 20));
+                JSONObject last = lastCommand(s, "menuTab");
+                assertNotNull("menuTab reached the page", last);
+                assertTrue(last.getBoolean("on"));
+                boolean left = tab.getX() < 1;
+                assertEquals(left ? "left" : "right", last.getString("side"));
+                assertEquals(tab.getY() / root.getHeight(), last.getDouble("yFrac"), 0.01);
+                assertEquals(tab.getHeight() / (float) root.getHeight(), last.getDouble("hFrac"), 0.01);
+                // 4 dp inside the tab's inner edge: beside the tab, in its extra room.
+                int[] at = new int[2];
+                root.getLocationInWindow(at);
+                float tx = left ? tab.getX() + tab.getWidth() + dpOf(a, 4) : tab.getX() - dpOf(a, 4);
+                float ty = tab.getY() + tab.getHeight() / 2f;
+                assertFalse("the spot is off the tab itself", tx >= tab.getX() && tx < tab.getX() + tab.getWidth());
+                s.onActivity(x -> tap(x.getWindow().getDecorView(), at[0] + tx, at[1] + ty));
+                SystemClock.sleep(400);
+                idle();
+                assertTrue("the menu opened", (Boolean) fieldOf(s, "menuOpen"));
+                InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                        .performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+                SystemClock.sleep(800);
+                idle();
+            } finally {
+                prefs.edit().remove("menuY").remove("menuLeft").apply();
+            }
+        }
+    }
+
+    /** The last command of a type the page's stub recorded, or null. */
+    private static JSONObject lastCommand(ActivityScenario<MainActivity> s, String type) throws Exception {
+        String v = pageJs(s, "JSON.stringify(window.__cmds||[])");
+        if (v == null || "null".equals(v)) return null;
+        JSONArray all = new JSONArray(String.valueOf(new JSONTokener(v).nextValue()));
+        JSONObject last = null;
+        for (int i = 0; i < all.length(); i++) {
+            JSONObject c = new JSONObject(all.getString(i));
+            if (type.equals(c.optString("type"))) last = c;
+        }
+        return last;
+    }
+
+    // B33: a local page on an Instagram address whose logo screen never goes (nothing is fetched).
+    private static final String STUCK_BASE = "https://www.instagram.com/b33test/";
+    private static final String STUCK_PAGE = "<!doctype html><html><head><title>Instagram</title></head><body>"
+            + "<div id=\"splash-screen\" style=\"position:fixed;inset:0;background:#fff\"><div>logo</div></div>"
+            + "<script>window.b33ready=1;</script></body></html>";
+
+    /**
+     * B33: a page stuck on Instagram's logo. The watch fires on the app's own
+     * clock (shortened here), the page is reloaded once by itself, and when the
+     * reloaded page is stuck too the chip offers Try again and Details (the
+     * load without filters comes only after a Try again). One chip at a time.
+     */
+    @Test
+    public void stuckLogoGetsOneReloadThenTheChip() throws Exception {
+        long watchWas = MainActivity.bootWatchMs;
+        NetWatch.testNetOk = true;             // the ladder, not the emulator's connectivity, is under test
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            MainActivity a = act.get();
+            SharedPreferences prefs = a.getSharedPreferences("simplegram", Context.MODE_PRIVATE);
+            prefs.edit().remove("autoReloads").remove("reloadLog").remove("bootLog").remove("lastStuck").apply();
+            SystemClock.sleep(1000);           // the launch's own load settles (or is cancelled) first
+            MainActivity.bootWatchMs = 1500;
+            localPage(s, STUCK_BASE, STUCK_PAGE, "www.instagram.com");
+            // One reload by itself, recorded before it runs...
+            assertTrue("a reload by itself", waitFor(() -> ringOf(prefs, "reloadLog").length() >= 1, 8000));
+            JSONObject reload = ringOf(prefs, "reloadLog").getJSONObject(0);
+            assertTrue(reload.toString(), reload.getString("what").startsWith("reload "));
+            assertEquals(1, reload.getInt("step"));
+            // ...then the chip, once the reloaded page is stuck too.
+            assertTrue("the chip", waitFor(() -> visibleChild(a, "Instagram didn't start") != null, 10000));
+            String text = textOf((ViewGroup) visibleChild(a, "Instagram didn't start"));
+            assertTrue(text, text.contains("Instagram didn't start") && text.contains("Try again") && text.contains("Details"));
+            assertFalse(text, text.contains("Load without filters"));
+            JSONArray reloads = ringOf(prefs, "reloadLog");
+            for (int i = 0; i < reloads.length(); i++) {
+                String what = reloads.getJSONObject(i).getString("what");
+                assertFalse(what, what.startsWith("loadUrl"));            // the reload did start a page
+                assertFalse(what, what.startsWith("reload ") && i > 0);   // only one by itself
+            }
+            JSONArray log = ringOf(prefs, "bootLog");
+            assertTrue(log.toString(), log.length() >= 2);
+            JSONObject first = log.getJSONObject(log.length() - 2), second = log.getJSONObject(log.length() - 1);
+            assertTrue(first.toString(), first.getString("outcome").startsWith("stuck"));
+            assertTrue(second.toString(), second.getString("how").startsWith("reload ") && second.getString("outcome").startsWith("stuck"));
+            assertTrue(prefs.getString("lastStuck", "").contains("\"rule\""));
+            assertNull("one chip at a time", visibleChild(a, "Scrolling stopped. Tap to fix"));
+            assertFalse("no address in what is kept", prefs.getString("bootLog", "").contains("b33test"));
+        } finally {
+            MainActivity.bootWatchMs = watchWas;
+            NetWatch.testNetOk = null;
+        }
+    }
+
+    /** B33: a failed load is kept by host kind, file kind and code; never its address. */
+    @Test
+    public void networkErrorsAreKeptByKind() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            SharedPreferences prefs = act.get().getSharedPreferences("simplegram", Context.MODE_PRIVATE);
+            prefs.edit().remove("netErrors").apply();
+            s.onActivity(x -> {
+                WebView w = (WebView) fieldOf(s, "web");
+                w.getWebViewClient().onReceivedHttpError(w, request("https://sg.test/static/x.js", false),
+                        new WebResourceResponse("text/plain", "utf-8", 503, "Service Unavailable", new HashMap<>(), null));
+            });
+            idle();
+            JSONArray errors = ringOf(prefs, "netErrors");
+            assertEquals(1, errors.length());
+            JSONObject e = errors.getJSONObject(0);
+            assertEquals(503, e.getInt("code"));
+            assertEquals("http", e.getString("kind"));
+            assertEquals("other", e.getString("host"));
+            assertEquals("js", e.getString("res"));
+            assertFalse(e.getBoolean("main"));
+            assertTrue(e.has("resumed") && e.has("blocked") && e.has("at"));
+            assertFalse(errors.toString(), errors.toString().contains("sg.test"));
+            // Host and file kinds.
+            assertEquals("static", MainActivity.hostKind(Uri.parse("https://static.cdninstagram.com/rsrc.php/v4/yX/r/abc.js")));
+            assertEquals("js", MainActivity.resKind(Uri.parse("https://static.cdninstagram.com/rsrc.php/v4/yX/r/abc.js")));
+            assertEquals("main", MainActivity.hostKind(Uri.parse("https://www.instagram.com/")));
+            assertEquals("none", MainActivity.resKind(Uri.parse("https://www.instagram.com/")));
+            assertEquals("api", MainActivity.hostKind(Uri.parse("https://www.instagram.com/api/v1/feed/timeline/")));
+            assertEquals("media", MainActivity.hostKind(Uri.parse("https://scontent-lax3-1.cdninstagram.com/v/a.jpg")));
+            assertEquals("image", MainActivity.resKind(Uri.parse("https://scontent-lax3-1.cdninstagram.com/v/a.jpg")));
+            assertEquals("other", MainActivity.hostKind(null));
+        }
+    }
+
+    /**
+     * B33: Copy details works from the app alone. A page that doesn't answer
+     * (here one without the page script) gets the device, net and boot blocks
+     * copied after a second, with no page block.
+     */
+    @Test
+    public void copyDetailsOpensWithoutAPageAnswer() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            blankPage(s);
+            s.onActivity(x -> {
+                try {
+                    call(x, "askStatus", new Class<?>[]{boolean.class}, true);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(300);
+            assertNull("not before the page had its second", fieldOf(s, "lastDetails"));
+            assertTrue(waitFor(() -> fieldOf(s, "lastDetails") != null, 3000));
+            String details = (String) fieldOf(s, "lastDetails");
+            JSONObject all = new JSONObject(details);
+            assertTrue(all.isNull("page"));
+            assertTrue(all.has("device") && all.has("trail"));
+            JSONObject net = all.getJSONObject("net");
+            assertTrue(net.getJSONObject("now").has("restrict") && net.getJSONObject("now").has("ok"));
+            assertTrue(net.has("netErrors") && net.has("restrictChanges") && net.has("tip"));
+            JSONObject boot = all.getJSONObject("boot");
+            assertTrue(boot.has("bootLog") && boot.has("lifecycle") && boot.has("reloadLog") && boot.has("rebuildLog"));
+            // The lifecycle ring counted this start (create, start, resume).
+            assertTrue(boot.getJSONArray("lifecycle").length() >= 3);
+            assertFalse(details, details.contains("sg.test"));
+        }
+    }
+
+    /**
+     * B33: Fix scrolling reads the old page's boot record along with its search
+     * state before destroying it, keeps the record, and logs the rebuild with
+     * what was up when it was chosen.
+     */
+    @Test
+    public void fixScrollingKeepsTheOldPagesBootRecordAndLogsTheRebuild() throws Exception {
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            SharedPreferences prefs = act.get().getSharedPreferences("simplegram", Context.MODE_PRIVATE);
+            prefs.edit().remove("rebuildLog").remove("rebuildRecord").apply();
+            blankPage(s);
+            pageJs(s, "window.__sg = { onNative: function () {}, searchState: function () { return JSON.stringify({open: false}); },"
+                    + " bootRecord: function () { return {rule: 'test', logo: true, scripts: {count: 6, errored: 1}}; } }; 1");
+            WebView old = (WebView) fieldOf(s, "web");
+            s.onActivity(x -> {
+                try {
+                    call(x, "fixScrolling", new Class<?>[]{});
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            assertTrue("rebuilt", waitFor(() -> fieldOf(s, "web") != old, 5000));
+            JSONArray log = ringOf(prefs, "rebuildLog");
+            assertEquals(1, log.length());
+            JSONObject e = log.getJSONObject(0);
+            assertEquals("Fix scrolling", e.getString("why"));
+            assertTrue(e.toString(), e.getBoolean("answered") && e.getInt("answerMs") >= 0);
+            assertTrue(e.has("route") && e.has("logoUp") && e.has("fullScreen") && e.has("chip") && e.has("at"));
+            JSONObject kept = new JSONObject(prefs.getString("rebuildRecord", "{}"));
+            assertEquals("Fix scrolling", kept.getString("why"));
+            assertEquals("test", kept.getJSONObject("record").getString("rule"));
+            assertEquals(1, kept.getJSONObject("record").getJSONObject("scripts").getInt("errored"));
+            assertEquals(1, (int) (Integer) fieldOf(s, "manualFix"));
+        }
+    }
+
+    private static JSONArray ringOf(SharedPreferences prefs, String key) {
+        try {
+            return new JSONArray(prefs.getString(key, "[]"));
+        } catch (Exception e) {
+            return new JSONArray();
+        }
+    }
+
+    private static boolean waitFor(java.util.function.BooleanSupplier c, long ms) {
+        long end = SystemClock.uptimeMillis() + ms;
+        while (SystemClock.uptimeMillis() < end) {
+            if (c.getAsBoolean()) return true;
+            SystemClock.sleep(50);
+        }
+        return c.getAsBoolean();
+    }
+
+    /** A request for the WebViewClient's error callbacks (the kind WebView would hand it). */
+    private static WebResourceRequest request(String url, boolean mainFrame) {
+        return new WebResourceRequest() {
+            @Override
+            public Uri getUrl() {
+                return Uri.parse(url);
+            }
+
+            @Override
+            public boolean isForMainFrame() {
+                return mainFrame;
+            }
+
+            @Override
+            public boolean isRedirect() {
+                return false;
+            }
+
+            @Override
+            public boolean hasGesture() {
+                return false;
+            }
+
+            @Override
+            public String getMethod() {
+                return "GET";
+            }
+
+            @Override
+            public Map<String, String> getRequestHeaders() {
+                return new HashMap<>();
+            }
+        };
+    }
+
     private static Object fieldOf(ActivityScenario<MainActivity> s, String name) {
         Object[] r = new Object[1];
         s.onActivity(x -> {
@@ -1711,27 +2009,31 @@ public class ShellTest {
      * side so the test can read what the app told it.
      */
     private static void blankPage(ActivityScenario<MainActivity> s) {
+        localPage(s, "https://sg.test/", "<!doctype html><title>t</title><body></body>", "sg.test");
+        pageJs(s, "window.__sg = { onNative: function (c) { (window.__got = window.__got || [])"
+                + ".push(c.type + (c.type === 'commentsOver' ? ':' + c.on : '')); } }; 1");
+    }
+
+    /** A local page in the main WebView (nothing fetched), settled. */
+    private static void localPage(ActivityScenario<MainActivity> s, String base, String html, String host) {
         s.onActivity(x -> {
             try {
                 Field f = MainActivity.class.getDeclaredField("web");
                 f.setAccessible(true);
                 WebView w = (WebView) f.get(x);
                 w.stopLoading();
-                w.loadDataWithBaseURL("https://sg.test/", "<!doctype html><title>t</title><body></body>",
-                        "text/html", "utf-8", null);
+                w.loadDataWithBaseURL(base, html, "text/html", "utf-8", null);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
         });
         long end = SystemClock.uptimeMillis() + 10000;
         while (SystemClock.uptimeMillis() < end
-                && !"\"sg.test complete\"".equals(pageJs(s, "location.host + ' ' + document.readyState"))) {
+                && !("\"" + host + " complete\"").equals(pageJs(s, "location.host + ' ' + document.readyState"))) {
             SystemClock.sleep(50);
         }
         SystemClock.sleep(500);
         idle();
-        pageJs(s, "window.__sg = { onNative: function (c) { (window.__got = window.__got || [])"
-                + ".push(c.type + (c.type === 'commentsOver' ? ':' + c.on : '')); } }; 1");
     }
 
     private static float dpOf(MainActivity a, int v) {
