@@ -15,18 +15,22 @@ article header{height:56px;line-height:56px;padding-left:12px}
 <div id="mount"><main>
 <article data-id="A"><header><a href="/friend_a/">friend_a</a></header>
 <div class="box" data-id="A"><div style="position:absolute;inset:0"><video id="A" src="%A%" muted playsinline loop preload="auto"></video></div><div class="tap" role="presentation"></div></div>
-<section class="cap">A: the previous video (red band, low tone)</section></article>
+<section class="cap">A: the previous video (red band)</section></article>
 <article data-id="B"><header><a href="/friend_b/">friend_b</a></header>
 <div class="box" data-id="B"><div style="position:absolute;inset:0"><video id="B" src="%B%" muted playsinline loop preload="auto"></video></div><div class="tap" role="presentation"></div></div>
-<section class="cap">B: the one tapped (green band, middle tone)</section></article>
+<section class="cap">B: the one tapped (green band)</section></article>
 <article data-id="C"><header><a href="/friend_c/">friend_c</a></header>
 <div class="box" data-id="C"><div style="position:absolute;inset:0"><video id="C" src="%C%" muted playsinline loop preload="auto"></video></div><div class="tap" role="presentation"></div></div>
-<section class="cap">C: the next video (blue band, high tone)</section></article>
+<section class="cap">C: the next video (blue band)</section></article>
 <div style="height:3000px">more posts</div>
 </main></div>
 <div id="bar">home · search · dm · me</div>
 <script>
 // An Instagram-like feed player (a model: Instagram's own code isn't available).
+// The clips are video-only: with an audio track the emulator (no hardware
+// acceleration, no audio device) cannot keep the media clock running, so a
+// playing video's time hardly moves and a seek never completes. Sound here is
+// the muted flag, which is all the page script sets.
 // One video plays at a time: the post most on screen (at least half), with the
 // feed-wide sound setting. A single tap on a video (300 ms after its click, when
 // no second click followed) toggles that sound setting; a double tap likes.
