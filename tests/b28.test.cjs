@@ -309,13 +309,105 @@ test('B28: a pause made in full screen is kept after Back; Instagram\'s re-mute 
   st = await videos(page);
   assert.deepEqual([st.B, st.A, st.C, st.y], [[true, true], [true, true], [true, true], B_Y], 'still paused, muted as before: ' + JSON.stringify(st));
   assert.deepEqual([(await fv(page)).r10KeptPaused, (await fv(page)).r10Restored], [1, 1]);
-  // The next full screen opens it playing (R10), and it plays on after Back: what you did there is kept.
+  // The next full screen opens it playing (R10). Back pauses it again: that play
+  // was R10's, not yours, and Instagram's player still shows the post paused.
   await openFull(page);
   await page.waitForFunction(() => !document.getElementById('B').paused && !document.getElementById('B').muted, null, { timeout: 2000 });
   await appBack(page);
   await page.waitForTimeout(500);
-  assert.deepEqual((await videos(page)).B, [false, true]);
+  assert.deepEqual((await videos(page)).B, [true, true], 'paused again, as before that tap');
+  assert.deepEqual([(await fv(page)).r10KeptPaused, (await fv(page)).r10Restored], [1, 2]);
+  // A tap that plays it in full screen is yours: it plays on after Back.
+  await openFull(page);
+  await page.waitForFunction(() => !document.getElementById('B').paused && !document.getElementById('B').muted, null, { timeout: 2000 });
+  await tapAt(page, 200, 500, 300);                     // pause
+  await tapAt(page, 200, 500, 300);                     // play: yours
+  assert.deepEqual((await videos(page)).B, [false, false]);
+  await appBack(page);
+  await page.waitForTimeout(500);
+  assert.deepEqual((await videos(page)).B, [false, true], 'your play is kept');
   assert.equal((await fv(page)).r10KeptPaused, 1);
+});
+
+test('B28: your own pause and play taps cost no sound budget (Instagram re-mutes on each): after five of each the sound is still on; a fight with Instagram still ends at 8', async () => {
+  const page = await openFeed();
+  await openFull(page);
+  await page.waitForFunction(() => !document.getElementById('B').muted, null, { timeout: 2000 });
+  for (let i = 0; i < 5; i++) {
+    await tapAt(page, 200, 500, 250);
+    let st = await videos(page);
+    assert.deepEqual(st.B, [true, false], 'pause ' + i + ': ' + JSON.stringify(st));
+    await tapAt(page, 200, 500, 250);
+    st = await videos(page);
+    assert.deepEqual(st.B, [false, false], 'play ' + i + ': ' + JSON.stringify(st));
+  }
+  let f = await fv(page);
+  assert.ok(f.remuted >= 10 && (await ig(page)).mutes.B >= 10, 'Instagram did re-mute each time: ' + JSON.stringify(f));
+  // Instagram muting it by itself (no play or pause of SimpleGram's behind it): set back 8 times, then left.
+  await page.waitForTimeout(600);
+  for (let i = 0; i < 10; i++) {
+    await page.evaluate(() => { document.getElementById('B').muted = true; });
+    await page.waitForTimeout(40);
+  }
+  await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(() => document.getElementById('B').muted), true, 'left muted after 8');
+  assert.equal((await fv(page)).remuted - f.remuted, 8);
+  // The next full screen has its own budget.
+  await appBack(page);
+  await page.waitForTimeout(500);
+  await openFull(page);
+  await page.waitForFunction(() => !document.getElementById('B').muted, null, { timeout: 2000 });
+});
+
+test('B28: the web view\'s pause while the app is in the background is no fight: no replay is spent; back in the foreground the video plays on, unless you had paused it', async () => {
+  const page = await openFeed();
+  await openFull(page);
+  await page.waitForFunction(() => !document.getElementById('B').muted, null, { timeout: 2000 });
+  // The page hidden (and, as the web view does to a backgrounded video, the video paused), then shown again.
+  const hide = on => page.evaluate(h => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => h });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => h ? 'hidden' : 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    if (h) document.getElementById('B').pause();
+  }, on);
+  await hide(true);
+  await page.waitForTimeout(300);
+  let st = await videos(page);
+  assert.deepEqual([st.B[0], (await fv(page)).replays], [true, 0], 'left paused: ' + JSON.stringify(st));
+  await hide(false);
+  await page.waitForFunction(() => !document.getElementById('B').paused, null, { timeout: 1000 });
+  await page.waitForTimeout(200);
+  st = await videos(page);
+  assert.deepEqual([st.B, st.active, (await fv(page)).replays], [[false, false], 'B', 0], 'plays on with sound, no replay spent: ' + JSON.stringify(st));
+  // Paused by your tap before the app went to the background: still paused on return.
+  await tapAt(page, 200, 500, 300);
+  assert.equal((await videos(page)).B[0], true);
+  await hide(true);
+  await page.waitForTimeout(200);
+  await hide(false);
+  await page.waitForTimeout(300);
+  assert.deepEqual((await videos(page)).B, [true, false]);
+  await appBack(page);
+  await page.waitForTimeout(500);
+  assert.deepEqual([(await videos(page)).B, (await fv(page)).r10KeptPaused], [[true, true], 1]);
+});
+
+test('B28: a reset the hold puts back is no Home jump: Home\'s log says held (where the page stood), never jump', async () => {
+  const page = await openFeed();
+  // C in the middle of the screen: the page more than a screen down (noteJump's threshold).
+  const C_Y = B_Y + 615;
+  await page.evaluate(y => window.scrollTo(0, y), C_Y);
+  await page.waitForFunction(() => window.__ig.active === 'C' && !document.getElementById('C').paused, null, { timeout: 5000 });
+  await page.waitForTimeout(400);
+  await openFull(page);
+  await page.waitForTimeout(300);
+  assert.deepEqual([await page.evaluate(() => window.__resets), await lifted(page), (await videos(page)).y], [1, 'C', C_Y]);
+  await page.evaluate(() => window.__sg.onNative({ type: 'status' }));
+  const m = (await sent(page, 'status')).pop();
+  const events = m.stats.homeEvents || [];
+  assert.deepEqual(events.filter(e => e.e === 'jump'), [], JSON.stringify(events));
+  assert.deepEqual(events.filter(e => e.e === 'held').map(e => e.from), [1.2], JSON.stringify(events));
+  assert.equal((await fv(page)).scrollHeld, 1);
 });
 
 test('B28: another video Instagram starts under the full screen is paused; the full-screen video paused by Instagram is played again, 6 times at most', async () => {

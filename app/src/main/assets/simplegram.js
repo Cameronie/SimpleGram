@@ -2508,6 +2508,7 @@
   const noteJump = safe(() => {
     if (CFG.role !== 'main' || route() !== 'home') { lastTop = 0; return; }
     const top = (document.scrollingElement || document.documentElement).scrollTop;
+    if (scrollHold) return;            // B28: held under a full screen; the move is put back in this same event ('held')
     if (lastTop > innerHeight && top < 10 && !touching && Date.now() - lastTouchEnd > 300 && Date.now() - selfScrollAt > 500) {
       homeEvent({ e: 'jump', from: screens(lastTop) });
     }
@@ -4408,11 +4409,12 @@
   const downIds = new Set();           // touch identifiers the page saw go down and not up
   let lastTouchEndAt = 0, lastFsChangeAt = 0;
   let reelBox = null;                  // R9's Reel layer
-  // B28: the page's scroll position held under the full screen (page mode), a
-  // pause made by a tap in full screen (kept), and the full screen's run: its
-  // sound and replay budgets and the frame check (fullRunStart).
+  // B28: the page's scroll position held under the full screen (page mode),
+  // what the last tap in full screen did (a pause is kept, and so is a play),
+  // and the full screen's run: its sound and replay budgets and the frame
+  // check (fullRunStart).
   let scrollHold = null;               // { y }: the scrolling element's scrollTop at the request
-  let fullUserPaused = false;
+  let fullUserPaused = false, fullUserPlayed = false;
   let fullRun = null;
   function searchOpen() { return typeof search !== 'undefined' && !!search.open; }
   function isField(el) {
@@ -4467,8 +4469,9 @@
   }
   function togglePlay(v) {
     // B28: a pause by a tap in SimpleGram's full screen is yours: it isn't
-    // played again under the full screen, nor on the way back.
-    if (v === r8El) fullUserPaused = !v.paused;
+    // played again under the full screen, nor on the way back. A play there
+    // is yours too (kept on the way back). Neither costs the sound budget.
+    if (v === r8El) { fullUserPaused = !v.paused; fullUserPlayed = v.paused; ownPlayPause(); }
     if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } else v.pause();
   }
 
@@ -4692,6 +4695,8 @@
     se.scrollTop = h.y;
     fvStats.scrollHeld++;
     fvStats.scrollHeldMax = Math.max(fvStats.scrollHeldMax, Math.round(Math.abs(moved)));
+    // Home's log: the web view's move, put back (not a 'jump'); once a full screen.
+    if (!h.noted && route() === 'home') { h.noted = true; homeEvent({ e: 'held', from: screens(h.y) }); }
   }
   let scrollHoldOnDoc = false;
   const scrollHoldScroll = safe(e => { if (e.target === document) scrollHoldCheck(); });
@@ -4714,15 +4719,19 @@
    * video) is paused at once. The full-screen video paused by anyone but a tap
    * in full screen is played again, 6 times a full screen at most: Instagram
    * pauses a video it thinks is off screen every time, and fighting on would
-   * show a still picture anyway. Its sound goes on the element itself, never
-   * through Instagram's control (that flips the feed-wide setting, and with
-   * the page scrolled under the full screen it could be another post's); when
-   * Instagram mutes it again (its effect runs on every paused change) it is
-   * set back, 8 times at most. The run also notes, every 250 ms, whether the
-   * video presents new frames while its clock runs (framesStalled). */
+   * show a still picture anyway (the web view's own pause, with the app in
+   * the background, isn't fought: the video plays again when the app is
+   * back). Its sound goes on the element itself, never through Instagram's
+   * control (that flips the feed-wide setting, and with the page scrolled
+   * under the full screen it could be another post's); when Instagram mutes
+   * it again (its effect runs on every paused change) it is set back: always
+   * after a play or pause of SimpleGram's own, 8 times at most otherwise. The
+   * run also notes, every 250 ms, whether the video presents new frames while
+   * its clock runs (framesStalled). */
   function fullRunStart(v) {
     fullRunStop();
-    const run = { v: v, sounds: 0, replays: 0, gaveUp: false, frames: 0, seen: 0, clock: v.currentTime, cb: 0, timer: 0 };
+    const run = { v: v, sounds: 0, fights: 0, ownAt: 0, replays: 0, gaveUp: false, bg: false,
+      frames: 0, seen: 0, clock: v.currentTime, cb: 0, timer: 0 };
     fullRun = run;
     if (typeof v.requestVideoFrameCallback !== 'function') return;
     const onFrame = () => { run.frames++; if (fullRun === run) { try { run.cb = v.requestVideoFrameCallback(onFrame); } catch (e) { run.cb = 0; } } };
@@ -4742,13 +4751,22 @@
     clearInterval(r.timer);
     try { if (r.cb) r.v.cancelVideoFrameCallback(r.cb); } catch (e) { /* gone */ }
   }
-  // Sound for SimpleGram's own full-screen video: on the element, within the run's budget.
+  // SimpleGram's own play or pause of the full-screen video (your tap, the
+  // 150 ms check, a replay): Instagram's effect answers each with a re-mute,
+  // which is no fight.
+  function ownPlayPause() { if (fullRun) fullRun.ownAt = Date.now(); }
+  // Sound for SimpleGram's own full-screen video: on the element, within the
+  // run's budget. The budget (8) is for a fight with Instagram: a re-mute that
+  // answers SimpleGram's own play or pause costs nothing, or four pause/play
+  // taps would spend it and leave a long clip silent. A hard stop at 40 sets
+  // a full screen, should Instagram ever answer the set itself.
   function fullSound(v) {
     const run = fullRun;
     if (!v.muted) return;
     if (run) {
-      if (run.sounds >= 9) return;
-      if (run.sounds) fvStats.remuted++;
+      const own = Date.now() - run.ownAt < 500;
+      if (run.sounds >= 40 || (run.sounds && !own && run.fights >= 8)) return;
+      if (run.sounds) { fvStats.remuted++; if (!own) run.fights++; }
       run.sounds++;
     }
     v.muted = false;
@@ -4762,12 +4780,23 @@
   document.addEventListener('pause', safe(e => {
     const v = e.target, run = fullRun;
     if (!run || v !== r8El || !fullVideoOn() || r8Mode !== 'page' || fullUserPaused || v.ended || !v.isConnected) return;
+    // The app in the background: the web view itself pauses the video. No
+    // fight (it would pause it again, or the clip would play on unheard, and
+    // the replays would be spent); it plays again when the app is back.
+    if (document.hidden) { run.bg = true; return; }
     if (run.replays >= 6) { if (!run.gaveUp) { run.gaveUp = true; fvStats.replaysGaveUp++; } return; }
     run.replays++;
     fvStats.replays++;
+    ownPlayPause();
     const p = v.play();
     if (p && p.catch) p.catch(() => {});
   }), true);
+  document.addEventListener('visibilitychange', safe(() => {
+    const run = fullRun, v = r8El;
+    if (document.hidden || !run || !run.bg || !v || !fullVideoOn() || r8Mode !== 'page') return;
+    run.bg = false;
+    if (v.paused && !fullUserPaused && !v.ended && v.isConnected) { ownPlayPause(); const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+  }));
   document.addEventListener('volumechange', safe(e => {
     const v = e.target;
     if (!fullRun || v !== r8El || !v.muted || !fullVideoOn() || soundBlocked(v) || !wantsSound(v)) return;
@@ -4869,7 +4898,7 @@
         r8On = true;
         bump(fvStats, fullKind === 'r8' ? 'r8' : 'r10');
         const v = r8El, kind = fullKind;
-        fullUserPaused = false;
+        fullUserPaused = fullUserPlayed = false;
         if (r8Mode === 'page' && !liftVideo(v)) {
           // Full screen with nothing lifted over it would show the feed: leave at once.
           fvStats.liftFailed++;
@@ -4884,7 +4913,7 @@
         setTimeout(safe(() => {
           if (!fullVideoOn() || r8El !== v) return;
           scrollHoldCheck();
-          if (kind !== 'r8' && v.paused && !v.ended && !fullUserPaused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+          if (kind !== 'r8' && v.paused && !v.ended && !fullUserPaused) { ownPlayPause(); const p = v.play(); if (p && p.catch) p.catch(() => {}); }
           else if (v.muted && !soundBlocked(v) && !v.paused && wantsSound(v)) unmute(v);
         }), 150);
       }
@@ -4902,7 +4931,7 @@
       r8Mode = 'element';
       fullKind = 'r8';
       r10Snap = null;
-      fullUserPaused = false;
+      fullUserPaused = fullUserPlayed = false;
       el.dataset.sgFull = '1';
       fsCounts.r8Adopted++;
       via = 'r8-adopted';
@@ -4926,10 +4955,10 @@
         // R10: out of full screen the feed video goes back to how it was.
         const snap = r10Snap;
         r10Snap = null;
-        if (snap && wasOn && snap.v === r8El) restoreAfterFull(snap, fullUserPaused);
+        if (snap && wasOn && snap.v === r8El) restoreAfterFull(snap, fullUserPaused, fullUserPlayed);
         r8El = null;
         fullKind = '';
-        fullUserPaused = false;
+        fullUserPaused = fullUserPlayed = false;
       }
     }
     if (!el) r8ExitAt = 0;
@@ -5078,14 +5107,18 @@
   // the tap (set on the element: Instagram's feed-wide setting was never
   // touched, so its icon still agrees). B28: what you did in full screen is
   // kept: a pause you made there stays (userPaused; it used to play on), and
-  // a video that was playing before the tap and is paused now plays again.
-  function restoreAfterFull(s, userPaused) {
+  // so does a play (userPlayed). Otherwise the video goes back to how it was
+  // before the tap: one that was playing and is paused now plays again; one
+  // that was paused (R10's own play opened it) is paused again, as it was in
+  // 1.4, since Instagram's player still shows it paused.
+  function restoreAfterFull(s, userPaused, userPlayed) {
     setTimeout(safe(() => {
       const v = s.v;
       if (!v.isConnected || document.fullscreenElement) return;     // gone, or full screen again
       if (v.muted !== s.muted) v.muted = s.muted;
       if (userPaused) { if (v.paused) fvStats.r10KeptPaused++; }
       else if (!s.paused && v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+      else if (s.paused && !userPlayed && !v.paused) v.pause();
       fvStats.r10Restored++;
     }), 120);
   }
