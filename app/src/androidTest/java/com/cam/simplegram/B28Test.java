@@ -276,7 +276,12 @@ public class B28Test {
         // The real tap on B: R10's full screen.
         float[] p = center(".box[data-id=B]");
         tapAt(p[0], p[1]);
-        assertTrue("R10 opens the full screen (the app's custom view)", waitFor(this::fullScreen, 8000, "onShowCustomView"));
+        boolean opened = waitFor(this::fullScreen, 8000, "onShowCustomView");
+        if (!opened) {
+            // What the page made of the tap, for the log.
+            log("R10 did not open: " + jsText("(function(){try{var d=__sg.stats;return JSON.stringify({fullVideo:d.diag.fullVideo,fs:d.b25.fs,touch:d.b25.touchSeq})}catch(e){return 'n/a '+e}})()"));
+        }
+        assertTrue("R10 opens the full screen (the app's custom view)", opened);
         assertTrue("B is lifted over the full-screen page", waitFor(() -> "B".equals(jsText("(document.querySelector('video:popover-open')||{}).id||''")), 5000, "B lifted"));
         // Sound comes with the landing's check (150 ms), the bars hide a moment later.
         assertTrue("B plays with sound in full screen", waitFor(() -> videoIs("B", false, false), 3000, "B with sound"));
