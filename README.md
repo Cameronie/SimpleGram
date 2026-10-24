@@ -3,7 +3,7 @@
 Distraction-free Instagram for Android. Your friends' posts, Stories, Reels and
 messages — without ads, suggested posts, reposts, the Reels tab or endless scrolling.
 
-**Download:** [`dist/SimpleGram-1.4.apk`](dist/SimpleGram-1.4.apk) · Android 10 or newer.
+**Download:** [`dist/SimpleGram-1.5.apk`](dist/SimpleGram-1.5.apk) · Android 10 or newer.
 It installs over an earlier version and keeps your login.
 
 ## What it does
@@ -39,25 +39,32 @@ Extras:
 - **Home goes on into Following**: after Instagram's "You're all caught up", Home carries on
   with posts from people you follow, newest first, with no repeats, under a thin
   "You're all caught up · Following, newest first" line. After about 200 posts, or if anything
-  goes wrong, a card offers **Following** (skipping posts you already saw in Home). Switch it
+  goes wrong, a card offers **Following** (skipping posts you already saw in Home). It also starts
+  when Home simply runs out of friends' posts without Instagram's line. Switch it
   off in ⋮ → More… → Continue Home into Following; Home then ends at "caught up" with the card.
 - **Home tab scrolls first**: tapping Instagram's Home tab while you're down the feed takes you
   to the top and keeps everything; a tap at the top refreshes, like the app.
 - **Favorites star** in the bottom bar, next to Home. It opens Favorites; on Favorites it scrolls
   to the top, and at the top refreshes. Going back to Home from Favorites loads Home fresh.
 - **Full-screen video**: one tap on a video in the feed or an opened post shows it alone on the
-  whole screen, with sound (a double tap still likes). In an opened post a swipe down at the top
-  does the same, and ⋮ → Full-screen video works for the video on screen. Swipe up or down, or
-  Back, to return; tap to pause.
+  whole screen, with sound (a double tap still likes; the tap doesn't change the feed's sound
+  setting). In an opened post a swipe down at the top does the same, and ⋮ → Full-screen video
+  works for the video on screen. Swipe up or down, or Back, to return; tap to pause, and a pause
+  is kept when you go back. Only that video plays while it's up. The Android buttons stay on
+  screen (only the status bar hides), and a tap near the ⋮ tab never opens full screen.
 - **Progress bar** like the app's Reels: drag it or tap a point to rewind or skip, in full screen,
   in an opened post, in a Reel sent in a DM and on a Story's Reel.
 - **Story Reels**: on a Story that shares a Reel, swipe up to watch the Reel full screen with its
-  account, caption, counts, like, save, comments and share; the Story waits.
+  account, caption, counts, like, save, comments and share; the Story waits. Swipe up again for
+  the comments; swipe down or Back to return.
 - **Self-repair**: if scrolling ever stops working, a "Scrolling stopped. Tap to fix" button (or
-  ⋮ → Fix scrolling) rebuilds the page view in place.
+  ⋮ → Fix scrolling) rebuilds the page view in place. If Instagram's logo screen stays up (a
+  start-up file lost while you switched apps, for instance), SimpleGram reloads once by itself,
+  waits for the network if you're offline, and otherwise offers "Try again"; Copy details works
+  even then. A one-time tip explains Data Saver if it's cutting SimpleGram off.
 - **Screen stays on** while a video plays.
 - **Following** (newest first) and **Favorites** feeds in the menu too (these show everything).
-- **Clean screenshots**: hide the menu button and system bars, tap to bring them back.
+- **Clean screenshots**: hide the menu button and the status bar, tap to bring them back.
 - **Instagram links** from texts and other apps open in SimpleGram (menu → More → Open Instagram
   links…), or use Share → SimpleGram / "Open copied Instagram link".
 
