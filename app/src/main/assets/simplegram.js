@@ -5178,10 +5178,13 @@
   // the edge, so a thumb aimed at it often lands on the page beside it, and
   // over a video that was R10's full screen. The app says where the tab is
   // (menuTab: side, top and height as fractions of its root; on:false when it
-  // is hidden): a trusted touch within 56 CSS px of the tab's edge, from 24 px
-  // above it to 24 px below, opens no full screen and arms no R8 swipe. The
-  // app's own tap for ⋮ → Full-screen video is never refused (menuTapped
-  // runs first). The tap itself is still Instagram's, as any tap off a video.
+  // is hidden): a trusted touch within 56 CSS px of the tab's inner edge (the
+  // tab is 16 dp wide, flush with the screen's edge: 72 px from that edge),
+  // from 24 px above it to 24 px below, opens no full screen and arms no R8
+  // swipe. The app's own tap for ⋮ → Full-screen video is never refused
+  // (menuTapped runs first). The tap itself is still Instagram's, as any tap
+  // off a video.
+  const MENU_ZONE = 16 + 56;           // CSS px from the screen's edge: the tab, then 56 past it
   let menuZone = null;
   function menuTabSet(cmd) {
     const y = cmd ? +cmd.yFrac : NaN, h = cmd ? +cmd.hFrac : NaN;
@@ -5191,7 +5194,7 @@
   function inMenuZone(x, y) {
     const z = menuZone;
     if (!z) return false;
-    if (z.left ? x > 56 : x < innerWidth - 56) return false;
+    if (z.left ? x > MENU_ZONE : x < innerWidth - MENU_ZONE) return false;
     return y >= z.y * innerHeight - 24 && y <= (z.y + z.h) * innerHeight + 24;
   }
 

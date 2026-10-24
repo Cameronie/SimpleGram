@@ -513,7 +513,8 @@ const tabAt = (page, cmd) => page.evaluate(c => window.__sg.onNative(Object.assi
 
 test('B27: a tap beside the ⋮ tab (the app says where it is) opens no full screen: it is Instagram\'s; off the zone, or with the tab hidden, the tap opens it', async () => {
   const page = await openFeed();
-  // The tab on the right, from 40% to 46% of the screen's height: the zone is x >= 356, y 342 to 445 (24 px either way).
+  // The tab on the right, from 40% to 46% of the screen's height: the zone is x >= 340
+  // (the 16 px tab and 56 px past its inner edge), y 342 to 445 (24 px either way).
   await tabAt(page, { on: true, side: 'right', yFrac: 0.4, hFrac: 0.06 });
   await tapAt(page, 380, 400, 700);
   let s = await ig(page);
@@ -528,9 +529,9 @@ test('B27: a tap beside the ⋮ tab (the app says where it is) opens no full scr
   assert.equal(await page.evaluate(() => window.__fs.length), 2);
   await appBack(page);
   await page.waitForTimeout(500);
-  // The tab moved to the left: the zone follows it; the right side is free again.
+  // The tab moved to the left: the zone follows it (x <= 72); the right side is free again.
   await tabAt(page, { on: true, side: 'left', yFrac: 0.4, hFrac: 0.06 });
-  await tapAt(page, 30, 400, 700);
+  await tapAt(page, 60, 400, 700);
   assert.deepEqual([await page.evaluate(() => window.__fs.length), (await fv(page)).r10DeadZone], [2, 3]);
   await tapAt(page, 380, 400, 700);
   assert.equal(await page.evaluate(() => window.__fs.length), 3);
@@ -546,7 +547,7 @@ test('B27: R8\'s swipe down from beside the tab arms nothing; from the video els
   const page = await openPage(POST_URL, FEED);
   await stubWebView(page);
   await page.waitForFunction(() => window.__ig.active === 'A' && !document.getElementById('A').paused, null, { timeout: 5000 });
-  await tabAt(page, { on: true, side: 'right', yFrac: 0.1, hFrac: 0.1 });    // zone: x >= 356, y 67.5 to 207
+  await tabAt(page, { on: true, side: 'right', yFrac: 0.1, hFrac: 0.1 });    // zone: x >= 340, y 67.5 to 207
   await drag(page, [380, 120], [380, 360]);
   await page.waitForTimeout(200);
   assert.deepEqual([await page.evaluate(() => window.__fs), (await fv(page)).r10DeadZone], [[], 1]);
