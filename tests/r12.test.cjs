@@ -549,6 +549,25 @@ test('R12: diagnostics carry counts only (no names, captions, codes, ids or link
   assert.equal(m.stats.reelInfo.follow.ok, 1);
 });
 
+test('B30: the comment icon is a whole bubble (its arc fills the icon\'s square), like the others', async () => {
+  const page = await openStory();
+  await openReel(page);
+  const boxes = await page.evaluate(() => {
+    const root = document.getElementById('sg-reelinfo').shadowRoot;
+    const out = {};
+    for (const k of ['like', 'comment', 'share', 'save']) {
+      const b = root.querySelector('.' + k + ' path').getBBox();
+      out[k] = { x: Math.round(b.x * 10) / 10, y: Math.round(b.y * 10) / 10, w: Math.round(b.width * 10) / 10, h: Math.round(b.height * 10) / 10 };
+    }
+    return out;
+  });
+  const c = boxes.comment;
+  assert.ok(c.w > 16 && c.h > 16, 'spans most of the 24-unit box: ' + JSON.stringify(c));
+  assert.ok(c.x >= 0 && c.y >= 0 && c.x + c.w <= 24 && c.y + c.h <= 24, 'inside the icon: ' + JSON.stringify(c));
+  // Drawn the same size as its neighbours (the arc's centre is inside the icon, not off to the side).
+  for (const k of ['like', 'share', 'save']) assert.ok(Math.abs(boxes[k].w - c.w) < 6 && Math.abs(boxes[k].h - c.h) < 6, k + ' vs comment: ' + JSON.stringify(boxes));
+});
+
 // An opened post with a video at the top (as in video.test.cjs).
 const POST = `<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0">
   <main><article><header style="height:60px">creator</header>

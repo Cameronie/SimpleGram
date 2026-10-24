@@ -5274,7 +5274,9 @@
   }
   const R12_ICONS = {
     heart: '<svg viewBox="0 0 24 24" class="i heart"><path d="M12 20.6s-7.4-4.5-9.4-9C1.2 8.3 3.2 4.5 6.8 4.5c2.1 0 3.9 1.2 5.2 3 1.3-1.8 3.1-3 5.2-3 3.6 0 5.6 3.8 4.2 7.1-2 4.5-9.4 9-9.4 9z"/></svg>',
-    comment: '<svg viewBox="0 0 24 24" class="i"><path d="M20.7 16.8A9.2 9.2 0 1 1 17.2 20.4L21.8 21.9Z"/></svg>',
+    // B30: the bubble as Instagram draws it, a full circle (centre 12.6, 12.4) with
+    // the tail at the bottom right. The other sweep put the centre outside the icon.
+    comment: '<svg viewBox="0 0 24 24" class="i"><path d="M20.7 16.8A9.2 9.2 0 1 0 17.2 20.4L21.8 21.9Z"/></svg>',
     share: '<svg viewBox="0 0 24 24" class="i"><path d="M21.5 2.5 10 13.2M21.5 2.5l-6.9 19-4.6-8.3-8-4.4z"/></svg>',
     save: '<svg viewBox="0 0 24 24" class="i save"><path d="M19 21.2 12 15.4 5 21.2V2.8h14z"/></svg>',
     badge: '<svg viewBox="0 0 24 24" class="badge"><circle cx="12" cy="12" r="10" fill="#3897f0"/><path d="m7.5 12.3 3 3 6-6.3" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
