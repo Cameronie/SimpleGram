@@ -113,26 +113,22 @@ public class ShellTest {
      * window for a moment and refuses the key as if it were for another app;
      * a real press a moment later lands, so this one tries again too.
      */
-    private static void pressBack() {
-        Instrumentation inst = InstrumentationRegistry.getInstrumentation();
+    /**
+     * A Back key the way the window delivers one: the decor view dispatches it,
+     * so the Activity sees it first and then the focused view, as with a real
+     * key. (Injecting through the input system was refused or lost whenever the
+     * window manager's focus lagged the test on a slow emulator; what is under
+     * test is the order inside the window, which this keeps.)
+     */
+    private static void pressBack(ActivityScenario<MainActivity> s) {
         long t = SystemClock.uptimeMillis();
         KeyEvent down = new KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0);
         KeyEvent up = new KeyEvent(t, t + 30, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK, 0);
-        // UiAutomation may inject into any window; the plain way is refused while
-        // the window manager has no focused window.
-        if (!inst.getUiAutomation().injectInputEvent(down, true) || !inst.getUiAutomation().injectInputEvent(up, true)) {
-            SecurityException last = null;
-            for (int i = 0; i < 20; i++) {
-                try {
-                    inst.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
-                    return;
-                } catch (SecurityException e) {
-                    last = e;
-                    SystemClock.sleep(250);
-                }
-            }
-            throw last;
-        }
+        s.onActivity(a -> {
+            View decor = a.getWindow().getDecorView();
+            decor.dispatchKeyEvent(down);
+            decor.dispatchKeyEvent(up);
+        });
     }
 
     private static void idle() {
@@ -1040,14 +1036,14 @@ public class ShellTest {
                 s.onActivity(a -> f[0] = a.hasWindowFocus());
                 return f[0];
             }, 45000));
-            pressBack();
+            pressBack(s);
             idle();
             assertEquals("Back never reached the full-screen view", 0, eaten[0]);
             assertFalse("the Story's full screen stays", hidden[0]);
             assertNotNull(story.getParent());
             assertEquals(View.VISIBLE, menuTab(act.get()).getVisibility());
             // The next Back ends the Story's full screen through the app.
-            pressBack();
+            pressBack(s);
             idle();
             assertTrue(hidden[0]);
             assertEquals(0, eaten[0]);
