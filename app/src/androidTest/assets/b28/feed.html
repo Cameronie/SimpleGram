@@ -88,6 +88,11 @@ article header{height:56px;line-height:56px;padding-left:12px}
       ids.map(id => { const r = document.querySelector('.box[data-id="' + id + '"]').getBoundingClientRect(); return Math.round(r.top); }).join('/')].join(' '));
     if (T.length > 600) T.shift();
   }, 100);
+  // Raw touches at the window, for the test's log: did the finger reach the page at all?
+  const R = window.__raw = { ts: 0, te: 0, click: 0, tsAt: 0 };
+  window.addEventListener('touchstart', () => { R.ts++; R.tsAt = Math.round(performance.now()); }, { capture: true, passive: true });
+  window.addEventListener('touchend', () => { R.te++; }, { capture: true, passive: true });
+  window.addEventListener('click', () => { R.click++; }, true);
   window.b28ready = 1;
 })();
 </script></body></html>

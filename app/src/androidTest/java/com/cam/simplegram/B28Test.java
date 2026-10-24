@@ -288,6 +288,7 @@ public class B28Test {
         boolean opened = waitFor(this::fullScreen, 8000, "onShowCustomView");
         if (!opened) {
             // What the page made of the tap, for the log.
+            log("raw touches at the page: " + jsText("JSON.stringify(window.__raw)") + "  now " + jsText("Math.round(performance.now())"));
             log("R10 did not open: " + jsText("(function(){try{var d=__sg.stats;return JSON.stringify({fullVideo:d.diag.fullVideo,fs:d.b25.fs,touch:d.b25.touchSeq})}catch(e){return 'n/a '+e}})()"));
         }
         assertTrue("R10 opens the full screen (the app's custom view)", opened);
