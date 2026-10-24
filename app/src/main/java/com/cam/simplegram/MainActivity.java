@@ -103,7 +103,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private WebView web;
     private CommentsPanel comments;
     private TextView menuButton;
-    private TouchDelegate tabDelegate;      // B27: the tab's extra room (its dead zone), asked before the page is
+    private TouchDelegate tabDelegate;      // B27: the tab's extra room (its dead zone); asked before the page view is
     private TextView zoomChip;
     private View feedBar;
     private TextView feedTitle;
@@ -209,7 +209,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     static long bootWatchMs = 30_000, bootProbeMs = 2_000, bootReloadFollowMs = 3_000, bootSettleMs = 1_000;
     static long bootResumeMinShownMs = 8_000;     // the resume check reloads a logo only after this much time on screen
     private static final int RELOADS_PER_10_MIN = 2;
-    private int bootSeq;                  // the native token of the newest main-frame page start (kept in prefs: unique across restarts)
     private BootWatch watch;              // the page start being watched, or null
     private BootChain chain;              // the ladder's place for the current page; survives its reloads and rebuilds
     private String startHow = "";         // how the next main-frame page start began, set by whoever starts it
@@ -2705,7 +2704,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
     }
 
-
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
@@ -3035,7 +3033,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         final String url, how;
         final long startedAt = SystemClock.uptimeMillis();
         long shownMs, shownSince;         // on-screen time so far; when the current stretch began (0 off screen)
-        boolean booted, stuck, hurt, probing, recovering;
+        boolean booted, stuck, hurt, recovering;
         String hurtWhy = "", pageToken = "";
         int probeMisses;                  // misses in the current probe round (two make a busy page)
         JSONObject probe;                 // the app's own probe's last answer
@@ -3045,8 +3043,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         BootWatch(WebView view, String url, String how) {
             // The logs are matched by this number, so it must never repeat: a new
             // Activity (a recreate, a fresh process) carries on from the last one.
-            seq = bootSeq = prefs.getInt("bootSeq", 0) + 1;
-            prefs.edit().putInt("bootSeq", bootSeq).apply();
+            seq = prefs.getInt("bootSeq", 0) + 1;
+            prefs.edit().putInt("bootSeq", seq).apply();
             this.view = view;
             this.url = url;
             this.how = how;
@@ -3339,7 +3337,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     private void probeOnce(BootWatch w, ValueCallback<JSONObject> cb) {
         if (w.view != web || isDestroyed()) return;
-        w.probing = true;
         final boolean[] done = {false};
         Runnable timeout = () -> {
             if (done[0]) return;
@@ -3347,7 +3344,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             probeTimeout = null;
             w.probeMisses++;
             if (w.probeMisses >= 2) {
-                w.probing = false;
                 cb.onReceiveValue(null);
             } else {
                 probeOnce(w, cb);
@@ -3360,7 +3356,6 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 done[0] = true;
                 ui.removeCallbacks(timeout);
                 probeTimeout = null;
-                w.probing = false;
                 cb.onReceiveValue(parseProbe(v));
             });
         } catch (RuntimeException e) {
