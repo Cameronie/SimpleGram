@@ -110,6 +110,14 @@ swiping a video up as the very first touch after opening the app, or right after
 the comments panel (whose own WebView takes the focus) closed, would do nothing.
 The old emulator WebView (74) had no such rule, which is why the tests passed
 there. Fix in 1.5: the WebView takes focus in `onCreate`, after a full screen
-ends, when the comments panel closes and on resume when nothing holds the focus
-(`focusWeb`). Checked by `dumpsys activity top` (the `F` flag) and by B25Test's
-R8 cases on WebView 158.
+ends, when the comments panel closes, on resume when nothing holds the focus
+(`focusWeb`), and when a finger lands on the page while the comments panel's
+WebView holds the focus (a review found that a swipe on the post above an open
+panel would still have been refused). Checked by `dumpsys activity top` (the `F`
+flag), by B25Test's R8 cases on WebView 158 and by ShellTest's
+`webViewHoldsTheFocusForFullScreenRequests`. Copy details now records, for each
+page full-screen request, whether the WebView held the focus
+(`device.b25.fs.startsUnfocused`, `lastStartFocused`), the attempt number and
+time of a refusal (`page.diag.fullVideo.r8FailNth`, `r8FailAt`), and why a tap
+on a video was not taken as R10's tap (`r10IgnoredWhy`: no touchstart, fingers,
+moved, long; `r10NoVideo` when no video was under it).

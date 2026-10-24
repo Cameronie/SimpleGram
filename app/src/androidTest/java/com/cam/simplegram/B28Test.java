@@ -309,7 +309,7 @@ public class B28Test {
         if (!opened) {
             // What the page made of the tap, for the log.
             log("raw touches at the page: " + jsText("JSON.stringify(window.__raw)") + "  now " + jsText("Math.round(performance.now())"));
-            log("R10 did not open: " + jsText("(function(){try{var d=__sg.stats;return JSON.stringify({fullVideo:d.diag.fullVideo,fs:d.b25.fs,touch:d.b25.touchSeq})}catch(e){return 'n/a '+e}})()"));
+            log("R10 did not open: " + jsText("(function(){try{var d=__sg.stats;return JSON.stringify({fullVideo:d.diag.fullVideo,fs:d.b25.fs,touch:d.b25.touchSeq,errors:d.errors,cfg:{tapMaxMs:__sg.cfg.tapMaxMs,touchStaleMs:__sg.cfg.touchStaleMs},route:__sg.route&&__sg.route()})}catch(e){return 'n/a '+e}})()"));
         }
         assertTrue("R10 opens the full screen (the app's custom view)", opened);
         assertTrue("B is lifted over the full-screen page", waitFor(() -> "B".equals(jsText("(document.querySelector('video:popover-open')||{}).id||''")), 5000, "B lifted"));

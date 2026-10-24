@@ -4,6 +4,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import android.app.Instrumentation;
@@ -1048,6 +1049,107 @@ public class ShellTest {
             assertTrue(hidden[0]);
             assertEquals(0, eaten[0]);
             assertNull(story.getParent());
+            // The page view has the focus back (Chromium grants a full screen only to a focused WebView).
+            idle();
+            assertTrue("the page view has the focus back", zoomOf(act.get()).getChildAt(0).hasFocus());
+        }
+    }
+
+    /**
+     * Chromium grants a page's full-screen request only to a WebView that holds
+     * Android's view focus. An app targeting Android 9+ starts with none in touch
+     * mode and a swipe never focuses the WebView, so the app gives it the focus:
+     * at start, when a finger lands on it while the comments panel's WebView has
+     * the focus, when the panel closes, and on resume when nothing holds it.
+     */
+    @Test
+    public void webViewHoldsTheFocusForFullScreenRequests() throws Exception {
+        InstrumentationRegistry.getInstrumentation().setInTouchMode(true);
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            MainActivity a = act.get();
+            ZoomFrame z = zoomOf(a);
+            CommentsPanel panel = panelOf(a);
+            View page = z.getChildAt(0);
+            assertTrue("the app's window has focus", waitFor(() -> {
+                boolean[] f = new boolean[1];
+                s.onActivity(x -> f[0] = x.hasWindowFocus());
+                return f[0];
+            }, 45000));
+            idle();
+            // 1. At start.
+            assertTrue("focused at start", page.hasFocus());
+            assertSame(page, a.getCurrentFocus());
+
+            // 2. The comments panel is up and its WebView took the focus (a tap in it does that).
+            JSONObject msg = new JSONObject()
+                    .put("code", "ABCDEFG")
+                    .put("rect", new JSONObject().put("x", 0).put("y", 120).put("w", 412).put("h", 515))
+                    .put("dpr", 2.625);
+            s.onActivity(x -> {
+                try {
+                    call(x, "openComments", new Class<?>[]{JSONObject.class}, msg);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            SystemClock.sleep(500);
+            idle();
+            assertTrue(panel.isOpen());
+            s.onActivity(x -> panel.web().requestFocus());
+            idle();
+            assertTrue("the panel's WebView took the focus", panel.web().hasFocus());
+            assertFalse(page.hasFocus());
+            // A finger landing on the page (above the panel) gives the page the focus back; the panel stays.
+            View decor = a.getWindow().getDecorView();
+            int top = Math.round(((View) z.getParent()).getHeight() * 0.42f);
+            s.onActivity(x -> tap(decor, 200, Math.max(10, top - 40)));
+            idle();
+            assertTrue("a touch on the page focuses it", page.hasFocus());
+            assertTrue(panel.isOpen());
+            // A finger landing on the panel leaves the panel's focus alone.
+            s.onActivity(x -> panel.web().requestFocus());
+            idle();
+            s.onActivity(x -> tap(decor, 200, top + 60));
+            idle();
+            assertTrue("a touch on the panel leaves its focus", panel.web().hasFocus());
+            // 3. Closing the panel hands the focus back at once (the panel is still sliding away).
+            s.onActivity(MainActivity::onBackPressed);
+            idle();
+            assertFalse(panel.isOpen());
+            assertTrue("focused as the panel closes", page.hasFocus());
+            SystemClock.sleep(600);
+            idle();
+            assertTrue("focused once the panel is gone", page.hasFocus());
+
+            // 4. On resume when nothing holds the focus (a focused view was removed).
+            View standIn = new View(a);
+            standIn.setFocusable(true);
+            standIn.setFocusableInTouchMode(true);
+            s.onActivity(x -> {
+                ((ViewGroup) z.getParent()).addView(standIn, new android.widget.FrameLayout.LayoutParams(10, 10));
+                standIn.requestFocus();
+            });
+            idle();
+            assertTrue(standIn.hasFocus());
+            s.onActivity(x -> ((ViewGroup) z.getParent()).removeView(standIn));
+            idle();
+            s.moveToState(Lifecycle.State.STARTED);
+            s.moveToState(Lifecycle.State.RESUMED);
+            idle();
+            assertTrue("focused again after a resume", page.hasFocus());
+            // 5. A view that holds the focus keeps it across a resume (nothing is stolen).
+            s.onActivity(x -> {
+                ((ViewGroup) z.getParent()).addView(standIn, new android.widget.FrameLayout.LayoutParams(10, 10));
+                standIn.requestFocus();
+            });
+            idle();
+            s.moveToState(Lifecycle.State.STARTED);
+            s.moveToState(Lifecycle.State.RESUMED);
+            idle();
+            assertTrue("a focused view keeps the focus", standIn.hasFocus());
+            assertFalse(page.hasFocus());
         }
     }
 

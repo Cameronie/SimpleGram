@@ -4833,7 +4833,7 @@
   // around the ⋮ tab (B27); framesStalled: quarter seconds the clock ran with no new
   // frame; exitsBy: why each full screen was left, by reason.
   const fvStats = { r8: 0, r9: 0, exits: 0, r8Failed: 0, r9Missing: 0, r9Moved: 0, r9Pressed: 0,
-    r10: 0, r10Doubles: 0, r10Skipped: 0, r10Menu: 0, r10MenuNone: 0, r10Restored: 0, liftFailed: 0,
+    r10: 0, r10Doubles: 0, r10Skipped: 0, r10Ignored: 0, r10NoVideo: 0, r10Menu: 0, r10MenuNone: 0, r10Restored: 0, liftFailed: 0,
     scrollHeld: 0, scrollHeldMax: 0, othersPaused: 0, replays: 0, replaysGaveUp: 0, remuted: 0, r10KeptPaused: 0,
     r10DeadZone: 0, framesStalled: 0, exitsBy: {} };
   let gesture = null;                  // the current one-finger touch
@@ -5272,8 +5272,13 @@
   // The event's own time (when the finger lifted) is far behind now.
   function staleTouch(e) {
     const lag = performance.now() - e.timeStamp;
-    // CFG.touchStaleMs: the on-device tests on a slow emulator raise the limit.
-    return lag > (CFG.touchStaleMs || R8_STALE_MS) && lag < 60000;
+    return lag > testMs(CFG.touchStaleMs, R8_STALE_MS) && lag < 60000;
+  }
+  // A limit the on-device tests may raise (a slow emulator takes over a second
+  // to deliver a tap); anything but a sane number means the built-in one.
+  function testMs(v, dflt) {
+    const n = +v;
+    return n > 0 && n < 60000 ? n : dflt;
   }
   // The one way SimpleGram leaves a full screen it is in. The app does it as Back
   // does, its full-screen view first and then the browser, so a finger already
@@ -5310,6 +5315,8 @@
     const fail = why => {
       fvStats.r8Failed++;
       fvStats.r8FailWhy = String(why && why.message || why || '?').slice(0, 120) + ' (' + r8Mode + ')';
+      fvStats.r8FailNth = fvStats.r8 + fvStats.r8Failed;        // 1: the very first attempt
+      fvStats.r8FailAt = Math.round(performance.now() / 1000);
       if (r8El === v) r8Pending = false;
       if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; fullKind = ''; r10Snap = null; scrollHoldOff(); }
       syncFullHold();
@@ -5520,15 +5527,16 @@
     const s = tapSeq;
     tapSeq = null;
     if (menuArm && menuTapped(e)) return;
-    // A tap, not a long press. CFG.tapMaxMs: the on-device tests on a slow emulator
-    // take over a second to deliver one.
-    if (!s || s.fresh || s.multi || s.moved || performance.now() - s.at > (CFG.tapMaxMs || 900)) return;
+    // A tap, not a long press. Copy details says why a tap was no tap (r10IgnoredWhy).
+    const ignored = !s ? 'no touch' : s.fresh ? 'no touchstart' : s.multi ? 'fingers' : s.moved ? 'moved'
+      : performance.now() - s.at > testMs(CFG.tapMaxMs, 900) ? 'long ' + Math.round(performance.now() - s.at) : '';
+    if (ignored) { fvStats.r10Ignored++; fvStats.r10IgnoredWhy = ignored; return; }
     // B28: the second tap of a double tap. R10 held the first tap's click, so
     // Instagram gets it now, just before this one: click, click (its single-tap
     // timer arms and clears; its touch-counted double tap likes).
     if (s.second) { if (s.first) replayClick(s.first); return; }
     const v = r10Video(e.target, e.clientX, e.clientY);
-    if (!v) return;
+    if (!v) { fvStats.r10NoVideo++; return; }
     // B25: no switch while one settles, and none from a lift handled too late.
     if (fullScreenSettling() || staleTouch(e)) {
       fvStats.r10Skipped++;

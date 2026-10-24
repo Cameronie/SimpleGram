@@ -117,6 +117,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private WebChromeClient.CustomViewCallback customViewCallback;
     private int fullScreens;
     private int fullScreenNested;
+    private int fullStartsUnfocused;       // page full-screen requests made while the WebView had no view focus
+    private boolean fullStartLastFocused = true;
     private String fullScreenLast = "";
     // A Reel the page plays over a Story (R9): Back closes it, not the Story.
     private boolean pageVideo;
@@ -261,6 +263,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 if (tabDelegate != null && menuButton != null && menuButton.getVisibility() == View.VISIBLE
                         && tabDelegate.onTouchEvent(ev)) {
                     return true;
+                }
+                // A finger landing on the page view gives it the view focus a tap would
+                // (a swipe doesn't): with the comments panel open, its WebView holds the
+                // focus after a tap in it, and Chromium would refuse the page's next
+                // full-screen request (see focusWeb).
+                if (ev.getActionMasked() == MotionEvent.ACTION_DOWN && customView == null && web != null
+                        && !web.hasFocus() && !hitsComments(ev)) {
+                    web.requestFocus();
                 }
                 return super.dispatchTouchEvent(ev);
             }
@@ -968,7 +978,12 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 break;
             case "fullVideoStart":
                 // The page is about to ask for full screen for a video of its own.
-                if (main) ownFullAt = SystemClock.uptimeMillis();
+                if (main) {
+                    ownFullAt = SystemClock.uptimeMillis();
+                    // Copy details: Chromium grants the request only to a focused WebView.
+                    fullStartLastFocused = web.hasFocus();
+                    if (!fullStartLastFocused) fullStartsUnfocused++;
+                }
                 break;
             case "fullVideoTap":
                 // R10 from the menu: the page names a spot on its video; the app taps it.
@@ -1383,6 +1398,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (getCurrentFocus() == null) web.requestFocus();
     }
 
+    /** Whether a touch lands on the comments panel while it is up. */
+    private boolean hitsComments(MotionEvent ev) {
+        if (comments == null || comments.getVisibility() != View.VISIBLE) return false;
+        Rect r = new Rect();
+        comments.getHitRect(r);
+        return r.contains((int) ev.getX(), (int) ev.getY());
+    }
+
     private void closeComments() {
         if (!comments.isOpen()) return;
         InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
@@ -1390,7 +1413,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         comments.close();
         // The panel's WebView had the focus and keeps it while the panel slides
         // away; the main WebView takes it back now (see focusWeb).
-        if (customView == null) web.requestFocus();
+        if (customView == null && !web.hasFocus()) web.requestFocus();
         if (commentsOverFull) {
             commentsOverFull = false;
             comments.setTranslationZ(0f);
@@ -1978,7 +2001,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (fv != null) {
                 b.append("\nFull-screen video\n")
                         .append("  Posts and Reels (swipe down): ").append(fv.optInt("r8"))
-                        .append(" · didn't open: ").append(fv.optInt("r8Failed")).append('\n')
+                        .append(" · didn't open: ").append(fv.optInt("r8Failed"))
+                        .append(fv.optString("r8FailWhy").isEmpty() ? "" : " (" + fv.optString("r8FailWhy") + ")").append('\n')
                         .append("  Reels in Stories (swipe up): ").append(fv.optInt("r9"))
                         .append(" · not found: ").append(fv.optInt("r9Missing"))
                         .append(" · Story moved on: ").append(fv.optInt("r9Moved"))
@@ -3916,6 +3940,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 .put("open", touchOpen);
         JSONObject fs = new JSONObject()
                 .put("last", new JSONArray(fsLog))
+                .put("startsUnfocused", fullStartsUnfocused)
+                .put("lastStartFocused", fullStartLastFocused)
                 .put("showDuringTouch", showDuringTouch)
                 .put("hideDuringTouch", hideDuringTouch);
         JSONObject z = new JSONObject()

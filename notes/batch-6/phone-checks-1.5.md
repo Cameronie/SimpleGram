@@ -60,6 +60,7 @@ only, never names, captions or links.
 | What | Field |
 | --- | --- |
 | Full screen (B28) | `page.diag.fullVideo` (scrollHeld, othersPaused, replays, remuted, r10KeptPaused, r10DeadZone, exitsBy), `page.b25.fsPage` (y, vh, t, playing), `device.b25.fsLog` (why, time) |
+| A tap or swipe that opened nothing | `page.diag.fullVideo.r8FailWhy` / `r8FailNth` / `r8FailAt` (the browser refused), `r10SkipWhy`, `r10IgnoredWhy` / `r10NoVideo` (the tap wasn't taken as one), `device.b25.fs.startsUnfocused` (requests made without the WebView's focus) |
 | Progress bar (B31) | `page.seekBar` |
 | Story Reel swipes (B29) | `page.reelInfo.swipeComments` |
 | Continuation (B32) | `page.cont.startVia`, `page.cont.headWhy.noLine` |
