@@ -1,6 +1,6 @@
 # B28 / B31 diagnosis: R10's full screen pauses the video and another one plays
 
-**Status: cause of the still picture and the other video's sound found, and reproduced on a real Android WebView (158; the phone has 156). The exits in report (2) and B31 are not settled.**
+**Status: cause of the still picture and the other video's sound found, and reproduced on a real Android WebView (158; the phone has 156). B31 has the same cause (Cam confirmed a Home video). The exits in report (2) are not settled.**
 
 ## In one paragraph
 
@@ -37,7 +37,7 @@ To show a feed video full screen with its progress bar, 1.4 puts the whole page 
 | (2) a still picture while "its audio kept playing" | The still picture is B, paused by Instagram. The sound was most likely the video at the top of Home, which can be the one just before. |
 | (1) after a pause in full screen and Back, the next full screen "was still paused, it wouldn't play", the music video heard | Same, on the second full screen. Back from the first one, SimpleGram had also played B again, undoing the pause (a separate defect, below). |
 | (2) taps in full screen went back to Home, then every tap flipped between Home and full screen | **Not reproduced.** Copy details show those exits were asked for by SimpleGram's page within 40–50 ms of a finger lifting (its swipe rule; its "video gone" rule would have fired without a tap). Likeliest cause: with the system bars hidden, reaching for Back/Home means swiping up from the bottom edge to bring the bars back, and that swipe also reaches the page as a swipe that leaves full screen (B26 removes the need). On Home, every tap on the video is R10 again, so it went straight back into full screen. Copy details will record the reason next time. |
-| B31: scrubbing moved the time but the picture froze | **Not settled.** If it was in Home's full screen, it's the same cause: Instagram keeps the video paused, and its streaming doesn't fetch the part you jump to for a video it has stopped. But Copy details were taken before the Story Reel (no Story Reel in them, last full screen 14:14), and the screenshots show the Story's Reel (mikeposner, 2:11). If the scrub was on the Story Reel, it's a different problem: that layer plays SimpleGram's own copy of the video, which Instagram's feed doesn't control, and nothing scrolls there. Asked Cam which it was. |
+| B31: scrubbing moved the time but the picture froze | Same cause (Cam confirmed it was a Home video in full screen). The bar shows where you drag. Instagram keeps the video paused, and its streaming doesn't fetch the part you jump to for a video it has stopped, so the picture never catches up. |
 | (3) the "You're all caught up" card after coming back | Probably not the full screen itself. In that WebView Home had ended without carrying on into Following (Copy details: the continuation never started; see B32), and the app holds the card back while full screen is up, so it shows the moment you come back. |
 
 ## Other defects found on the way (all to fix with B28)
