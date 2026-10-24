@@ -152,9 +152,9 @@
   const BOOT_INFLIGHT_MS = 20000;   // a request on its way is progress this long after it started
   const BOOT_STATIC = /^https:\/\/static\.cdninstagram\.com\/rsrc\.php\//;
   const nativeSetTimeout = window.setTimeout, nativeClearTimeout = window.clearTimeout, NativeObserver = window.MutationObserver;
-  // What the status report carries; the full record is bootRecord().
+  // What the status report carries; the full record is bootRecord(), with
   // scripts: Instagram's start-up files (data-bootloader-hash) as seen, loaded,
-  // failed, still pending, and retried; own: SimpleGram's part in the start
+  // failed, still pending, and retried. own: SimpleGram's part in the start
   // (payloads rooted in Instagram's start-up data, how many a rule changed and
   // which keys fired, and the continuation asking Instagram's require from
   // inside a data hook).
