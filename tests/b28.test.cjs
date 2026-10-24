@@ -507,6 +507,21 @@ test('B28: diagnostics: the full-screen log carries the scroll, the viewport, th
   assert.doesNotMatch(JSON.stringify(m.stats), /friend_|clip-|instagram\.com/);
 });
 
+test('B28: diagnostics: a video whose clock runs while no new frame comes counts as stalled, a quarter second at a time', async () => {
+  const page = await openFeed();
+  // The frames never come (the callback is never answered), though the clip plays on.
+  await page.evaluate(() => { document.getElementById('B').requestVideoFrameCallback = () => 1; });
+  await openFull(page);
+  await page.waitForTimeout(1100);
+  const f = await fv(page);
+  assert.ok(f.framesStalled >= 2 && f.framesStalled <= 5, JSON.stringify(f));
+  assert.equal(await page.evaluate(() => document.getElementById('B').paused), false);
+  // Back: the check ends with the full screen.
+  await appBack(page);
+  await page.waitForTimeout(600);
+  assert.equal((await fv(page)).framesStalled, f.framesStalled);
+});
+
 /* ---------------- B27: the dead zone around the ⋮ tab ---------------- */
 
 const tabAt = (page, cmd) => page.evaluate(c => window.__sg.onNative(Object.assign({ type: 'menuTab' }, c)), cmd);
@@ -519,9 +534,9 @@ test('B27: a tap beside the ⋮ tab (the app says where it is) opens no full scr
   await tapAt(page, 380, 400, 700);
   let s = await ig(page);
   assert.deepEqual([await page.evaluate(() => window.__fs), s.singles, s.sound, (await fv(page)).r10DeadZone], [[], 1, true, 1], 'refused; Instagram\'s own tap ran');
-  await tapAt(page, 380, 440, 700);                      // still within the 24 px below
+  await tapAt(page, 345, 440, 700);                      // still within: 67 px from the edge, in the 24 px below
   assert.deepEqual([await page.evaluate(() => window.__fs.length), (await fv(page)).r10DeadZone], [0, 2]);
-  await tapAt(page, 300, 400, 700);                      // 112 px in: off the zone
+  await tapAt(page, 330, 400, 700);                      // 82 px in: off the zone
   assert.deepEqual(await page.evaluate(() => window.__fs), ['page:B']);
   await appBack(page);
   await page.waitForTimeout(500);

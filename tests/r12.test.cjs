@@ -134,10 +134,11 @@ async function tapAt(page, x, y) {
   await c.detach();
   await page.waitForTimeout(120);
 }
-// Swipes up on the Story and waits for the Reel and its details.
+// Swipes up on the Story and waits for the Reel and its details (a long wait:
+// on a busy machine, with the whole suite running, 4 s was not always enough).
 async function openReel(page) {
   await drag(page, [200, 600], [205, 250], { steps: 4 });
-  await page.waitForFunction(() => document.querySelector('#sg-reel #sg-reelinfo'), null, { timeout: 4000 });
+  await page.waitForFunction(() => document.querySelector('#sg-reel #sg-reelinfo'), null, { timeout: 10000 });
 }
 // The middle of an element inside the overlay's shadow root.
 const spot = (page, sel) => page.evaluate(s => {
