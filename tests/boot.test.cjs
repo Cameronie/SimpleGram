@@ -453,6 +453,17 @@ test('latent risk 1: the feed rules leave Instagram\'s start-up configuration al
   stats = await page.evaluate(() => window.__sg.stats);
   assert.equal(stats.ads, 2);
   assert.equal((await record(page)).own.bootPayloads, 2, 'an api answer is not a start-up payload');
+  // The same configuration in an ajax answer's shape (define and require
+  // lists under jsmods): untouched; the answer's payload beside it is data.
+  const ajax = await page.evaluate(() => JSON.parse(JSON.stringify({ __ar: 1, payload: { items: [{ ad_id: '2', pk: '3' }, { pk: '4', k: 1 }] },
+    jsmods: { define: [['SomeConfig', [], { ads: { items: [{ a: 1 }] }, items: [{ ad_id: '1' }, { x: 2 }] }, 1]], require: [['M', 'run', [], [{ items: [{ ad_id: '4' }] }]]] }, lid: '7' })));
+  const under = ajax.jsmods.define[0][2];
+  assert.deepEqual([under.ads.items.length, under.items.length, ajax.jsmods.require[0][3][0].items.length], [1, 2, 1], 'configuration under jsmods stays');
+  assert.deepEqual(ajax.payload.items.map(i => i.pk), ['4'], 'the answer beside it is data, as before');
+  assert.deepEqual([(await record(page)).own.bootPayloads, (await record(page)).own.bootChanged], [3, 2]);
+  // A start-up payload carrying a feed page with nothing to drop: counted, not changed.
+  await page.evaluate(p => JSON.parse(JSON.stringify(p)), { require: [['RelayPrefetchedStreamCache', 'next', [], ['adp_Feed', { __bbox: { complete: true, result: feedPage([friend('FRIEND3'), friend('FRIEND4')]), sequence_number: 0 } }]]] });
+  assert.deepEqual([(await record(page)).own.bootPayloads, (await record(page)).own.bootChanged], [4, 2]);
 });
 
 test('latent risk 3: an XHR json response is one cleansed object, read as often as Instagram likes; a request opened again starts over', async () => {
@@ -568,6 +579,23 @@ test('latent risk 2: modules missing at the first page (a lazy bundle) are looke
   assert.equal((await contOf(page)).state, 'running');
   assert.equal((await req(page)).inParse, 0);
   assert.equal((await record(page)).own.requireInHook, 0);
+});
+
+test('latent risk 2: the bundle arrives after a miss and the marker page is next: the two query modules alone are asked inside the parse, the full check follows', async () => {
+  const page = await open('https://www.instagram.com/', modulesHtml(true), { cfg: { continueHome: true }, api: followingApi() });
+  await parseIn(page, homePage([friend('FRIEND1')]));
+  await tick(page);
+  assert.equal((await contOf(page)).modules, null, 'a miss');
+  await page.evaluate(() => { window.__defineModules(); const s = document.createElement('script'); s.textContent = '/* bundle */'; document.head.appendChild(s); });
+  const out = await parseIn(page, homePage([friend('FRIEND2'), marker()]));
+  assert.deepEqual(conn(out).edges.map(e => e.node.media.code), ['FRIEND2']);
+  assert.equal(conn(out).page_info.has_next_page, true, 'Home goes on');
+  assert.equal((await contOf(page)).state, 'running');
+  assert.equal((await req(page)).inParse, 2, 'the two query modules, nothing else, inside the parse');
+  assert.equal((await record(page)).own.requireInHook, 2);
+  await tick(page);
+  assert.deepEqual((await contOf(page)).modules, { root: true, next: true, constants: false, actions: false, asyncParams: false, asyncHeaders: false }, 'the full check once the parse was over');
+  assert.equal((await req(page)).inParse, 2);
 });
 
 test('latent risk 2: when no check could run before the marker, today\'s look from inside the parse still arms Home, and the record says so', async () => {

@@ -1723,16 +1723,19 @@
   }
 
   // B33: Instagram's start-up data (its ServerJS payloads: require and define
-  // lists carrying module configuration) is not feed data. The generic feed
-  // rules, the bare ads key and dropAds on plain list names, never touch it;
-  // they apply to the query results it carries (__bbox.result.data), as to
-  // any api answer. cfgScope: objects inside such configuration; cfgExempt:
-  // the query results in it. inCfg: the object visit() is looking at.
+  // lists carrying module configuration, in the HTML's __bbox or under jsmods
+  // in an ajax answer) is not feed data. The generic feed rules, the bare ads
+  // key and dropAds on plain list names, never touch it; they apply to the
+  // query results it carries (__bbox.result.data) and to the ajax answer's
+  // payload beside it, as to any api answer. cfgScope: objects inside such
+  // configuration; cfgExempt: the data in it. inCfg: the object visit() is looking at.
   const cfgScope = new WeakSet(), cfgExempt = new WeakSet();
   let inCfg = false;
   let bootKeysNow = null;   // the rule keys fired in the start-up payload being cleansed (names only)
   function serverJsRoot(o) {
-    return Array.isArray(o.require) || Array.isArray(o.define) || !!(o.__bbox && typeof o.__bbox === 'object');
+    if (Array.isArray(o.require) || Array.isArray(o.define) || !!(o.__bbox && typeof o.__bbox === 'object')) return true;
+    const j = o.jsmods;
+    return !!j && typeof j === 'object' && (Array.isArray(j.define) || Array.isArray(j.require));
   }
   // The counters the rules move: a payload they left as it was moves none (a
   // feed page with nothing dropped is a page, not a change).
@@ -1788,7 +1791,11 @@
     }
     const bootPayload = !Array.isArray(root) && serverJsRoot(root);
     const moved = bootPayload ? ruleMoves() : 0;
-    if (bootPayload) { cfgScope.add(root); bootKeysNow = []; }
+    if (bootPayload) {
+      cfgScope.add(root);
+      if (root.jsmods && root.payload && typeof root.payload === 'object') cfgExempt.add(root.payload);   // the ajax answer itself
+      bootKeysNow = [];
+    }
     const stack = [root];
     let budget = 400000;
     while (stack.length && budget-- > 0) {
@@ -2267,15 +2274,23 @@
   // than at the last miss, so a miss costs Instagram's error logging a few
   // asks at most.
   let contModulesCached = null, contModulesScripts = -1, contModulesQueued = false;
+  // The two query modules alone, straight from require (never igModule: a
+  // miss is not remembered). From a data hook, counted as such.
+  function contQueriesReady() {
+    const peek = name => {
+      if (inHook) boot.own.requireInHook++;
+      try { return typeof window.require === 'function' ? window.require(name + '.graphql') : null; } catch (e) { return null; }
+    };
+    const ready = p => !!p && /^\d+$/.test(String(p.id)) && !!p.providedVariables && typeof p.providedVariables === 'object';
+    return ready(paramsOf(peek(CONT_ROOT))) && ready(paramsOf(peek(CONT_NEXT)));
+  }
   function contModulesSoon() {
     if (contModulesCached || contModulesQueued || !cont.on || CFG.role !== 'main') return;
     if (contModulesScripts >= 0 && document.scripts.length <= contModulesScripts) return;
     contModulesQueued = true;
     Promise.resolve().then(safe(() => {
       contModulesQueued = false;
-      const peek = name => { try { return typeof window.require === 'function' ? window.require(name + '.graphql') : null; } catch (e) { return null; } };
-      const ready = p => !!p && /^\d+$/.test(String(p.id)) && !!p.providedVariables && typeof p.providedVariables === 'object';
-      if (ready(paramsOf(peek(CONT_ROOT))) && ready(paramsOf(peek(CONT_NEXT)))) cont.modules = contModulesCached = contModules();
+      if (contQueriesReady()) cont.modules = contModulesCached = contModules();
       else contModulesScripts = document.scripts.length;
     }));
   }
@@ -2286,8 +2301,18 @@
     if (!contWanted(fs) || fs.cont) return false;
     if (cont.state === 'failed' || cont.state === 'limit') return false;   // this page load stays ended
     if (!hasMore(owner) || !cursorOf(owner)) return false;                 // Instagram itself stops here
-    // The check made after an earlier page; only when none ran, today's look from here.
-    cont.modules = contModulesCached || contModules();
+    // The check made after an earlier page. None could run (the marker on
+    // Home's first page): today's look from here. A miss there (the bundle
+    // that defines the queries may have loaded since): the two query modules
+    // alone are asked for, already run if Instagram used them; the full
+    // check follows once this parse is over.
+    if (contModulesCached) cont.modules = contModulesCached;
+    else if (contModulesScripts < 0) cont.modules = contModules();
+    else {
+      const ok = contQueriesReady();
+      cont.modules = { root: ok, next: ok, constants: null, actions: null, asyncParams: null, asyncHeaders: null };
+      if (ok) { contModulesScripts = -1; contModulesSoon(); }
+    }
     if (!cont.modules.root || !cont.modules.next) { cont.state = 'failed'; cont.reason = 'modules'; return false; }
     fs.cont = true;
     fs.caughtUp = true;
