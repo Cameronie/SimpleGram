@@ -18,7 +18,7 @@
 //
 // Run: NODE_PATH=/opt/node-tools/node_modules node --test tests/*.test.cjs
 'use strict';
-const { test, before, after } = require('node:test');
+const { test, before, after, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { SCRIPT, ME, sent, PNG } = require('./helpers.cjs');
 const { chromium } = require('playwright');
@@ -32,6 +32,9 @@ before(async () => {
   browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || undefined, args: ['--autoplay-policy=no-user-gesture-required'] });
 });
 after(async () => { await browser.close(); });
+// Each test's pages are closed behind it: left open, their videos play on and
+// starve the later tests (with the whole suite running, openReel timed out).
+afterEach(async () => { for (const c of browser.contexts()) await c.close().catch(() => {}); });
 
 const HOME = 'https://www.instagram.com/';
 const POST_URL = 'https://www.instagram.com/p/ABCDEFG/';
