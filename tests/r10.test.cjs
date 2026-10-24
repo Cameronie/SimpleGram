@@ -215,9 +215,12 @@ test('R10: one tap on a feed video opens it full screen after the double-tap win
       top: [[200, 400], [380, 640], [26, 640], [200, 60]].map(p => (document.elementFromPoint(p[0], p[1]) || {}).id) };
   });
   assert.deepEqual(shown, { rect: [0, 0, 412, 915], fit: 'contain', bg: 'rgb(0, 0, 0)', top: ['v', 'v', 'v', 'v'] });
-  // Sound on and playing (Instagram's own single tap ran too: its sound toggle).
+  // Sound on and playing, set on the video itself. B28: R10 took the tap, so
+  // Instagram's own single tap (its feed-wide sound toggle) never ran.
   await page.waitForFunction(() => { const v = document.getElementById('v'); return !v.muted && !v.paused; }, null, { timeout: 2000 });
-  assert.equal((await ig(page)).singles, 1);
+  await page.waitForTimeout(350);
+  assert.deepEqual([(await ig(page)).singles, (await ig(page)).clicks], [0, 0], 'Instagram never saw the click');
+  assert.equal(await page.evaluate(() => document.querySelector('.sound svg').getAttribute('aria-label')), 'Audio is muted', 'its feed setting untouched');
   assert.equal((await fv(page)).r10, 1);
   assert.deepEqual((await sent(page, 'fullVideoExitRequest')), []);
 });
@@ -284,19 +287,20 @@ test('R10: a swipe up or down, or Back, leaves through the app and puts the feed
   assert.deepEqual([f.r10, f.exits, f.r10Restored], [3, 3, 3]);
 });
 
-test('R10: where Instagram\'s tap pauses instead, full screen plays it; afterwards it plays on, muted as before', async () => {
+test('R10: where Instagram\'s tap would pause instead, R10 takes the tap: full screen plays on; afterwards it plays on, muted as before', async () => {
   const page = await openFeed();
   await page.evaluate(() => { window.__ig.mode = 'pause'; });
   await tapAt(page, 200, 300);
-  await page.waitForFunction(() => { const v = document.getElementById('v'); return window.__fsEl && !v.muted && !v.paused && window.__ig.singles === 1; }, null, { timeout: 2000 });
-  await page.waitForTimeout(200);
-  assert.equal(await page.evaluate(() => document.getElementById('v').paused), false);
+  await page.waitForFunction(() => { const v = document.getElementById('v'); return window.__fsEl && !v.muted && !v.paused; }, null, { timeout: 2000 });
+  await page.waitForTimeout(400);
+  // B28: Instagram's pause never ran (it used to, and full screen had to undo it).
+  assert.deepEqual([(await ig(page)).singles, (await ig(page)).clicks, await page.evaluate(() => document.getElementById('v').paused)], [0, 0, false]);
   // In full screen a tap pauses or plays (R8's rule), and never reaches Instagram's layer.
   await tapAt(page, 200, 400, 150);
   assert.equal(await page.evaluate(() => document.getElementById('v').paused), true);
   await tapAt(page, 200, 400, 150);
   assert.equal(await page.evaluate(() => document.getElementById('v').paused), false);
-  assert.equal((await ig(page)).clicks, 1);
+  assert.equal((await ig(page)).clicks, 0);
   await appBack(page);
   await page.waitForTimeout(500);
   assert.deepEqual(await page.evaluate(() => { const v = document.getElementById('v'); return [v.muted, v.paused]; }), [true, false]);
@@ -313,13 +317,15 @@ test('R10: a pinch, a scroll, a tap with a finger soon down elsewhere, or a busy
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.waitForTimeout(300);
   assert.equal((await ig(page)).clicks, 0);
-  // A tap, then straight away a drag elsewhere: the wait ends with no full screen.
+  // A tap, then straight away a drag elsewhere: the wait ends with no full
+  // screen. B28: R10 had taken the tap's click, and Instagram never gets it
+  // (no sound toggle for a tap that turned out to be something else).
   await tapAt(page, 200, 300);
   await page.waitForTimeout(60);
   await drag(page, [300, 800], [300, 600], { steps: 4 });
   await page.waitForTimeout(500);
   assert.deepEqual(await page.evaluate(() => window.__fs), []);
-  assert.deepEqual([(await ig(page)).clicks, (await fv(page)).r10Skipped], [1, 1]);
+  assert.deepEqual([(await ig(page)).clicks, (await ig(page)).singles, (await fv(page)).r10Skipped], [0, 0, 1]);
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.waitForTimeout(300);
   // A tap whose click is handled long after it happened (a busy page) switches
@@ -327,7 +333,7 @@ test('R10: a pinch, a scroll, a tap with a finger soon down elsewhere, or a busy
   await page.evaluate(() => { const now = performance.now.bind(performance); performance.now = () => now() + 1000; });
   await tapAt(page, 200, 300, 600);
   assert.deepEqual(await page.evaluate(() => window.__fs), []);
-  assert.deepEqual([(await ig(page)).clicks, (await fv(page)).r10Skipped], [2, 2], 'the tap reached the page; R10 let it be');
+  assert.deepEqual([(await ig(page)).clicks, (await fv(page)).r10Skipped], [1, 2], 'the tap reached the page; R10 let it be');
 });
 
 test('R10: in the post view the same tap opens it; R8\'s swipe down at the top still does too', async () => {
