@@ -5497,6 +5497,7 @@
       const t0 = e.touches[0];
       second = !!t0 && Math.hypot(t0.clientX - w.x, t0.clientY - w.y) <= 40;
       fvStats[second ? 'r10Doubles' : 'r10Skipped']++;
+      if (!second) fvStats.r10SkipWhy = 'second touch';
       if (second) first = { target: w.target, x: w.x, y: w.y };   // B28: the click Instagram is owed
     }
     if (e.touches.length !== 1) { if (tapSeq) tapSeq.multi = true; return; }
@@ -5526,7 +5527,11 @@
     const v = r10Video(e.target, e.clientX, e.clientY);
     if (!v) return;
     // B25: no switch while one settles, and none from a lift handled too late.
-    if (fullScreenSettling() || staleTouch(e)) { fvStats.r10Skipped++; return; }
+    if (fullScreenSettling() || staleTouch(e)) {
+      fvStats.r10Skipped++;
+      fvStats.r10SkipWhy = fullScreenSettling() ? 'settling' : 'stale ' + Math.round(performance.now() - e.timeStamp);
+      return;
+    }
     // B27: a tap beside the ⋮ tab is for the tab (a near miss): Instagram's tap, never a full screen.
     if (inMenuZone(e.clientX, e.clientY)) { fvStats.r10DeadZone++; return; }
     // B28: R10 takes the tap: Instagram's single tap never runs for it.
@@ -5554,7 +5559,12 @@
     const v = w.v;
     // B25: never while a finger is down (the switch would split its touch) or a switch settles.
     if (!v.isConnected || document.fullscreenElement || downIds.size || fullScreenSettling() || !r10Route(route()) ||
-      reelBox || split || searchOpen()) { fvStats.r10Skipped++; return; }
+      reelBox || split || searchOpen()) {
+      fvStats.r10Skipped++;
+      fvStats.r10SkipWhy = !v.isConnected ? 'gone' : document.fullscreenElement ? 'full' : downIds.size ? 'finger down'
+        : fullScreenSettling() ? 'settling' : !r10Route(route()) ? 'route' : reelBox ? 'reel' : split ? 'split' : 'search';
+      return;
+    }
     r10Snap = w.snap;
     if (!enterR8(v, 'r10')) r10Snap = null;
   }
