@@ -3,7 +3,9 @@
 // only suggestions, no line, the card after four empty pages). The second page
 // in a row without a friend's post, or a page Instagram labels as its
 // suggestions (feed_recs), is Home's end: Following follows under SimpleGram's
-// own line, as after a marker. Same mock page and server as cont.test.cjs;
+// own line, as after a marker. Instagram's marker arriving later in such a run
+// is cut there (a next page, not a reload); a Home that showed nothing from
+// friends keeps to the card. Same mock page and server as cont.test.cjs;
 // nothing reaches Instagram.
 //
 // Run: NODE_PATH=/opt/node-tools/node_modules node --test tests/*.test.cjs

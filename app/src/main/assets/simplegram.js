@@ -969,12 +969,6 @@
     list.splice(0, list.length, ...keep);
   }
   function markerText(s) { return typeof s === 'string' ? s.slice(0, 200) : ''; }
-  // Home ends at the marker. Once Instagram sees it, every later page is its
-  // suggestions, so the marker and everything after it go and paging stops;
-  // the app's own card marks the end and carries Instagram's line.
-  // (Kept with emptied groups, Instagram would still advertise more pages.)
-  // With R7 on, paging stays on and Following follows the marker instead.
-  // Returns the marker it cut (the first page's anchor may put it back).
   // The marker and everything after it go; Instagram's line is kept for the
   // card. Returns the marker cut.
   function cutMarker(list, at, fs, ctx) {
@@ -989,6 +983,12 @@
     list.splice(at);
     return cut;
   }
+  // Home ends at the marker. Once Instagram sees it, every later page is its
+  // suggestions, so the marker and everything after it go and paging stops;
+  // the app's own card marks the end and carries Instagram's line.
+  // (Kept with emptied groups, Instagram would still advertise more pages.)
+  // With R7 on, paging stays on and Following follows the marker instead.
+  // Returns the marker it cut (the first page's anchor may put it back).
   function endHome(owner, list, fs, ctx, first) {
     const at = markerAt(list);
     let cut = null;
@@ -2393,7 +2393,7 @@
     contResumeAt = null;
     cs = { gen: ++contGen, cursor: null, more: true, buffer: [], fetching: false, timer: 0, shown: new Set(),
       firstCode: null, waiting: false, resume: carry, startedAt: now, firstMs: -1, capped: false, noteTimer: 0, note: false,
-      waitSeen: contSeenPassed };
+      waitSeen: contSeenPassed, lateMarker: false };
     cont.state = 'running';
     cont.reason = '';
     if (contStarts.length > CONT_STARTS) { contFail('restarts'); return; }
@@ -2719,10 +2719,11 @@
   // Instagram's own jump to the top, a Home-tab tap passed to it, or (once
   // Following is over) friends' posts as in 1.2. Returns the reason, or ''.
   // After a start without Instagram's line (B32), its marker on a page that
-  // is a head by no other sign comes late: a next page (contLateMarker).
+  // is a head by no other sign comes late: a next page (contLateMarker), once
+  // per run (Instagram sends it once; another is a reload's head).
   function contHead(owner, list, jump, tap) {
     let why = '';
-    const late = cont.state === 'running' && cont.startVia === 'noLine' && !jump && !tap && markerAt(list) >= 0;
+    const late = cont.state === 'running' && cont.startVia === 'noLine' && !!cs && !cs.lateMarker && !jump && !tap && markerAt(list) >= 0;
     if (markerAt(list) >= 0 && !late) why = 'marker';
     else if (list.some(e => followedPost(e) && homeRanked.has(edgeCode(e)))) why = 'seen';
     else if (late || owner.pagination_source === 'feed_recs') why = '';
@@ -2740,6 +2741,7 @@
     const at = markerAt(list);
     if (at < 0) return;
     cutMarker(list, at, fs, ctx);
+    if (cs) cs.lateMarker = true;
     cont.lateMarker++;
     tr.lm = true;
   }
