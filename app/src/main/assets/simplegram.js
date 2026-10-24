@@ -975,19 +975,25 @@
   // (Kept with emptied groups, Instagram would still advertise more pages.)
   // With R7 on, paging stays on and Following follows the marker instead.
   // Returns the marker it cut (the first page's anchor may put it back).
+  // The marker and everything after it go; Instagram's line is kept for the
+  // card. Returns the marker cut.
+  function cutMarker(list, at, fs, ctx) {
+    const cut = list[at];
+    const marker = unitOf(cut);
+    const d = marker.end_of_feed_demarcator;
+    fs.endText = { title: markerText(d.title), subtitle: markerText(d.subtitle) };
+    for (const g of markerGroups(marker)) stats.feed.inMarker = (stats.feed.inMarker || 0) + g.feed_items.length;
+    if (ctx) { noteUnit(list[at], 'end', ctx); for (const e of list.slice(at + 1)) noteUnit(e, 'afterEnd', ctx); }
+    stats.feed.eof = (stats.feed.eof || 0) + 1;
+    stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length - at - 1;
+    list.splice(at);
+    return cut;
+  }
   function endHome(owner, list, fs, ctx, first) {
     const at = markerAt(list);
     let cut = null;
     if (at >= 0) {
-      cut = list[at];
-      const marker = unitOf(cut);
-      const d = marker.end_of_feed_demarcator;
-      fs.endText = { title: markerText(d.title), subtitle: markerText(d.subtitle) };
-      for (const g of markerGroups(marker)) stats.feed.inMarker = (stats.feed.inMarker || 0) + g.feed_items.length;
-      if (ctx) { noteUnit(list[at], 'end', ctx); for (const e of list.slice(at + 1)) noteUnit(e, 'afterEnd', ctx); }
-      stats.feed.eof = (stats.feed.eof || 0) + 1;
-      stats.feed.afterEnd = (stats.feed.afterEnd || 0) + list.length - at - 1;
-      list.splice(at);
+      cut = cutMarker(list, at, fs, ctx);
     } else if (owner.pagination_source === 'feed_recs') {
       // Instagram's all-suggestions feed: only posts from people you follow stay.
       const keep = list.filter(followedPost);
@@ -1152,7 +1158,8 @@
    * edges, k posts kept, sk skipped as seen, ad, sg suggestions, mk marker
    * index, nx0/nx1 has_next in/out, an anchor kind, first, ae after the end;
    * R7: hw why a page after the marker was taken for Home's first page again,
-   * ik Instagram's own followed posts kept and cf Following posts handed. */
+   * ik Instagram's own followed posts kept and cf Following posts handed; lm
+   * Instagram's marker cut from a next page of a run begun without it (B32). */
   const TRAIL_MAX = 30;
   const docN = (readSession('sg_doc_n') | 0) + 1;
   writeSession('sg_doc_n', docN);
@@ -1304,6 +1311,7 @@
       } else {
         fs.lastCursor = cursor;
         try {
+          if (cont.startVia === 'noLine') contLateMarker(list, fs, ctx, tr);
           contHandover(owner, list, fs, ctx, tr);
         } catch (e) {
           // Never Instagram's suggestions: its new followed posts at most, then Home ends with the card.
@@ -2171,11 +2179,12 @@
   // stalled cards while it ran (with the wait so far), and the last few
   // waits (end: posts, up, ended).
   // startVia (B32): how the last run started, at Instagram's marker or
-  // without its line (noLine, also counted in headWhy).
+  // without its line (noLine, also counted in headWhy); lateMarker: its marker
+  // arriving on a next page of such a run (cut there, never a reload).
   const cont = (stats.cont = { on: CFG.continueHome === true, state: 'off', reason: '', own: 0, ownFail: 0, pages: 0,
     swaps: 0, handed: 0, empty: 0, skippedSeen: 0, heads: 0, anchors: 0, recsAnchors: 0, nudges: 0,
     headWhy: { marker: 0, seen: 0, jump: 0, tap: 0, ended: 0, noLine: 0 }, igKept: 0, resets: 0, keptBuffer: 0,
-    startsMin: 0, peakMin: 0, repeats: 0, notes: 0, modules: null, startVia: '', runs: [], hand: [],
+    startsMin: 0, peakMin: 0, repeats: 0, notes: 0, modules: null, startVia: '', lateMarker: 0, runs: [], hand: [],
     waits: { n: 0, ms: 0, longest: 0, why: { empty: 0, read: 0, pacing: 0, ig: 0 }, notes: 0, cards: 0, atCard: null, last: [] } });
   let cs = null;                 // the current run (from one marker on)
   let contGen = 0;               // one counter for the page load: a reset makes every answer on its way stale
@@ -2334,8 +2343,11 @@
   // page Instagram labels as its suggestions (feed_recs) starts it at once,
   // from endHome. The first such page may be a gap in Instagram's ranking:
   // without the continuation, Home still stops after four (stats.feed.stopped).
+  // Posts that show, not a hidden first-page anchor: a Home with nothing from
+  // friends keeps to the four-page rule and the card, whose Following button
+  // is the way on.
   function contNoLine(fs, owner) {
-    if (!contWanted(fs) || fs.cont || fs.ended || !fs.shownAny || fs.emptyStreak < 1) return false;
+    if (!contWanted(fs) || fs.cont || fs.ended || fs.shownCount === 0 || fs.emptyStreak < 1) return false;
     return contArm(fs, owner, 'noLine');
   }
   function contAlive() { return !!cs && cont.state === 'running'; }
@@ -2706,16 +2718,30 @@
   // feed_recs are Instagram's suggestions paging: always a next page. Then
   // Instagram's own jump to the top, a Home-tab tap passed to it, or (once
   // Following is over) friends' posts as in 1.2. Returns the reason, or ''.
+  // After a start without Instagram's line (B32), its marker on a page that
+  // is a head by no other sign comes late: a next page (contLateMarker).
   function contHead(owner, list, jump, tap) {
     let why = '';
-    if (markerAt(list) >= 0) why = 'marker';
+    const late = cont.state === 'running' && cont.startVia === 'noLine' && !jump && !tap && markerAt(list) >= 0;
+    if (markerAt(list) >= 0 && !late) why = 'marker';
     else if (list.some(e => followedPost(e) && homeRanked.has(edgeCode(e)))) why = 'seen';
-    else if (owner.pagination_source === 'feed_recs') why = '';
+    else if (late || owner.pagination_source === 'feed_recs') why = '';
     else if (jump) why = 'jump';
     else if (tap) why = 'tap';
     else if (cont.state !== 'running' && !(cs && cs.buffer.length) && list.some(followedPost)) why = 'ended';
     if (why) bump(cont.headWhy, why);
     return why;
+  }
+  // B32: Instagram's marker arriving on a next page of a run that started
+  // without its line (Cam's Home: suggestions for pages, then the line). Not
+  // a reload: the marker and what follows it go as at Home's end, the card
+  // gets Instagram's words, and the handover goes on with Following.
+  function contLateMarker(list, fs, ctx, tr) {
+    const at = markerAt(list);
+    if (at < 0) return;
+    cutMarker(list, at, fs, ctx);
+    cont.lateMarker++;
+    tr.lm = true;
   }
   // Instagram's next page, handed back with Following in place of its
   // suggestions: first the page's own posts from people you follow (never

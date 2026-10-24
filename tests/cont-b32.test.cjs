@@ -102,6 +102,64 @@ test('B32 no marker, Home turns to its suggestions (feed_recs): Following starts
   await context.close();
 });
 
+test('B32 after a start without the line, Instagram\'s marker on a later page comes late: cut there, not a reload; Following goes on under the one line', async () => {
+  const home = noLineHome({ h3: { edges: [recs('X5'), ad('A5'), recs('X6')], next: 'h4' },
+    h4: { edges: [recs('X7'), ad('A6'), marker()], next: 'm1', ps: 'feed_recs' } });
+  const { pg, S, context } = await openIG({ home, follow: range(1, 400), recsPs: null }, { sgCfg: ON });
+  await readToEnd(pg, 18);
+  const s = await snap(pg);
+  const visible = await shown(pg);
+  assert.deepEqual(visible.slice(0, 7), HOME_KEPT);
+  const after = visible.slice(7);
+  assert.ok(after.length >= 12, 'Following went on: ' + after.length);
+  assert.deepEqual(after, unseen(range(1, 400)).slice(0, after.length));
+  assert.deepEqual(dupes(s.codes), []);
+  assert.equal(s.cont.stats.state, 'running');
+  assert.equal(s.cont.stats.startVia, 'noLine');
+  assert.equal(s.cont.stats.lateMarker, 1);
+  assert.deepEqual([s.cont.stats.resets, s.cont.stats.heads, s.cont.stats.headWhy.marker], [0, 0, 0], 'not taken for a reload');
+  assert.equal(s.feed.eof, 1, 'the marker was cut');
+  assert.equal(s.feed.refreshes || 0, 0);
+  assert.equal(await pg.evaluate(() => document.querySelectorAll('.eof').length), 0, 'Instagram never drew its line');
+  assert.deepEqual(await lined(pg), ['F04'], 'one line, above Following\'s first post');
+  assert.equal(s.fs.endText && s.fs.endText.title, "You're all caught up", 'the card would carry Instagram\'s words');
+  assert.equal(s.fs.cont, true);
+  assert.equal(s.fs.ended, false);
+  assert.equal(s.feedEnd.some(m => m.on), false, 'no card while Home goes on');
+  const ig = S.log.filter(e => e.who === 'ig');
+  assert.ok(ig.some(e => e.after === 'm1'), 'Instagram paged on past the marker');
+  assert.equal(s.cont.stats.repeats, 0);
+  await pg.waitForTimeout(3200);
+  const st = (await snap(pg)).cont.stats;
+  assert.equal(st.runs.length, 1, 'one run');
+  assert.equal(st.runs[0].line, true);
+  await context.close();
+});
+
+test('B32 a Home with nothing from friends (a hidden anchor only) never starts Following by itself: the card after four pages, as before', async () => {
+  const home = {
+    head: { edges: [recs('X1'), ad('A1'), recs('X2')], next: 'h1' },
+    h1: { edges: [recs('X3'), recs('X4'), ad('A2')], next: 'h2' },
+    h2: { edges: [recs('X5'), ad('A3')], next: 'h3' },
+    h3: { edges: [recs('X6'), recs('X7')], next: 'm1' },
+  };
+  const { pg, S, context } = await openIG({ home, follow: range(1, 400), recsPs: null }, { sgCfg: ON });
+  await readToEnd(pg, 14);
+  assert.ok(await waitFor(pg, async () => (await snap(pg)).fs.ended, 8000), 'Home ended');
+  await pg.evaluate(() => { const se = document.scrollingElement; se.scrollTop = se.scrollHeight; });
+  assert.ok(await waitFor(pg, async () => { const s = await snap(pg); return s.feedEnd.length && lastEnd(s).on; }, 6000), 'the card shows');
+  const s = await snap(pg);
+  assert.deepEqual(await shown(pg), [], 'nothing from friends to show');
+  assert.deepEqual([s.fs.shownAny, s.fs.shownCount], [true, 0], 'a hidden anchor was handed, no post');
+  assert.equal(s.cont.stats.state, 'off');
+  assert.equal(s.cont.stats.headWhy.noLine, 0);
+  assert.equal(s.feed.stopped, 1);
+  assert.equal(own(S).length, 0, 'Following was not read');
+  assert.deepEqual(await lined(pg), []);
+  assert.equal(lastEnd(s).caughtUp, false);
+  await context.close();
+});
+
 test('B32 with the marker: unchanged (the line, the start at the marker)', async () => {
   const { pg, context } = await openIG({ home: markerHome(), follow: range(1, 400) }, { sgCfg: ON });
   await readToEnd(pg, 16);
