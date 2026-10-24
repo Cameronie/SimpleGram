@@ -214,6 +214,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private String startHow = "";         // how the next main-frame page start began, set by whoever starts it
     private Runnable watchTick, reloadFollow, probeTimeout;
     private boolean pendingNetReload;     // the automatic reload waits for the network
+    private Runnable resumeReload;        // the automatic reload that came due while the app was away
     private String bootChipKind = "";     // "" (off), "offline", "stuck", "still"
     private int bootChipsShown, bootLate;
     private android.widget.LinearLayout bootChip;
@@ -2242,6 +2243,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 .put("chipsShown", bootChipsShown)
                 .put("lateMessages", bootLate)
                 .put("pendingNetReload", pendingNetReload)
+                .put("pendingResumeReload", resumeReload != null)
                 .put("plainBoots", prefs.getInt("plainBoots", 0))
                 .put("plainNext", plainBootOn)
                 .put("autoReloads10min", ringOf("autoReloads").length());
@@ -2508,6 +2510,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             Runnable swap = deferredSwap;
             deferredSwap = null;
             ui.post(swap);
+        }
+        if (resumeReload != null) {
+            // The ladder's reload came due while Cam was away: after a moment to settle.
+            Runnable reload = resumeReload;
+            resumeReload = null;
+            if (chain != null) chain.deferred = 0;
+            ui.postDelayed(reload, bootSettleMs);
         }
         BootWatch w = watch;
         if (w != null && w.hurt && !w.booted && !w.stuck && !w.recovering) scheduleResumeRecovery(w);
@@ -2970,7 +2979,9 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             boolean offline = "offline".equals(bootChipKind), still = "still".equals(bootChipKind);
             bootChipText.setText(offline ? "No connection. SimpleGram will reload when you're back online"
                     : still ? "Still not starting. Check your connection, then Try again." : "Instagram didn't start");
-            bootChipRetry.setVisibility(offline ? View.GONE : View.VISIBLE);
+            // Try again stays on the offline chip too: a wrong word from the network
+            // callback (a stale loss, a VPN) may delay the reload, never leave Cam stuck.
+            bootChipRetry.setVisibility(View.VISIBLE);
             bootChipPlain.setVisibility(still && (chain == null || !chain.plain) ? View.VISIBLE : View.GONE);
         }
         bootChip.setVisibility(boot ? View.VISIBLE : View.GONE);
@@ -3064,6 +3075,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             // Not reachable with constant keys.
         }
         pendingNetReload = false;
+        resumeReload = null;
         if (!bootChipKind.isEmpty()) {
             bootChipKind = "";           // the new page gets its chance
             updateStuckChip();
@@ -3187,6 +3199,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         bootOutcome(w, "booted in " + Math.max(0, Math.min(600_000, m.optLong("ms"))) + " ms (" + (how.length() > 12 ? "?" : how) + ")");
         chain = null;
         pendingNetReload = false;
+        resumeReload = null;
         if (!bootChipKind.isEmpty()) {
             bootChipKind = "";
             updateStuckChip();
@@ -3386,6 +3399,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         if (watch != w || w.booted || isDestroyed()) return;
         if (chain == null) chain = new BootChain();
         String gate = reloadGate();
+        if ("paused".equals(gate)) {
+            // Off screen: a page started now would load with the network blocked, and
+            // half a minute away must not end in the chip. The reload waits for the
+            // next onResume, which runs the ladder again (offline, it waits for the
+            // network as before).
+            if (resumeReload == null) logReload("wait paused " + why, 1);
+            resumeReload = () -> recover(w, why);
+            return;
+        }
         if (gate != null) {
             // Not now: again in a moment, for up to half a minute; then the chip.
             if (chain.deferred++ < 30) {
