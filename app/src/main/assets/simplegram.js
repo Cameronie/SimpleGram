@@ -4354,9 +4354,9 @@
    * swipe up or down (or Back) returns; a tap pauses or plays.
    * R9: in Stories, a swipe up on a Story that shares a Reel plays the Reel
    * over the whole screen. Instagram's Story stays pressed (its own pause)
-   * underneath and continues where it was. A swipe up or down (or Back)
-   * returns. No second full-screen request is made: Instagram ends the Story
-   * when its own full screen ends.
+   * underneath and continues where it was. A swipe down (or Back) returns; a
+   * swipe up opens the Reel's comments (B29). No second full-screen request
+   * is made: Instagram ends the Story when its own full screen ends.
    * ------------------------------------------------------------------ */
   const FV_SWIPE = 60;                 // px of mostly vertical travel
   // r10: full screens from a tap; r10Doubles: taps that turned out to be a double tap
@@ -5002,8 +5002,8 @@
       story: { target: g.target, x: g.x, y: g.y, path: location.pathname } };
     const zone = pressUnderSticker(g);
     if (zone) rb.story.target = zone;               // its touchend lets go on close
-    // The layer's own touches: a swipe up or down returns, a tap pauses or plays.
-    // Nothing reaches Instagram's page underneath.
+    // The layer's own touches: a swipe down returns, a swipe up opens the Reel's
+    // comments (B29), a tap pauses or plays. Nothing reaches Instagram's page underneath.
     let start = null;
     box.addEventListener('touchstart', e => {
       e.stopPropagation();
@@ -5017,7 +5017,7 @@
       start = null;
       if (!s || e.touches.length || !e.changedTouches.length) return;
       const dx = e.changedTouches[0].clientX - s.x, dy = e.changedTouches[0].clientY - s.y;
-      if (Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6) closeStoryReel('swipe');
+      if (Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6) reelSwipe(rb, dy);
     }), { passive: true });
     box.addEventListener('click', safe(e => {
       e.stopPropagation();
@@ -5141,7 +5141,7 @@
    * stays clean: this is only on R9's layer.
    * ------------------------------------------------------------------ */
   const reelStats = (stats.reelInfo = { shown: 0, noInfo: 0, fields: {}, expanded: 0, profile: 0, profileVia: {},
-    comments: 0, commentsOff: 0, commentsOver: 0, shares: 0, slowed: 0, busy: 0, followingTaps: 0, via: { page: 0, own: 0 },
+    comments: 0, commentsOff: 0, commentsOver: 0, swipeComments: 0, shares: 0, slowed: 0, busy: 0, followingTaps: 0, via: { page: 0, own: 0 },
     inCollection: 0, strayTaps: 0, blocked: 0,
     like: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 }, unlike: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 },
     save: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 }, unsave: { sent: 0, ok: 0, refused: 0, unconfirmed: 0 },
@@ -5374,9 +5374,10 @@
     info.paint = paint;
     paint();
     // Its touches are its own: none reaches the Story under it, and a tap on
-    // it doesn't pause the Reel. A swipe up or down that starts on it still
-    // returns to the Story, as one on the video does (R9's way back), except
-    // on an opened caption, which a finger scrolls (the page is held still).
+    // it doesn't pause the Reel. A swipe down that starts on it still returns
+    // to the Story and a swipe up still opens the comments, as on the video
+    // (R9's way back, B29), except on an opened caption, which a finger
+    // scrolls (the page is held still).
     let drag = null, sw = null;
     // Which gesture a click comes from: one that started on the overlay (set
     // before its own listeners run), or one that began before it was there.
@@ -5401,7 +5402,7 @@
       sw = drag = null;
       if (!s0 || scrolled || e.touches.length || !e.changedTouches.length || info.gone || reelBox !== rb) return;
       const dx = e.changedTouches[0].clientX - s0.x, dy = e.changedTouches[0].clientY - s0.y;
-      if (Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6) closeStoryReel('swipe');
+      if (Math.abs(dy) >= FV_SWIPE && Math.abs(dx) < Math.abs(dy) * 0.6) reelSwipe(rb, dy);
     }), { passive: true });
     for (const type of ['touchcancel', 'pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'mouseup']) {
       host.addEventListener(type, e => { e.stopPropagation(); if (type === 'touchcancel') sw = drag = null; }, { passive: true });
@@ -5554,6 +5555,17 @@
     }
     reelStats.comments++;
     openComments(code, null);
+  }
+  // B29: a vertical swipe on R9's layer or its details. Down returns to the
+  // Story as ever; up opens the comments exactly as the Comment button does
+  // (Cam swiped up for the caption and a comment box, and got the Story back).
+  // No details, comments turned off or the panel already up: nothing.
+  function reelSwipe(rb, dy) {
+    if (dy > 0) { closeStoryReel('swipe'); return; }
+    const info = rb.info;
+    if (!info || info.gone || !info.rec.code || info.about.commentsOff || rb.commentsUp) return;
+    reelStats.swipeComments++;
+    reelComment(info);
   }
   // From the app: the comments panel is up over the Story (on) with its top
   // `top` CSS px down, or gone (off). The Reel plays on above it, fitted into

@@ -521,7 +521,7 @@ test('B25: the lift that opens R9\'s Reel still counts in the page\'s touch book
   assert.deepEqual([s.starts, s.ends, s.orphans, s.orphanLast], [4, 4, 0, null], JSON.stringify(s));
 });
 
-test('R9: Back (from the app) and a swipe up also return; a tap pauses the Reel', async () => {
+test('R9: Back (from the app) and a swipe down also return; a tap pauses the Reel', async () => {
   const page = await openStory([sharingItem('424242', REEL_STICKER)]);
   await drag(page, [200, 600], [200, 300], { steps: 4 });
   await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v && v.getAttribute('src'); });
@@ -541,7 +541,8 @@ test('R9: Back (from the app) and a swipe up also return; a tap pauses the Reel'
   await drag(page, [200, 600], [200, 300], { steps: 4 });
   await page.waitForFunction(() => { const v = document.querySelector('#sg-reel video'); return v && v.getAttribute('src'); });
   assert.equal(page.hits['/api/v1/media/*'], 1);
-  await drag(page, [200, 700], [200, 250], { steps: 4 });
+  // B29: a swipe up opens the Reel's comments now (tests/r12.test.cjs); down returns.
+  await drag(page, [200, 250], [200, 700], { steps: 4 });
   assert.equal(await page.evaluate(() => !!document.getElementById('sg-reel')), false);
   const s = await fv(page);
   assert.deepEqual([s.r9, s.exits], [2, 2]);
