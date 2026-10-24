@@ -2577,17 +2577,18 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             if (answer == null) {
                 w.stuck = true;
                 bootOutcome(w, "busy on resume after " + w.shown() + " ms shown");
-                keepLastStuck(w, "resume", "busy", null);
+                keepLastStuck(w, "resume", "busy");
                 showBootChip("stuck");
                 return;
             }
+            w.probe = answer;
             boolean logo = answer.optBoolean("logo");
             boolean blank = answer.optInt("kids", -1) == 0 && !"complete".equals(answer.optString("ready"));
             if (!logo && !answer.optBoolean("error") && !blank) return;     // started after all: the watch goes on
             w.stuck = true;
             String rule = answer.optBoolean("error") ? "errorPage" : logo ? "logo" : "blank";
             bootOutcome(w, "stuck: " + rule + " (resume) after " + w.shown() + " ms shown");
-            keepLastStuck(w, "resume", rule, answer);
+            keepLastStuck(w, "resume", rule);
             recover(w, "resume " + rule);
         });
     }
@@ -2966,7 +2967,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         chip.setOnClickListener(v -> {
             stuckChipWanted = false;
             updateStuckChip();
-            rebuildWebView();
+            rebuildWebView("Scrolling chip", "scroll");
         });
         return chip;
     }
@@ -3007,7 +3008,8 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         long shownMs, shownSince;         // on-screen time so far; when the current stretch began (0 off screen)
         boolean booted, stuck, hurt, probing, recovering;
         String hurtWhy = "", pageToken = "";
-        int probeMisses;
+        int probeMisses;                  // misses in the current probe round (two make a busy page)
+        JSONObject probe;                 // the app's own probe's last answer
         JSONObject record;                // the page's latest boot record (shapes only)
         JSONObject log;                   // its bootLog entry, rewritten as the outcome changes
 
@@ -3214,13 +3216,23 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     private void onBootStuck(JSONObject m) {
         BootWatch w = watch;
-        if (w == null || w.booted || w.stuck || !pageTokenOk(w, m, 1000)) return;
-        w.stuck = true;
+        if (w == null || w.booted || !pageTokenOk(w, m, 1000)) return;
         String rule = m.optString("rule", "?");
         if (rule.length() > 24) rule = rule.substring(0, 24);
-        w.record = capped(m.optJSONObject("record"));
+        JSONObject record = capped(m.optJSONObject("record"));
+        if (record != null) w.record = record;
+        if (w.stuck) {
+            // The app's own probe spoke first (its cap and the page's rule (c) share
+            // the 30 s mark): the ladder is already running, but the page's record is
+            // the fuller evidence, so it joins what was kept.
+            String after = w.probe != null ? "after probe" : "after busy";
+            bootOutcome(w, "stuck: " + rule + " (page, " + after + ") after " + w.shown() + " ms shown");
+            keepLastStuck(w, "page " + after, rule);
+            return;
+        }
+        w.stuck = true;
         bootOutcome(w, "stuck: " + rule + " after " + w.shown() + " ms shown");
-        keepLastStuck(w, "page", rule, null);
+        keepLastStuck(w, "page", rule);
         recover(w, "page " + rule);
     }
 
@@ -3236,12 +3248,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         return record;
     }
 
-    private void keepLastStuck(BootWatch w, String from, String rule, JSONObject probe) {
+    /** The stuck page's state (the page's record, the app's probe, or both), kept in prefs for Copy details. */
+    private void keepLastStuck(BootWatch w, String from, String rule) {
         try {
             JSONObject e = new JSONObject().put("from", from).put("rule", rule).put("at", NetWatch.clock())
                     .put("seq", w.seq).put("how", w.how).put("shownMs", w.shown()).put("hurt", w.hurtWhy)
                     .put("resumed", resumed).put("netOk", netWatch.netOk());
-            if (probe != null) e.put("probe", probe);
+            if (w.probe != null) e.put("probe", w.probe);
             if (w.record != null) e.put("record", w.record);
             prefs.edit().putString("lastStuck", e.toString()).apply();
         } catch (JSONException ignored) {
@@ -3267,10 +3280,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 // No answer twice: a page too busy to speak. Recorded; Cam decides.
                 w.stuck = true;
                 bootOutcome(w, "busy after " + w.shown() + " ms shown");
-                keepLastStuck(w, "probe", "busy", null);
+                keepLastStuck(w, "probe", "busy");
                 showBootChip("stuck");
                 return;
             }
+            w.probe = answer;
             boolean logo = answer.optBoolean("logo");
             boolean blank = answer.optInt("kids", -1) == 0 && !"complete".equals(answer.optString("ready"));
             if (!logo && !answer.optBoolean("error") && !blank && !answer.has("err")) {
@@ -3283,13 +3297,18 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             w.stuck = true;
             String rule = answer.optBoolean("error") ? "errorPage" : logo ? "logo" : blank ? "blank" : "probeError";
             bootOutcome(w, "stuck: " + rule + " (probe) after " + w.shown() + " ms shown");
-            keepLastStuck(w, "probe", rule, answer);
+            keepLastStuck(w, "probe", rule);
             recover(w, "probe " + rule);
         });
     }
 
-    /** Asks the page about itself; null after two misses of {@code bootProbeMs}. */
+    /** Asks the page about itself; null after two misses of {@code bootProbeMs} in this round. */
     private void probe(BootWatch w, ValueCallback<JSONObject> cb) {
+        w.probeMisses = 0;              // a miss in an earlier round (one the page answered) doesn't count
+        probeOnce(w, cb);
+    }
+
+    private void probeOnce(BootWatch w, ValueCallback<JSONObject> cb) {
         if (w.view != web || isDestroyed()) return;
         w.probing = true;
         final boolean[] done = {false};
@@ -3302,7 +3321,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                 w.probing = false;
                 cb.onReceiveValue(null);
             } else {
-                probe(w, cb);
+                probeOnce(w, cb);
             }
         };
         probeTimeout = timeout;
@@ -3530,23 +3549,27 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
 
     /** Step 2's button: a new page view, loaded from the address (never restoreState: that is what failed). */
     private void tryAgain() {
+        if (rebuilding) return;           // a second tap while the first is under way
         if (chain == null) chain = new BootChain();
         chain.tryAgains++;
+        String chip = bootChipKind;       // for the rebuild log: the chip Cam answered
         bootChipKind = "";
         updateStuckChip();
-        rebuildWebView("Try again");
+        rebuildWebView("Try again", chip);
     }
 
     /** Step 3's button: one load with the page script's data hooks and boot-time DOM rules off. */
     private void loadWithoutFilters() {
+        if (rebuilding) return;
         if (chain == null) chain = new BootChain();
         chain.plain = true;
         chain.tryAgains++;
+        String chip = bootChipKind;
         bootChipKind = "";
         updateStuckChip();
         prefs.edit().putInt("plainBoots", prefs.getInt("plainBoots", 0) + 1).apply();
         plainBootOn = true;
-        rebuildWebView("Load without filters");
+        rebuildWebView("Load without filters", chip);
     }
 
     /**
@@ -3617,14 +3640,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     /** ⋮ → Fix scrolling. */
     private void fixScrolling() {
         manualFix++;
+        String chip = chipNow();
         stuckChipWanted = false;
         updateStuckChip();
-        rebuildWebView("Fix scrolling");
+        rebuildWebView("Fix scrolling", chip);
     }
 
-    /** B25's chip. */
-    private void rebuildWebView() {
-        rebuildWebView("Scrolling chip");
+    /** Which chip is up: B33's kind, B25's "scroll", or none. */
+    private String chipNow() {
+        return !bootChipKind.isEmpty() ? bootChipKind : stuckChipWanted ? "scroll" : "";
     }
 
     /**
@@ -3634,13 +3658,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
      * handed to the new page; the record is kept, so the evidence of a page
      * stuck on the logo doesn't go with it); the rest comes back from the saved
      * history, or from the address for Try again. The rebuild is logged with
-     * why it was chosen and what was up. A swap due while the app is off
+     * why it was chosen and what was up ({@code chip}: the one Cam answered,
+     * read before the tap took it down). A swap due while the app is off
      * screen waits for the next onResume (its page would load blocked).
      */
-    private void rebuildWebView(String why) {
+    private void rebuildWebView(String why, String chip) {
         if (rebuilding || isFinishing()) return;
         rebuilding = true;
-        final JSONObject entry = rebuildEntry(why);
+        final JSONObject entry = rebuildEntry(why, chip);
         final long asked = SystemClock.uptimeMillis();
         final boolean[] done = {false};
         final long[] answered = {-1};
@@ -3686,14 +3711,14 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
             + "try{return JSON.stringify(r)}catch(e){return null}})()";
 
     /** What was up when a rebuild was chosen (kinds only). */
-    private JSONObject rebuildEntry(String why) {
+    private JSONObject rebuildEntry(String why, String chip) {
         JSONObject e = new JSONObject();
         try {
             BootWatch w = watch;
             e.put("why", why).put("at", NetWatch.clock()).put("route", route)
                     .put("logoUp", w != null && !w.booted).put("stuck", w != null && w.stuck)
                     .put("fullScreen", customView != null || pageVideo)
-                    .put("chip", !bootChipKind.isEmpty() ? bootChipKind : stuckChipWanted ? "scroll" : "")
+                    .put("chip", chip)
                     .put("seq", w == null ? 0 : w.seq).put("resumed", resumed);
         } catch (JSONException ignored) {
             // Not reachable with constant keys.
