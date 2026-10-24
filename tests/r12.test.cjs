@@ -787,7 +787,7 @@ test('R12: a swipe down that starts on the details returns to the Story, which c
   assert.deepEqual(await sent(page, 'comments'), []);
 });
 
-const page_open = page => page.evaluate(() => !!document.getElementById('sg-reel'));
+const reelOpen = page => page.evaluate(() => !!document.getElementById('sg-reel'));
 test('B29: a swipe up on a Story\'s Reel (or its details) opens the comments as the Comment button does; the Reel stays, the Story waits', async () => {
   const reelState = page => page.evaluate(() => ({ open: !!document.getElementById('sg-reel'), story: window.__story.paused,
     playing: !document.querySelector('#sg-reel video').paused, fs: document.fullscreenElement && document.fullscreenElement.tagName }));
@@ -820,11 +820,11 @@ test('B29: a swipe up on a Story\'s Reel (or its details) opens the comments as 
   await drag(off, [200, 400], [200, 140]);
   await off.waitForTimeout(200);
   assert.deepEqual([await sent(off, 'comments'), (await sent(off, 'toast')).length], [[], 0]);
-  assert.deepEqual(await page_open(off), true);
+  assert.deepEqual(await reelOpen(off), true);
   assert.equal((await r12(off)).swipeComments, 0);
   // Back from the app still closes the Reel.
   await off.evaluate(() => window.__sg.onNative({ type: 'fullVideoExit' }));
-  assert.equal(await page_open(off), false);
+  assert.equal(await reelOpen(off), false);
 });
 
 test('R12: like and save send the Reel\'s exact id, though Instagram\'s answer has it as a bare 19-digit number', async () => {
