@@ -1102,16 +1102,18 @@ public class ShellTest {
             assertTrue("the panel's WebView took the focus", panel.web().hasFocus());
             assertFalse(page.hasFocus());
             // A finger landing on the page (above the panel) gives the page the focus back; the panel stays.
-            View decor = a.getWindow().getDecorView();
-            int top = Math.round(((View) z.getParent()).getHeight() * 0.42f);
-            s.onActivity(x -> tap(decor, 200, Math.max(10, top - 40)));
+            // (Touches are dispatched on the app's root view, in its own coordinates.)
+            View root = (View) z.getParent();
+            int panelTop = panel.getTop() + Math.round(panel.getTranslationY());
+            assertTrue("the panel sits in the lower part (top " + panelTop + ")", panelTop > 100 && panelTop < root.getHeight() - 100);
+            s.onActivity(x -> tap(root, 200, Math.max(10, panelTop - 80)));
             idle();
             assertTrue("a touch on the page focuses it", page.hasFocus());
             assertTrue(panel.isOpen());
             // A finger landing on the panel leaves the panel's focus alone.
             s.onActivity(x -> panel.web().requestFocus());
             idle();
-            s.onActivity(x -> tap(decor, 200, top + 60));
+            s.onActivity(x -> tap(root, 200, panelTop + 80));
             idle();
             assertTrue("a touch on the panel leaves its focus", panel.web().hasFocus());
             // 3. Closing the panel hands the focus back at once (the panel is still sliding away).

@@ -273,6 +273,14 @@ public class B28Test {
         send(d, MotionEvent.ACTION_UP, x, y);
     }
 
+    /** B's playback machinery: clock, seeking, readiness, frames decoded/dropped, the fixture's last samples. */
+    String playback() {
+        return jsText("(function(){var v=document.getElementById('B');var q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():{};"
+                + "return JSON.stringify({t:Math.round(v.currentTime*1000)/1000,seeking:v.seeking,ready:v.readyState,net:v.networkState,"
+                + "frames:q.totalVideoFrames,dropped:q.droppedVideoFrames,rvfc:typeof v.requestVideoFrameCallback,"
+                + "tail:(window.__t||[]).slice(-6)})})()");
+    }
+
     /** Each video's state as "P"/">" (paused/playing) and "m"/"S" (muted/sound), with the player's choice. */
     String videoStates() {
         return jsText("['A','B','C'].map(function(i){var v=document.getElementById(i);return i+(v.paused?'P':'>')+(v.muted?'m':'S')}).join(' ')+' active='+__ig.active");
@@ -296,7 +304,7 @@ public class B28Test {
         SystemClock.sleep(800);
         int y0 = jsInt("Math.round(scrollY)");
         int playsA = jsInt("__ig.plays.A"), playsC = jsInt("__ig.plays.C");
-        log("before the tap: scrollY " + y0 + "  " + videoStates());
+        log("before the tap: scrollY " + y0 + "  " + videoStates() + "  B " + playback());
         assertTrue("the page is scrolled past A (" + y0 + ")", y0 > 200);
 
         // The real tap on B: R10's full screen.
@@ -329,6 +337,7 @@ public class B28Test {
             SystemClock.sleep(100);
         }
         log("largest move from " + y0 + ": " + maxOff + " px  SG: " + jsText("JSON.stringify((function(d){return {scrollHeld:d.scrollHeld,scrollHeldMax:d.scrollHeldMax,othersPaused:d.othersPaused,replays:d.replays,remuted:d.remuted,framesStalled:d.framesStalled}})(__sg.stats.diag.fullVideo))"));
+        log("B after 3 s of full screen: " + playback());
         assertTrue("the page stays within 2 px of " + y0 + " under the full screen (moved " + maxOff + ")", maxOff <= 2);
         assertEquals("B the only video playing and the only one with sound, every sample:\n" + wrong, 0, wrong.length());
         assertEquals("A was never played", playsA, jsInt("__ig.plays.A"));
@@ -340,10 +349,12 @@ public class B28Test {
         // B31: a jump as the progress bar makes one; the picture follows (the clock runs on).
         js("(function(){var v=document.getElementById('B');v.currentTime=Math.min(v.duration-0.5,(v.currentTime+3)%v.duration)})()");
         double t1 = Double.parseDouble(js("document.getElementById('B').currentTime"));
-        SystemClock.sleep(1200);
+        // The clock runs on once the new position has decoded (at once on a phone; the
+        // emulator decodes in software and may take seconds).
+        boolean moved = waitFor(() -> Double.parseDouble(js("document.getElementById('B').currentTime")) != t1, 8000, "clock after the jump");
         double t2 = Double.parseDouble(js("document.getElementById('B').currentTime"));
-        log("after the jump: " + t1 + " -> " + t2 + "  " + videoStates());
-        assertTrue("B plays on after the jump", videoIs("B", false, false) && t2 != t1);
+        log("after the jump: " + t1 + " -> " + t2 + "  " + videoStates() + "  B " + playback());
+        assertTrue("B plays on after the jump", videoIs("B", false, false) && moved);
 
         // A tap in the middle of the full screen pauses B; nothing plays it again.
         float mx = act.getWindow().getDecorView().getWidth() / 2f, my = act.getWindow().getDecorView().getHeight() / 2f;
