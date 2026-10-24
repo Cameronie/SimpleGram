@@ -47,7 +47,10 @@ Status: **open** (recorded, not started) · **fixed (unconfirmed)** (in a build,
 
 Plan conflicts between the batch-4 notes are settled in [`notes/batch-4/plan-decisions.md`](notes/batch-4/plan-decisions.md).
 
-## Batch 6 — open (reported against 1.4)
+## Batch 6 — fixed (unconfirmed) in 1.5 (reported against 1.4)
+
+Cam: "fix everything and push out the next updated apk" (the go-ahead for this batch). Everything here is in 1.5 except R14 (Cam's decision pending). What to try on the phone: [`notes/batch-6/phone-checks-1.5.md`](notes/batch-6/phone-checks-1.5.md). Diagnoses: [B28/B31](notes/batch-6/b28-diagnosis.md), [B33](notes/batch-6/b33-diagnosis.md) with [Data Saver](notes/batch-6/data-saver.md); the build plan: [plan](notes/batch-6/plan.md).
+
 
 | # | Report | Likely cause (tentative, not yet diagnosed) | Planned fix |
 | --- | --- | --- | --- |
