@@ -17,8 +17,10 @@
   if (window.__sg) return;
 
   // continueHome (R7): Home goes on into Following past "caught up" (the app's
-  // switch; off when the app doesn't say).
-  const CFG = Object.assign({ role: 'main', version: 'dev', searchPages: 3, viewerId: null, continueHome: false },
+  // switch; off when the app doesn't say). plainBoot (B33): one load without
+  // SimpleGram's data hooks and DOM rules (the app's last step when Instagram
+  // didn't start); the bridge, the route messages and the diagnostics stay.
+  const CFG = Object.assign({ role: 'main', version: 'dev', searchPages: 3, viewerId: null, continueHome: false, plainBoot: false },
     window.__sgCfg || {});
   const SG = (window.__sg = { cfg: CFG });
   const stats = (SG.stats = {
@@ -123,6 +125,251 @@
       };
     } catch (e) { /* left as it was */ }
   })();
+
+  /* ------------------------------------------------------------------ *
+   * B33: did Instagram start? Its logo screen (#splash-screen) is part of
+   * the page, and its code removes or hides it once the website has started.
+   * Starting needs about six script files from its static host; if one fails
+   * or stalls while the page loads, Instagram marks it done anyway, never asks
+   * again and has no timeout, so the logo stays up for good. This watch tells
+   * the app when the logo goes ('boot': removed, hidden, or none for a page
+   * without one) and when the page is stuck ('bootStuck', once), and keeps a
+   * record of the page's state for Copy details (counts and shapes only):
+   * pushed at 10 s and 30 s of logo, and read by the app (bootRecord) before
+   * a rebuild. Set up here, before any of Instagram's scripts: the native
+   * timers and observer are kept (Instagram swaps the window's), and the
+   * clock counts only time on screen and online. The main page only; every
+   * message carries this document's token, so a late one never acts on a
+   * newer page.
+   * ------------------------------------------------------------------ */
+  const BOOT_TICK = 250;
+  const BOOT_RULE_MS = 3000;        // (a) a start-up file failed, (b) a cut-off document: the logo still up this long after
+  const BOOT_QUIET_AFTER = 20000;   // (c) the logo up this long...
+  const BOOT_QUIET_MS = 10000;      // ...with no progress for this long
+  const BOOT_CAP_MS = 60000;        // (d) the logo up this long...
+  const BOOT_CAP_QUIET = 15000;     // ...with no progress in this long
+  const BOOT_RECORD_AT = [10000, 30000];
+  const BOOT_STATIC = /^https:\/\/static\.cdninstagram\.com\/rsrc\.php\//;
+  const nativeSetTimeout = window.setTimeout, nativeClearTimeout = window.clearTimeout, NativeObserver = window.MutationObserver;
+  // What the status report carries; the full record is bootRecord().
+  // scripts: Instagram's start-up files (data-bootloader-hash) as seen, loaded,
+  // failed, still pending, and retried; own: SimpleGram's part in the start
+  // (payloads rooted in Instagram's start-up data, how many a rule changed and
+  // which keys fired, and the continuation asking Instagram's require from
+  // inside a data hook).
+  const boot = (stats.boot = { token: Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4), how: '', ms: -1,
+    rule: '', stuck: 0, records: 0, plain: CFG.plainBoot === true, errors: 0, rejections: 0,
+    own: { bootPayloads: 0, bootChanged: 0, bootKeys: [], requireInHook: 0 } });
+  // The watch's own state. vis: ms on screen and online since document start;
+  // hashes: start-up file hash -> { state: pending | loaded | error, errVis,
+  // hidden, tries }; snap: the last progress signature; errs/rejs: the first
+  // three window errors and unhandled rejections (kind, host kind, line).
+  const bw = { vis: 0, last: Date.now(), timer: 0, dcl: false, dclVis: -1, splashSeen: false, progressVis: 0, snap: '',
+    resources: 0, done: false, mo: null, splashMo: null, hashes: new Map(), errs: [], rejs: [], recordsSent: 0 };
+  function bootSplash() { return document.getElementById('splash-screen'); }
+  // Instagram hides the logo (PolarisSplashScreenController: display none) or removes it (CometSSRContentRevealer).
+  function bootLogoUp() {
+    const el = bootSplash();
+    if (!el || el.hidden || el.style.display === 'none') return false;
+    try { return getComputedStyle(el).display !== 'none'; } catch (e) { return true; }
+  }
+  // A start-up file: a script or stylesheet from Instagram's static host with its loader hash.
+  function bootStatic(el) {
+    if (!el || (el.tagName !== 'SCRIPT' && el.tagName !== 'LINK')) return '';
+    const h = el.getAttribute('data-bootloader-hash');
+    return h && BOOT_STATIC.test(el.src || el.href || '') ? h : '';
+  }
+  // Only the files in the HTML count (later route bundles fail and are retried as
+  // a matter of course), plus a retry of one of them (a new element, same hash).
+  function bootNoteScript(el, inHtml) {
+    const h = bootStatic(el);
+    if (!h) return;
+    const e = bw.hashes.get(h);
+    if (e) { if (e.state !== 'pending' && e.el !== el) { e.state = 'pending'; e.tries++; e.el = el; } return; }
+    if (bw.dcl && !inHtml) return;
+    bw.hashes.set(h, { state: 'pending', errVis: 0, hidden: false, tries: 0, el: el });
+  }
+  function bootHost(url) {
+    if (!url) return 'inline';
+    if (/^https:\/\/www\.instagram\.com\//.test(url)) return 'www';
+    if (/^https:\/\/static\.cdninstagram\.com\//.test(url)) return 'static';
+    if (/^https:\/\/scontent[^/]*\//.test(url)) return 'scontent';
+    return 'other';
+  }
+  // Capture phase on the document: the load and error of every element pass it
+  // first (an element's load never reaches the window).
+  function bootResource(e) {
+    const h = bootStatic(e.target);
+    if (!h) return;
+    if (!bw.hashes.has(h)) bootNoteScript(e.target);
+    const s = bw.hashes.get(h);
+    if (!s) return;
+    if (e.type === 'load') s.state = 'loaded';
+    else { s.state = 'error'; s.errVis = bw.vis; s.hidden = !!document.hidden; }
+  }
+  document.addEventListener('load', safe(bootResource), true);
+  document.addEventListener('error', safe(bootResource), true);
+  // A script error (the ErrorEvent at the window), not a file that failed to load.
+  window.addEventListener('error', safe(e => {
+    if (e.target && e.target !== window) return;
+    boot.errors++;
+    if (bw.errs.length < 3) bw.errs.push({ kind: shapeToken(e.error && e.error.name) || 'Error', host: bootHost(e.filename), line: e.lineno | 0 });
+  }));
+  window.addEventListener('unhandledrejection', safe(e => {
+    boot.rejections++;
+    const r = e.reason;
+    if (bw.rejs.length < 3) bw.rejs.push({ kind: shapeToken(r && typeof r === 'object' ? r.name : typeof r) || '?' });
+  }));
+  // Progress while the logo is up: a new or processed start-up payload
+  // (script[data-sjs]), a resource completing (a file, a fetch or an XHR),
+  // the document's readyState changing, a payload through the data hooks.
+  function bootProgress() {
+    const sig = [document.readyState, document.querySelectorAll('script[data-sjs]').length,
+      document.querySelectorAll('script[data-sjs][data-processed]').length, bw.resources, stats.payloads].join(',');
+    if (sig === bw.snap) return;
+    bw.snap = sig;
+    bw.progressVis = bw.vis;
+  }
+  // The stuck rules, on time on screen and online: (a) a start-up file failed,
+  // no retry of any file is on its way, and the logo is still up 3 s later;
+  // (b) the document ended without Instagram's end marker (cut off) and the
+  // logo is still up 3 s after DOMContentLoaded; (c) no progress for 10 s once
+  // the logo has been up 20 s; (d) the logo up 60 s with no progress in 15 s.
+  function bootRule() {
+    let pending = 0, err = null;
+    for (const s of bw.hashes.values()) {
+      if (s.state === 'pending') pending++;
+      else if (s.state === 'error' && (!err || s.errVis < err.errVis)) err = s;
+    }
+    if (err && !pending && bw.vis - err.errVis >= BOOT_RULE_MS) return 'a';
+    if (bw.dcl && !document.getElementById('has-finished-comet-page') && bw.vis - bw.dclVis >= BOOT_RULE_MS) return 'b';
+    if (bw.vis >= BOOT_QUIET_AFTER && bw.vis - bw.progressVis >= BOOT_QUIET_MS) return 'c';
+    if (bw.vis >= BOOT_CAP_MS && bw.vis - bw.progressVis >= BOOT_CAP_QUIET) return 'd';
+    return '';
+  }
+  function bootRecord() {
+    const splash = bootSplash();
+    const sjs = document.querySelectorAll('script[data-sjs]');
+    const last = sjs.length ? sjs[sjs.length - 1] : null;
+    const sc = { n: 0, loaded: 0, errored: 0, pending: 0, retries: 0 };
+    for (const s of bw.hashes.values()) {
+      sc.n++;
+      sc[s.state === 'pending' ? 'pending' : s.state === 'error' ? 'errored' : 'loaded']++;
+      sc.retries += s.tries;
+    }
+    // Instagram's static files (rsrc.php) in the resource timing: how many, how many answered 4xx or 5xx, the longest in ms.
+    const files = { n: 0, failed: 0, longest: 0 };
+    try {
+      for (const e of performance.getEntriesByType('resource')) {
+        if (!/\/rsrc\.php\//.test(e.name)) continue;
+        files.n++;
+        if (e.responseStatus >= 400) files.failed++;
+        files.longest = Math.max(files.longest, Math.round(e.duration));
+      }
+    } catch (e) { /* resource timing unavailable */ }
+    // Instagram's HTML queues module definitions and requireLazy calls in two
+    // arrays until its loader arrives; their lengths show how far it got.
+    const stub = v => (Array.isArray(v) ? v.length : null);
+    return {
+      token: boot.token, rule: boot.rule, ms: Math.round(performance.now()), vis: Math.round(bw.vis),
+      hidden: !!document.hidden, online: navigator.onLine !== false,
+      logo: { present: !!splash, up: bootLogoUp(), display: splash ? shapeToken(splash.style.display) || '' : '', how: boot.how, ms: boot.ms },
+      ready: document.readyState, dcl: bw.dcl, endMarker: !!document.getElementById('has-finished-comet-page'),
+      require: typeof window.require, stubs: { d: stub(window.__d_stub), rl: stub(window.__rl_stub) },
+      sjs: { n: sjs.length, processed: document.querySelectorAll('script[data-sjs][data-processed]').length,
+        lastLen: last ? last.textContent.length : 0, lastWant: last ? (+last.getAttribute('data-content-len') || 0) : 0 },
+      scripts: sc, files: files,
+      errors: { n: boot.errors, first: bw.errs.slice() }, rejections: { n: boot.rejections, first: bw.rejs.slice() },
+      progress: { quiet: Math.round(bw.vis - bw.progressVis), snap: bw.snap },
+      own: { hooks: CFG.plainBoot !== true, plain: CFG.plainBoot === true, payloads: stats.payloads, errors: stats.errors,
+        bootPayloads: boot.own.bootPayloads, bootChanged: boot.own.bootChanged, bootKeys: boot.own.bootKeys.slice(),
+        requireInHook: boot.own.requireInHook, cont: stats.cont ? stats.cont.state : '' },
+    };
+  }
+  SG.bootRecord = () => safe(bootRecord)() || null;
+  function bootBooted(how) {
+    if (bw.done) return;
+    bw.done = true;
+    boot.how = how;
+    boot.ms = Math.round(performance.now());
+    if (bw.mo) bw.mo.disconnect();
+    if (bw.splashMo) bw.splashMo.disconnect();
+    bw.mo = bw.splashMo = null;
+    if (bw.timer) nativeClearTimeout.call(window, bw.timer);
+    bw.timer = 0;
+    post('boot', { token: boot.token, ms: boot.ms, how: how });
+  }
+  // The logo, looked at as soon as something touches it and on every tick.
+  function bootCheck() {
+    if (bw.done) return;
+    const el = bootSplash();
+    if (el) bw.splashSeen = true;
+    if (el && !bw.splashMo) {
+      try {
+        bw.splashMo = new NativeObserver(safe(bootCheck));
+        bw.splashMo.observe(el, { attributes: true, attributeFilter: ['style', 'hidden', 'class'] });
+      } catch (e) { bw.splashMo = null; }
+    }
+    if (bw.splashSeen && !bootLogoUp()) bootBooted(el ? 'hidden' : 'removed');
+  }
+  function bootTick() {
+    bw.timer = 0;
+    if (bw.done) return;
+    const now = Date.now();
+    if (!document.hidden && navigator.onLine !== false) bw.vis += Math.max(0, now - bw.last);
+    bw.last = now;
+    bootCheck();
+    if (!bw.done && bootLogoUp()) {
+      bootProgress();
+      if (!boot.rule) {
+        const rule = bootRule();
+        if (rule) {
+          boot.rule = rule;
+          boot.stuck++;
+          post('bootStuck', { token: boot.token, rule: rule, record: bootRecord() });
+        }
+      }
+      if (bw.recordsSent < BOOT_RECORD_AT.length && bw.vis >= BOOT_RECORD_AT[bw.recordsSent]) {
+        bw.recordsSent++;
+        boot.records++;
+        post('bootRecord', { token: boot.token, record: bootRecord() });
+      }
+    }
+    if (!bw.done) bw.timer = nativeSetTimeout.call(window, safe(bootTick), BOOT_TICK);
+  }
+  if (CFG.role === 'main') {
+    try {
+      bw.mo = new NativeObserver(safe(records => {
+        let touched = false;
+        for (const r of records) {
+          for (const n of r.addedNodes) {
+            if (n.nodeType !== 1) continue;
+            if (n.id === 'splash-screen') touched = true;
+            else bootNoteScript(n);
+          }
+          for (const n of r.removedNodes) if (n.nodeType === 1 && n.id === 'splash-screen') touched = true;
+        }
+        if (touched || (!bw.splashSeen && !bw.dcl)) bootCheck();
+      }));
+      // The document itself: at document start its <html> may not exist yet.
+      bw.mo.observe(document, { childList: true, subtree: true });
+    } catch (e) { bw.mo = null; }
+    try {
+      new PerformanceObserver(safe(list => { bw.resources += list.getEntries().length; })).observe({ type: 'resource', buffered: true });
+    } catch (e) { /* resource timing unavailable: readyState and payloads still count */ }
+    // The document is parsed (or was already, on a WebView that injects late).
+    const bootDomReady = safe(() => {
+      bw.dcl = true;
+      bw.dclVis = bw.vis;
+      for (const el of document.querySelectorAll('script[data-bootloader-hash],link[data-bootloader-hash]')) bootNoteScript(el, true);
+      bootCheck();
+      // A page without Instagram's logo screen (a challenge, an error page): nothing to watch.
+      if (!bw.done && !bw.splashSeen && !bootSplash()) bootBooted('none');
+    });
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootDomReady, { once: true });
+    else bootDomReady();
+    bw.timer = nativeSetTimeout.call(window, safe(bootTick), BOOT_TICK);
+  }
 
   /* ------------------------------------------------------------------ *
    * Routes
@@ -733,7 +980,7 @@
     } else {
       return null;
     }
-    if (safe(contArm)(fs, owner) === true) return cut;   // R7: paging stays on, Following comes next
+    if (safe(contArm)(fs, owner, at >= 0 ? 'marker' : 'noLine') === true) return cut;   // R7: paging stays on, Following comes next
     if (fs.cont) { fs.cont = false; safe(contFail)('error'); }   // a start that broke: the card, as before
     endHomePaging(owner, fs);
     endFeed(fs, true);
@@ -999,6 +1246,7 @@
     const tr = { ev: 'page', va: addressVariant(), vp: variant, ps: shapeToken(owner.pagination_source),
       in: list.length, mk: markerAt(list), nx0: sentMore };
     if (home) safe(noteHomePage)(owner, list, fs);
+    if (home) safe(contModulesSoon)();   // R7's module check, once this parse is over
     safe(triedHit)();
     fs.lastPageAt = Date.now();
     if (streamed) {
@@ -1174,6 +1422,9 @@
     if (kept.length !== list.length || kept.some((e, i) => e !== list[i])) list.splice(0, list.length, ...kept);
     if (first && !list.length) emptyFirstAt = Date.now();
     const more = hasMore(owner);
+    // B32: the second Home page in a row without friends' posts and without
+    // Instagram's line: Following comes next (R7), as at the marker.
+    if (home && !fs.cont && keptMedia === 0 && more) safe(contNoLine)(fs, owner);
     if (home && fs.cont) {
       // Home's last page before Following: Instagram is asked again once posts are ready.
       if (keptMedia <= 2 && cs) { if (!cs.waiting) cs.waitSeen = contSeenPassed; cs.waiting = true; }
@@ -1449,6 +1700,27 @@
     }
   }
 
+  // B33: Instagram's start-up data (its ServerJS payloads: require and define
+  // lists carrying module configuration) is not feed data. The generic feed
+  // rules, the bare ads key and dropAds on plain list names, never touch it;
+  // they apply to the query results it carries (__bbox.result.data), as to
+  // any api answer. cfgScope: objects inside such configuration; cfgExempt:
+  // the query results in it. inCfg: the object visit() is looking at.
+  const cfgScope = new WeakSet(), cfgExempt = new WeakSet();
+  let inCfg = false;
+  let bootKeysNow = null;   // the rule keys fired in the start-up payload being cleansed (names only)
+  function serverJsRoot(o) {
+    return Array.isArray(o.require) || Array.isArray(o.define) || !!(o.__bbox && typeof o.__bbox === 'object');
+  }
+  // The counters the rules move: a payload they left as it was moves none.
+  function ruleMoves() {
+    return stats.ads + stats.chainingTrimmed + stats.exploreBlanked + stats.suggestionsBlanked + stats.searchStopped +
+      stats.feed.pages + (stats.feed.inMarker || 0) + stats.dmReel.trimmed;
+  }
+  function noteBootKey(k) {
+    const t = shapeToken(k);
+    if (t && bootKeysNow.indexOf(t) < 0 && bootKeysNow.length < 12) bootKeysNow.push(t);
+  }
   function visit(o) {
     if (cleanseDirect) {
       b24NoteShare(o);
@@ -1457,6 +1729,7 @@
     for (const k in o) {
       const v = o[k];
       if (!v || typeof v !== 'object') continue;
+      let hit = true;
       if (TIMELINE_KEY.test(k) && Array.isArray(v.edges)) filterFeedList(v, v.edges);
       else if (k === 'feed_items' && Array.isArray(v)) filterFeedList(o, v);
       else if (cleanseDirect && (CHAINING_KEY.test(k) || DM_CHAIN_KEY.test(k)) && !SUGGEST_KEY.test(k) && !DM_MSG_KEYS.includes(k)) b24TrimChain(v, 'key');
@@ -1464,9 +1737,11 @@
       else if (EXPLORE_KEY.test(k)) blankLists(v, 'exploreBlanked');
       else if (k === 'sectional_items' && Array.isArray(v) && route() !== 'search' && !ownFetch) { blankLists(v, 'exploreBlanked'); stopPagination(o); }
       else if (SUGGEST_KEY.test(k)) { if (/ayml/i.test(k)) safe(noteAyml)(); blankLists(v, 'suggestionsBlanked'); }
-      else if (AD_CONTAINER_KEY.test(k)) blankLists(v, 'ads');
+      else if (AD_CONTAINER_KEY.test(k) && !(inCfg && k === 'ads')) blankLists(v, 'ads');
       else if (SEARCH_KEY.test(k) && route() === 'search' && !ownFetch) limitSearch(v);
-      if (Array.isArray(v) && v.length && AD_LIST_KEY.test(k)) dropAds(v);
+      else hit = false;
+      if (!inCfg && Array.isArray(v) && v.length && AD_LIST_KEY.test(k)) { dropAds(v); hit = true; }
+      if (hit && bootKeysNow) noteBootKey(k);
     }
     if (looksLikeMedia(o)) indexMedia(o);
     else if (typeof o.username === 'string' && o.username && !o.image_versions2) {
@@ -1486,19 +1761,33 @@
       blankLists(root.sectional_items, 'exploreBlanked');
       stopPagination(root);
     }
+    const bootPayload = !Array.isArray(root) && serverJsRoot(root);
+    const moved = bootPayload ? ruleMoves() : 0;
+    if (bootPayload) { cfgScope.add(root); bootKeysNow = []; }
     const stack = [root];
     let budget = 400000;
     while (stack.length && budget-- > 0) {
       const o = stack.pop();
+      const cfg = cfgScope.has(o);
       if (Array.isArray(o)) {
-        for (let i = 0; i < o.length; i++) { const x = o[i]; if (x && typeof x === 'object') stack.push(x); }
+        for (let i = 0; i < o.length; i++) { const x = o[i]; if (x && typeof x === 'object') { if (cfg) cfgScope.add(x); stack.push(x); } }
         continue;
       }
+      inCfg = cfg;
       visit(o);
-      for (const k in o) { const x = o[k]; if (x && typeof x === 'object') stack.push(x); }
+      // A query result carried in the start-up data (__bbox.result.data) is feed data again.
+      if (cfg && o.__bbox && o.__bbox.result && o.__bbox.result.data && typeof o.__bbox.result.data === 'object') cfgExempt.add(o.__bbox.result.data);
+      for (const k in o) { const x = o[k]; if (x && typeof x === 'object') { if (cfg && !cfgExempt.has(x)) cfgScope.add(x); stack.push(x); } }
     }
+    inCfg = false;
     streamed = false;
     cleanseDirect = false;
+    if (bootPayload) {
+      boot.own.bootPayloads++;
+      if (ruleMoves() !== moved) boot.own.bootChanged++;
+      for (const k of bootKeysNow) if (boot.own.bootKeys.indexOf(k) < 0 && boot.own.bootKeys.length < 12) boot.own.bootKeys.push(k);
+      bootKeysNow = null;
+    }
   }
   SG.cleanse = cleanse;
 
@@ -1530,39 +1819,59 @@
       }
     } catch (e) { /* never throw into Instagram */ }
   }
+  // B33: a cleanse running inside one of the three data hooks, that is inside
+  // Instagram's own reading of its data (the boot record counts what asks
+  // Instagram's require from there).
+  let inHook = 0;
+  function hookCleanse(out, via) {
+    inHook++;
+    try { cleanse(out, via); } catch (e) { stats.errors++; } finally { inHook--; }
+  }
   const wrappedParse = function parse(text, reviver) {
     const out = nativeParse.apply(this, arguments);
     if (out && typeof out === 'object' && (out.status === 'fail' || out.errors)) noteThrottle(out);
     if (typeof text === 'string' && text.length > 150 && out && typeof out === 'object' &&
         (INTEREST.test(text) || (text.indexOf('"target_url"') >= 0 && CFG.role === 'main' && route() === 'direct'))) {
-      try { cleanse(out, 'parse'); } catch (e) { stats.errors++; }
+      hookCleanse(out, 'parse');
     }
     return out;
   };
-  JSON.parse = wrappedParse;
+  // B33: a plain load (plainBoot) installs none of the three data hooks.
+  if (!CFG.plainBoot) JSON.parse = wrappedParse;
 
-  if (window.Response && Response.prototype.json) {
+  if (window.Response && Response.prototype.json && !CFG.plainBoot) {
     const nativeJson = Response.prototype.json;
     Response.prototype.json = function json() {
       return nativeJson.apply(this, arguments).then(out => {
-        if (out && typeof out === 'object') { noteThrottle(out); try { cleanse(out, 'fetch'); } catch (e) { stats.errors++; } }
+        if (out && typeof out === 'object') { noteThrottle(out); hookCleanse(out, 'fetch'); }
         return out;
       });
     };
   }
-  if (window.XMLHttpRequest) {
+  if (window.XMLHttpRequest && !CFG.plainBoot) {
     const desc = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
     if (desc && desc.get && desc.configurable) {
-      const done = new WeakSet();
+      // Chromium parses a JSON response anew on every read of `response`, so
+      // the cleansed object is kept per request and handed back on every read
+      // (B33: a repeated read used to be cleansed and counted again). A request
+      // opened again starts over: the kept object goes when readyState leaves DONE.
+      const cleansed = new WeakMap();
       Object.defineProperty(XMLHttpRequest.prototype, 'response', {
         configurable: true,
         enumerable: desc.enumerable,
         get: function () {
+          if (this.responseType !== 'json') return desc.get.call(this);
+          const kept = cleansed.get(this);
+          if (kept && kept.out && this.readyState === 4) return kept.out;
           const out = desc.get.call(this);
-          if (this.responseType === 'json' && out && typeof out === 'object' && !done.has(out)) {
-            done.add(out);
+          if (out && typeof out === 'object' && this.readyState === 4) {
+            if (kept) kept.out = out;
+            else {
+              cleansed.set(this, { out: out });
+              this.addEventListener('readystatechange', () => { if (this.readyState !== 4) { const k = cleansed.get(this); if (k) k.out = null; } });
+            }
             noteThrottle(out);
-            try { cleanse(out, 'xhr'); } catch (e) { stats.errors++; }
+            hookCleanse(out, 'xhr');
           }
           return out;
         },
@@ -1810,10 +2119,12 @@
   // ready, Instagram's next page pending), the "Loading more…" notes, the
   // stalled cards while it ran (with the wait so far), and the last few
   // waits (end: posts, up, ended).
+  // startVia (B32): how the last run started, at Instagram's marker or
+  // without its line (noLine, also counted in headWhy).
   const cont = (stats.cont = { on: CFG.continueHome === true, state: 'off', reason: '', own: 0, ownFail: 0, pages: 0,
     swaps: 0, handed: 0, empty: 0, skippedSeen: 0, heads: 0, anchors: 0, recsAnchors: 0, nudges: 0,
-    headWhy: { marker: 0, seen: 0, jump: 0, tap: 0, ended: 0 }, igKept: 0, resets: 0, keptBuffer: 0,
-    startsMin: 0, peakMin: 0, repeats: 0, notes: 0, modules: null, runs: [], hand: [],
+    headWhy: { marker: 0, seen: 0, jump: 0, tap: 0, ended: 0, noLine: 0 }, igKept: 0, resets: 0, keptBuffer: 0,
+    startsMin: 0, peakMin: 0, repeats: 0, notes: 0, modules: null, startVia: '', runs: [], hand: [],
     waits: { n: 0, ms: 0, longest: 0, why: { empty: 0, read: 0, pacing: 0, ig: 0 }, notes: 0, cards: 0, atCard: null, last: [] } });
   let cs = null;                 // the current run (from one marker on)
   let contGen = 0;               // one counter for the page load: a reset makes every answer on its way stale
@@ -1902,20 +2213,61 @@
       actions: !!(m && (m.PAGE_SIZE || (m.default && m.default.PAGE_SIZE))), asyncParams: !!moduleFn('getAsyncParams'),
       asyncHeaders: !!moduleFn('getAsyncHeaders') };
   }
+  // The module check outside Instagram's own data reading (B33's latent risk:
+  // asking its require from inside its JSON.parse can run a module's factory
+  // mid-parse). After a Home page, once the parse is over (a microtask), the
+  // two feed queries are asked for straight from require, not through
+  // igModule: a miss there is remembered for the page, and the bundle that
+  // defines them may simply not have loaded yet. Found, the full check is
+  // kept for contArm. Asked again only once the page holds more script files
+  // than at the last miss, so a miss costs Instagram's error logging a few
+  // asks at most.
+  let contModulesCached = null, contModulesScripts = -1, contModulesQueued = false;
+  function contModulesSoon() {
+    if (contModulesCached || contModulesQueued || !cont.on || CFG.role !== 'main') return;
+    if (contModulesScripts >= 0 && document.scripts.length <= contModulesScripts) return;
+    contModulesQueued = true;
+    Promise.resolve().then(safe(() => {
+      contModulesQueued = false;
+      const peek = name => { try { return typeof window.require === 'function' ? window.require(name + '.graphql') : null; } catch (e) { return null; } };
+      const ready = p => !!p && /^\d+$/.test(String(p.id)) && !!p.providedVariables && typeof p.providedVariables === 'object';
+      if (ready(paramsOf(peek(CONT_ROOT))) && ready(paramsOf(peek(CONT_NEXT)))) cont.modules = contModulesCached = contModules();
+      else contModulesScripts = document.scripts.length;
+    }));
+  }
   // At the marker, synchronously: Home goes on only when its own paging does
   // and the page's own query modules are there; otherwise the card, as before.
-  function contArm(fs, owner) {
+  // via: 'marker', or 'noLine' when Instagram sent no marker (B32).
+  function contArm(fs, owner, via) {
     if (!contWanted(fs) || fs.cont) return false;
     if (cont.state === 'failed' || cont.state === 'limit') return false;   // this page load stays ended
     if (!hasMore(owner) || !cursorOf(owner)) return false;                 // Instagram itself stops here
-    cont.modules = contModules();
+    // The check made after an earlier page; only when none ran, today's look from here.
+    cont.modules = contModulesCached || contModules();
     if (!cont.modules.root || !cont.modules.next) { cont.state = 'failed'; cont.reason = 'modules'; return false; }
     fs.cont = true;
     fs.caughtUp = true;
     contStart(!!fs.contMerged);
-    if (cont.state === 'running') return true;
+    if (cont.state === 'running') {
+      cont.startVia = via === 'noLine' ? 'noLine' : 'marker';
+      if (via === 'noLine') cont.headWhy.noLine++;
+      return true;
+    }
     fs.cont = false;
     return false;
+  }
+  // B32: Home's end without Instagram's line. Instagram sends no marker, just
+  // page after page without a post from people you follow (its suggestions,
+  // or nothing at all); the second one in a row, once Home has shown posts,
+  // is where the marker would have been: the continuation starts there, as
+  // at the marker (fs.caughtUp, fs.cont, paging on), and the handover draws
+  // its own line above Following's first post as it does after a marker. A
+  // page Instagram labels as its suggestions (feed_recs) starts it at once,
+  // from endHome. The first such page may be a gap in Instagram's ranking:
+  // without the continuation, Home still stops after four (stats.feed.stopped).
+  function contNoLine(fs, owner) {
+    if (!contWanted(fs) || fs.cont || fs.ended || !fs.shownAny || fs.emptyStreak < 1) return false;
+    return contArm(fs, owner, 'noLine');
   }
   function contAlive() { return !!cs && cont.state === 'running'; }
   // An own read on its way (never longer than it may take), one waiting for
@@ -1964,7 +2316,11 @@
     cont.state = 'running';
     cont.reason = '';
     if (contStarts.length > CONT_STARTS) { contFail('restarts'); return; }
-    contFill();
+    // The first read once Instagram's own reading of the page is over (B33's
+    // latent risk): building the request asks Instagram's require for its
+    // helpers, never from inside its JSON.parse.
+    const run = cs;
+    setTimeout(safe(() => { if (run === cs) contFill(); }), 0);
   }
   // Home starts over (a reload replaces Instagram's list). Kept for the next
   // run: the cursor of the page in flight (or the next one), and the posts
@@ -3729,7 +4085,7 @@
   }
   let lastTidy = 0, lastBannerScan = 0;
   function queueTidy() {
-    if (tidyQueued) return;
+    if (tidyQueued || CFG.plainBoot) return;   // B33: a plain load leaves Instagram's page as it is
     tidyQueued = true;
     const wait = Math.max(0, 300 - (Date.now() - lastTidy));
     setTimeout(() => { lastTidy = Date.now(); requestAnimationFrame(tidyNow); }, wait);
@@ -6589,6 +6945,7 @@
   const igMiss = new Set();
   function igModule(name) {
     if (igMiss.has(name)) return null;
+    if (inHook) boot.own.requireInHook++;   // B33: asked from inside Instagram's own data reading
     try {
       const m = typeof window.require === 'function' ? window.require(name) : null;
       if (m == null) igMiss.add(name);
@@ -6620,8 +6977,8 @@
   };
   function pvKey(provider) { return '__relay_internal__pv__' + provider + 'relayprovider'; }
   // The query's compiled module, when the page has loaded it.
-  function gqlParams(name) {
-    const m = igModule(name + '.graphql');
+  function gqlParams(name) { return paramsOf(igModule(name + '.graphql')); }
+  function paramsOf(m) {
     const p = m && (m.params || (m.default && m.default.params));
     return p && typeof p === 'object' ? p : null;
   }
@@ -8526,7 +8883,7 @@
         stats.b25.census = safe(touchCensus)() || null;
         stats.b25.search = safe(() => ({ open: !!search.open, leaving: !!leaving,
           cells: search.body && search.body.sgGrid ? search.body.sgGrid.n : 0, liveObservers: liveWatchers }))() || null;
-        post('status', { stats: stats, route: route(), version: CFG.version });
+        post('status', { stats: stats, route: route(), version: CFG.version, plainBoot: CFG.plainBoot === true });
         break;
       case 'tidy': queueTidy(); break;
       case 'contSet': if (typeof cmd.on === 'boolean') contSet(cmd.on); break;
@@ -8538,6 +8895,12 @@
    * Start
    * ------------------------------------------------------------------ */
   function start() {
+    if (CFG.plainBoot) {
+      // B33: a load without SimpleGram's filters: no styles, no DOM rules, no
+      // observer. The bridge, the route messages and the diagnostics stay.
+      post('ready', { url: location.href, route: route() });
+      return;
+    }
     addStyle();
     safe(markFeed)();
     safe(tidyStars)();
