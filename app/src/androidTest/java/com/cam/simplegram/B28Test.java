@@ -359,7 +359,8 @@ public class B28Test {
         // A tap in the middle of the full screen pauses B; nothing plays it again.
         float mx = act.getWindow().getDecorView().getWidth() / 2f, my = act.getWindow().getDecorView().getHeight() / 2f;
         tapAt(mx, my);
-        assertTrue("a tap in full screen pauses B", waitFor(() -> "true".equals(js("document.getElementById('B').paused")), 3000, "B paused"));
+        // (The emulator composites the full screen in software and takes seconds per step.)
+        assertTrue("a tap in full screen pauses B", waitFor(() -> "true".equals(js("document.getElementById('B').paused")), 20000, "B paused"));
         SystemClock.sleep(1200);
         log("after the pause: " + videoStates());
         assertTrue("the pause holds (your pause is never undone)", videoIs("B", true, false));
@@ -368,7 +369,7 @@ public class B28Test {
 
         // Back: the pause is kept, the page is back where it was, B muted as before the tap.
         inst.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
-        assertTrue("Back leaves the full screen", waitFor(() -> !fullScreen(), 8000, "onHideCustomView"));
+        assertTrue("Back leaves the full screen", waitFor(() -> !fullScreen(), 20000, "onHideCustomView"));
         SystemClock.sleep(1500);
         int y1 = jsInt("Math.round(scrollY)");
         log("after Back: scrollY " + y1 + "  " + videoStates() + "  exits=" + jsText("JSON.stringify(__sg.stats.diag.fullVideo.exitsBy)")
