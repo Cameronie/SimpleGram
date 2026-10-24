@@ -5304,9 +5304,11 @@
     const page = canLift(v);
     const target = page ? document.documentElement : v;
     const req = target.requestFullscreen || target.webkitRequestFullscreen;
-    if (typeof req !== 'function') { fvStats.r8Failed++; return false; }
-    const fail = () => {
+    if (typeof req !== 'function') { fvStats.r8Failed++; fvStats.r8FailWhy = 'no api'; return false; }
+    // why: the browser's own words for a refusal (Copy details), never page content.
+    const fail = why => {
       fvStats.r8Failed++;
+      fvStats.r8FailWhy = String(why && why.message || why || '?').slice(0, 120) + ' (' + r8Mode + ')';
       if (r8El === v) r8Pending = false;
       if (r8El === v && !r8On) { r8El = null; delete v.dataset.sgFull; fullKind = ''; r10Snap = null; scrollHoldOff(); }
       syncFullHold();
@@ -5323,13 +5325,13 @@
     // Story asks for one on Home before its route says "story").
     post('fullVideoStart');
     let p;
-    try { p = req.call(target, { navigationUI: 'hide' }); } catch (err) { fail(); return false; }
+    try { p = req.call(target, { navigationUI: 'hide' }); } catch (err) { fail(err); return false; }
     if (p && typeof p.then === 'function') {
       // Chromium resolves the promise before it fires fullscreenchange: in page
       // mode the event (not the promise) says the request landed, so the
       // request stays pending until then (the 3 s limit covers an event that never comes).
       p.then(() => { if (r8El === v && document.fullscreenElement === target && (!page || r8On)) r8Pending = false; },
-        () => { if (document.fullscreenElement !== target) fail(); });
+        err => { if (document.fullscreenElement !== target) fail(err); });
     }
     return true;
   }
