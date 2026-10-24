@@ -117,14 +117,7 @@ Read `b33-diagnosis.md` ("Fix plan" and the reviewers' risks) and
   `status` reply, show the device-only details.
 - Fix scrolling copies the old page's boot record (`window.__sg.bootRecord()`)
   along with its search state before destroying it, and logs the rebuild.
-- Data Saver (see `data-saver.md` for the verified behaviour): read
-  `getRestrictBackgroundStatus()` into Copy details; a one-time tip when it is
-  ENABLED and SimpleGram isn't exempt ("Data Saver can stop Instagram loading
-  when you switch apps. Allow SimpleGram unrestricted data?" with a button that
-  opens `Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS` for the
-  package, and "Not now"); a `NetworkCallback` whose `onBlockedStatusChanged`
-  delays the first load and a rebuild's load while blocked (cap 5 s) and, with
-  a boot stuck, triggers the one reload when the block lifts.
+- Data Saver and the background block: follow `data-saver.md` "Design for 1.5" (it refines this section: the `ACCESS_NETWORK_STATE` permission, `NetWatch`, `whenNetReady` gating, hurt page tokens, recovery on unblock, the watchdog clock counting only resumed and unblocked time, the one-time tip, `netErrors` keys, the `net` block of Copy details).
 - Tests (ShellTest): a local page whose `#splash-screen` never goes → the
   watch fires (timings shortened through a static test knob), one reload,
   then the chip; `netErrors` records a 503 from a local URL; Copy details
