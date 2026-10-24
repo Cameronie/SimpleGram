@@ -691,10 +691,13 @@ public class B25Test {
 
     void r8Enter() {
         float[] a = videoPt(0.2f), z = videoPt(0.9f);
+        long t0 = SystemClock.uptimeMillis();
         drag(a[0], a[1], z[1]);
+        long dragMs = SystemClock.uptimeMillis() - t0;        // R8 takes a swipe under 1.5 s
         boolean ok = waitFor(this::fullScreen, 8000, "R8 full screen");
         SystemClock.sleep(800);
-        log("R8 enter by swipe: " + ok + "  " + r8State());
+        log("R8 enter by swipe: " + ok + "  drag took " + dragMs + " ms  " + r8State()
+                + " fullVideo " + js("JSON.stringify(window.__sg.stats.diag.fullVideo)"));
         assertTrue("R8 entered full screen", ok);
     }
 
@@ -930,8 +933,17 @@ public class B25Test {
         log("native: posts " + field("stuckPosts") + " ignored " + field("stuckIgnored") + " soft " + field("softResets"));
         assertTrue("reported and reset quietly", soft);
         assertFalse("no chip yet", chipShowing());
-        // The quiet reset alone doesn't fix it (the web engine's own state).
-        assertTrue("still stuck after the quiet reset", scrollCheck("after soft 1") <= 20);
+        // On WebView 74 the quiet reset alone doesn't fix it (the web engine's
+        // own state) and the chip follows. A newer web engine comes back from
+        // the reset itself: then there is nothing for the chip to do, and the
+        // rest of this case (the chip's rebuild) can't be run here.
+        if (scrollCheck("after soft 1") > 20) {
+            SystemClock.sleep(1500);
+            assertFalse("no chip once scrolling is back", chipShowing());
+            log("the quiet reset was enough on this WebView: the chip's rebuild isn't exercised");
+            assertStillScrolls();
+            return;
+        }
         assertTrue(scrollCheck("after soft 2") <= 20);
         assertTrue("the chip offers the fix", waitFor(this::chipShowing, 4000, "chip"));
         assertEquals(1, intField("chipShown"));

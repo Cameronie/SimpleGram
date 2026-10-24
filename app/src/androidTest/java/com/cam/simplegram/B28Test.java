@@ -275,7 +275,9 @@ public class B28Test {
 
         // The real tap on B: R10's full screen.
         float[] p = center(".box[data-id=B]");
+        long t0 = SystemClock.uptimeMillis();
         tapAt(p[0], p[1]);
+        log("the tap took " + (SystemClock.uptimeMillis() - t0) + " ms to send");   // R10 wants a tap under 0.9 s
         boolean opened = waitFor(this::fullScreen, 8000, "onShowCustomView");
         if (!opened) {
             // What the page made of the tap, for the log.
