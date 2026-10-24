@@ -208,7 +208,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // Package-private timings: ShellTest shortens them.
     static long bootWatchMs = 30_000, bootProbeMs = 2_000, bootReloadFollowMs = 3_000, bootSettleMs = 1_000;
     private static final int RELOADS_PER_10_MIN = 2;
-    private int bootSeq;                  // the native token of the newest main-frame page start
+    private int bootSeq;                  // the native token of the newest main-frame page start (kept in prefs: unique across restarts)
     private BootWatch watch;              // the page start being watched, or null
     private BootChain chain;              // the ladder's place for the current page; survives its reloads and rebuilds
     private String startHow = "";         // how the next main-frame page start began, set by whoever starts it
@@ -2989,7 +2989,7 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
      * background is given its 30 s once it is back.
      */
     private final class BootWatch {
-        final int seq = ++bootSeq;
+        final int seq;
         final WebView view;
         final String url, how;
         final long startedAt = SystemClock.uptimeMillis();
@@ -3001,6 +3001,10 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         JSONObject log;                   // its bootLog entry, rewritten as the outcome changes
 
         BootWatch(WebView view, String url, String how) {
+            // The logs are matched by this number, so it must never repeat: a new
+            // Activity (a recreate, a fresh process) carries on from the last one.
+            seq = bootSeq = prefs.getInt("bootSeq", 0) + 1;
+            prefs.edit().putInt("bootSeq", bootSeq).apply();
             this.view = view;
             this.url = url;
             this.how = how;
