@@ -106,7 +106,7 @@ bug report, including a short trail of the last feed pages that survives a resta
 
 ## Limits
 
-- Tested against fixture data shaped like Instagram's (468 browser tests), checked against
+- Tested against fixture data shaped like Instagram's (510 browser tests), checked against
   the code of Instagram's current website, and on an Android 10 emulator (48 native tests; 3 of them need a newer WebView than the emulator's and run only on a phone).
   It is not tested against a signed-in Instagram account, so your phone is the real test.
 - Instagram's website, not the app: calls, music on Stories, and some posting features
