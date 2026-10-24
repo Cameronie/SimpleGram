@@ -34,6 +34,8 @@ final class NetWatch {
     }
 
     private static final int RING = 30, RESUMES = 10;
+    // Test knob: ShellTest decides the network's state instead of Android.
+    static Boolean testNetOk;
 
     // Static so they survive the recreate() after a lost renderer.
     private static final ArrayList<JSONObject> events = new ArrayList<>();
@@ -119,6 +121,7 @@ final class NetWatch {
 
     /** Usable now: the callback's word once it has spoken, else whether there is an active network at all. */
     boolean netOk() {
+        if (testNetOk != null) return testNetOk;
         if (known) return net != null && !blocked;
         return !activeNull();
     }
