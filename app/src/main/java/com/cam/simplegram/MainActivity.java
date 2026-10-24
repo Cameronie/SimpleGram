@@ -4,10 +4,12 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.res.Configuration;
@@ -17,11 +19,14 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.ConnectivityManager;
 import android.net.Uri;
+import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.TypedValue;
@@ -41,9 +46,12 @@ import android.webkit.CookieManager;
 import android.webkit.GeolocationPermissions;
 import android.webkit.PermissionRequest;
 import android.webkit.RenderProcessGoneDetail;
+import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -131,6 +139,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     // R10 from the menu: the taps the app made on the page's video for it, and the ones it held back.
     private int videoTaps, videoTapsHeld;
     private Downloads downloads;
+    // B33: what Android lets the network do (Data Saver, the background block).
+    private NetWatch netWatch;
+    private boolean restrictReceiverOn;
+    private final BroadcastReceiver restrictReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            readRestrictStatus("changed");
+        }
+    };
 
     private String route = "other";
     private String pageUrl = "";
@@ -210,6 +227,11 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         viewerId = readViewerId();
         downloads = new Downloads(this, this::toast);
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
+        netWatch = new NetWatch(this, ui, this::onNetOk);
+        netWatch.start();
+        registerRestrictReceiver();
+        readRestrictStatus("create");
+        lifecycle(state == null ? "create" : "restore");
 
         root = new FrameLayout(this) {
             // B27: a touch that lands just beside the ⋮ tab (its dead zone) is the
@@ -453,6 +475,27 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
 
         @Override
+        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+            super.onReceivedError(view, request, error);
+            if ("main".equals(role)) netError(request.getUrl(), request.isForMainFrame(), "net", error.getErrorCode(), String.valueOf(error.getDescription()));
+        }
+
+        @Override
+        public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
+            super.onReceivedHttpError(view, request, response);
+            if ("main".equals(role)) netError(request.getUrl(), request.isForMainFrame(), "http", response.getStatusCode(), "");
+        }
+
+        @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            // The default stays: a page with a bad certificate (a captive portal, a
+            // VPN, a wrong clock) is never shown. Until now it was cancelled in silence.
+            handler.cancel();
+            Uri u = error.getUrl() == null ? null : Uri.parse(error.getUrl());
+            if ("main".equals(role)) netError(u, u != null && u.toString().equals(view.getUrl()), "ssl", error.getPrimaryError(), "");
+        }
+
+        @Override
         public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
             // Both WebViews share the renderer and each reports it: act once.
             if (restarting) return true;
@@ -465,6 +508,85 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
                     .apply();
             ui.post(MainActivity.this::recreate);
             return true;
+        }
+    }
+
+    /**
+     * B33: a failed load of the page or one of its files (shapes only: host kind,
+     * file kind, the error's name and code, whether the app was on screen and
+     * whether Android had it blocked). A start-up file that fails leaves
+     * Instagram's logo up for good; one that stalls leaves no error at all.
+     */
+    private void netError(Uri url, boolean mainFrame, String kind, int code, String name) {
+        try {
+            JSONObject e = new JSONObject()
+                    .put("at", NetWatch.clock())
+                    .put("kind", kind)
+                    .put("code", code)
+                    .put("main", mainFrame)
+                    .put("host", hostKind(url))
+                    .put("res", resKind(url))
+                    .put("resumed", resumed)
+                    .put("blocked", netWatch.isBlocked());
+            if (!name.isEmpty()) e.put("name", name.length() > 60 ? name.substring(0, 60) : name);
+            ring("netErrors", 20, e);
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /** main / api / static / media / other: an address's host, by what it serves. */
+    static String hostKind(Uri u) {
+        if (u == null) return "other";
+        String h = Links.host(u);
+        String p = u.getPath() == null ? "" : u.getPath();
+        if (h.equals("www.instagram.com") || h.equals("instagram.com") || h.equals("m.instagram.com")) {
+            return p.startsWith("/api/") || p.startsWith("/graphql") || p.startsWith("/ajax/") ? "api" : "main";
+        }
+        if (h.equals("i.instagram.com") || h.equals("graph.instagram.com")) return "api";
+        if (h.startsWith("static.")) return "static";    // Instagram's script and style files
+        if (Links.isMediaFile(u)) return "media";
+        return "other";
+    }
+
+    /** js / css / json / html / image / video / font / none / other: a file by its extension. */
+    static String resKind(Uri u) {
+        String p = u == null || u.getLastPathSegment() == null ? "" : u.getLastPathSegment();
+        int dot = p.lastIndexOf('.');
+        if (dot < 0) return "none";
+        switch (p.substring(dot + 1).toLowerCase(Locale.ROOT)) {
+            case "js":
+            case "mjs":
+                return "js";
+            case "css":
+                return "css";
+            case "json":
+                return "json";
+            case "html":
+            case "htm":
+                return "html";
+            case "jpg":
+            case "jpeg":
+            case "png":
+            case "webp":
+            case "gif":
+            case "heic":
+            case "avif":
+            case "svg":
+                return "image";
+            case "mp4":
+            case "m4v":
+            case "m4s":
+            case "webm":
+            case "m3u8":
+            case "mpd":
+                return "video";
+            case "woff":
+            case "woff2":
+            case "ttf":
+                return "font";
+            default:
+                return "other";
         }
     }
 
@@ -1899,20 +2021,30 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     private static final int TRAIL_MAX = 40;
 
     private JSONArray trail() {
-        try {
-            return new JSONArray(prefs.getString("feedTrail", "[]"));
-        } catch (JSONException e) {
-            return new JSONArray();
-        }
+        return ringOf("feedTrail");
     }
 
     private void keepTrail(JSONObject entry) {
         if (entry == null || entry.toString().length() > 800) return;
-        JSONArray old = trail();
+        ring("feedTrail", TRAIL_MAX, entry);
+    }
+
+    /** A ring of entries kept in prefs (counts and shapes only), newest last; it survives a rebuild. */
+    private void ring(String key, int max, JSONObject entry) {
+        if (entry == null || entry.toString().length() > 2000) return;
+        JSONArray old = ringOf(key);
         JSONArray kept = new JSONArray();
-        for (int i = Math.max(0, old.length() - (TRAIL_MAX - 1)); i < old.length(); i++) kept.put(old.opt(i));
+        for (int i = Math.max(0, old.length() - (max - 1)); i < old.length(); i++) kept.put(old.opt(i));
         kept.put(entry);
-        prefs.edit().putString("feedTrail", kept.toString()).apply();
+        prefs.edit().putString(key, kept.toString()).apply();
+    }
+
+    private JSONArray ringOf(String key) {
+        try {
+            return new JSONArray(prefs.getString(key, "[]"));
+        } catch (JSONException e) {
+            return new JSONArray();
+        }
     }
 
     /** Counts and data shapes only, for pasting into a bug report. */
@@ -2144,9 +2276,17 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        lifecycle("start");
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         resumed = false;
+        netWatch.setResumed(false);
+        lifecycle("pause");
         setAwake(false);
         web.onPause();
         comments.web().onPause();
@@ -2157,8 +2297,63 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     protected void onResume() {
         super.onResume();
         resumed = true;
+        netWatch.setResumed(true);
+        lifecycle("resume");
+        readRestrictStatus("resume");
         web.onResume();
         comments.web().onResume();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        // The screen going off stops the Activity too: told apart for the record.
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        lifecycle(pm != null && !pm.isInteractive() ? "screenOff" : "stop");
+    }
+
+    /**
+     * B33: the ring of pause/resume/stop/start/memory events (times only, kept in
+     * prefs). A page that was loading when the app left the screen is the
+     * likeliest to be stuck on Instagram's logo.
+     */
+    private void lifecycle(String event) {
+        try {
+            ring("lifecycle", 20, new JSONObject().put("ev", event).put("at", NetWatch.clock()));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /**
+     * Data Saver's status for this app, re-read when the app comes back and when
+     * Android says it changed (a protected broadcast: registered here, not in the
+     * manifest). Changes are kept with their times.
+     */
+    private void registerRestrictReceiver() {
+        try {
+            IntentFilter f = new IntentFilter(ConnectivityManager.ACTION_RESTRICT_BACKGROUND_CHANGED);
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(restrictReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+            else registerReceiver(restrictReceiver, f);
+            restrictReceiverOn = true;
+        } catch (RuntimeException ignored) {
+            // Without it the status is still read on every resume.
+        }
+    }
+
+    private void readRestrictStatus(String why) {
+        String now = netWatch.restrictStatus();
+        if (now.equals(prefs.getString("restrictStatus", ""))) return;
+        prefs.edit().putString("restrictStatus", now).apply();
+        try {
+            ring("netStatus", 10, new JSONObject().put("status", now).put("why", why).put("at", NetWatch.clock()));
+        } catch (JSONException ignored) {
+            // Not reachable with constant keys.
+        }
+    }
+
+    /** NetWatch: the network became usable, or stopped being. */
+    private void onNetOk(boolean ok) {
     }
 
     @Override
@@ -2190,9 +2385,13 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (level == TRIM_MEMORY_UI_HIDDEN) return;   // only "the app left the screen"
+        if (level == TRIM_MEMORY_UI_HIDDEN) {         // only "the app left the screen"
+            lifecycle("uiHidden");
+            return;
+        }
         String name = level >= 80 ? "complete" : level >= 60 ? "moderate" : level >= 40 ? "background"
                 : level >= 15 ? "critical" : level >= 10 ? "low" : "running moderate";
+        lifecycle("trim " + name);
         trimLog.add(name + " at " + clock());
         if (trimLog.size() > 10) trimLog.remove(0);
     }
@@ -2211,6 +2410,15 @@ public class MainActivity extends Activity implements ZoomFrame.Listener, Commen
         }
         rebuilding = false;
         downloads.release();
+        netWatch.stop();
+        if (restrictReceiverOn) {
+            restrictReceiverOn = false;
+            try {
+                unregisterReceiver(restrictReceiver);
+            } catch (RuntimeException ignored) {
+                // Already gone.
+            }
+        }
         if (touchLast != null) {
             touchLast.recycle();
             touchLast = null;
