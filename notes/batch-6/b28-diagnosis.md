@@ -38,7 +38,7 @@ To show a feed video full screen with its progress bar, 1.4 puts the whole page 
 | (1) after a pause in full screen and Back, the next full screen "was still paused, it wouldn't play", the music video heard | Same, on the second full screen. Back from the first one, SimpleGram had also played B again, undoing the pause (a separate defect, below). |
 | (2) taps in full screen went back to Home, then every tap flipped between Home and full screen | **Not reproduced.** Copy details show those exits were asked for by SimpleGram's page within 40–50 ms of a finger lifting (its swipe rule; its "video gone" rule would have fired without a tap). Likeliest cause: with the system bars hidden, reaching for Back/Home means swiping up from the bottom edge to bring the bars back, and that swipe also reaches the page as a swipe that leaves full screen (B26 removes the need). On Home, every tap on the video is R10 again, so it went straight back into full screen. Copy details will record the reason next time. |
 | B31: scrubbing moved the time but the picture froze | Same cause. The bar shows where you drag. Instagram keeps the video paused, and its streaming doesn't fetch the new part for a video it has stopped, so the picture never catches up. |
-| (3) the "You're all caught up" card after coming back | Not caused by the full screen. Home had ended (the continuation didn't run in that WebView; see the ledger), and the card waits until full screen ends to show. |
+| (3) the "You're all caught up" card after coming back | Probably not the full screen itself. In that WebView Home had ended without carrying on into Following (Copy details: the continuation never started; see B32), and the app holds the card back while full screen is up, so it shows the moment you come back. |
 
 ## Other defects found on the way (all to fix with B28)
 
@@ -60,4 +60,24 @@ To show a feed video full screen with its progress bar, 1.4 puts the whole page 
 
 ## Fix candidate tried on the emulator
 
-PENDING
+`B28Probe#boxHold`: the same run, with a small page script that remembers the scroll position before full screen and puts it back when it moves while `<html>` is full screen.
+
+```
+128775  738 411x842 html -    B   A PS6.4  B >S4.4      full screen lands
+129926  738 411x842 html lift B   A PS6.4  B >S4.4
+132480  738 411x914 html lift B   A PS6.4  B >S4.4      bars hidden; the scroll stays (holds: 1)
+145650  738 411x914 html lift B   A PS6.4  B >S7.0      B plays with sound, A stays paused
+156491  738 411x914 html lift B   A PS6.4  B PS1.0      a tap pauses B; nothing else starts
+166818  738 411x842 -    -    B   A PS6.4  B >m1.0      after Back: SimpleGram plays B again (the separate defect)
+```
+
+The WebView moved the page once; it was put back in the same moment (it never showed in the 100 ms samples) and the WebView didn't fight it. Instagram's model player kept B as its video, so A never played. This is the core of fix step 1, now confirmed on a real WebView.
+
+## Reproducing it
+
+The emulator image's WebView is 74. To run the probe on a current one:
+
+1. Download `SystemWebView.apk` (x86_64, package `com.android.webview`) from Chromium's `AndroidDesktop_x64` snapshots. It sits inside `chrome-android-desktop.zip`; a range request fetches just that entry.
+2. Boot `sg29` normally. Then: `adb root`, push the APK to `/data/local/tmp/wv/webview.apk`, `setenforce 0`, `chcon -R u:object_r:system_file:s0 /data/local/tmp/wv`, `mount -o bind /data/local/tmp/wv /system/product/app/webview`, then `stop; start`. `dumpsys webviewupdate` should then show 158. The mount lasts until the emulator stops.
+3. Don't use `-writable-system` with `adb disable-verity`: the emulator stopped booting, and only deleting the AVD's `*.qcow2` overlays brought it back.
+4. `adb shell am instrument -w -r -e probe 1 -e class com.cam.simplegram.B28Probe#box com.cam.simplegram.test/androidx.test.runner.AndroidJUnitRunner`. Screenshots are in `/sdcard/Android/data/com.cam.simplegram/files/b28/`.
