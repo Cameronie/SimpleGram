@@ -23,6 +23,7 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 
+import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -1762,7 +1763,7 @@ public class ShellTest {
      */
     @Test
     public void stuckLogoGetsOneReloadThenTheChip() throws Exception {
-        long watchWas = MainActivity.bootWatchMs;
+        long watchWas = MainActivity.bootWatchMs, followWas = MainActivity.bootReloadFollowMs;
         NetWatch.testNetOk = true;             // the ladder, not the emulator's connectivity, is under test
         try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
             AtomicReference<MainActivity> act = new AtomicReference<>();
@@ -1772,6 +1773,8 @@ public class ShellTest {
             prefs.edit().remove("autoReloads").remove("reloadLog").remove("bootLog").remove("lastStuck").apply();
             SystemClock.sleep(1000);           // the launch's own load settles (or is cancelled) first
             MainActivity.bootWatchMs = 1500;
+            // The reload's fallback (loadUrl of the address) would fetch from Instagram: never from a test.
+            MainActivity.bootReloadFollowMs = 60_000;
             localPage(s, STUCK_BASE, STUCK_PAGE, "www.instagram.com");
             // One reload by itself, recorded before it runs...
             assertTrue("a reload by itself", waitFor(() -> ringOf(prefs, "reloadLog").length() >= 1, 8000));
@@ -1786,7 +1789,7 @@ public class ShellTest {
             JSONArray reloads = ringOf(prefs, "reloadLog");
             for (int i = 0; i < reloads.length(); i++) {
                 String what = reloads.getJSONObject(i).getString("what");
-                assertFalse(what, what.startsWith("loadUrl"));            // the reload did start a page
+                assertFalse(what, what.startsWith("loadUrl"));            // the fallback stayed off
                 assertFalse(what, what.startsWith("reload ") && i > 0);   // only one by itself
             }
             JSONArray log = ringOf(prefs, "bootLog");
@@ -1799,7 +1802,128 @@ public class ShellTest {
             assertFalse("no address in what is kept", prefs.getString("bootLog", "").contains("b33test"));
         } finally {
             MainActivity.bootWatchMs = watchWas;
+            MainActivity.bootReloadFollowMs = followWas;
             NetWatch.testNetOk = null;
+        }
+    }
+
+    /**
+     * B33: the page's boot messages carry its own token. The watch adopts the
+     * token from the first message that can be this page's; a "booted" that took
+     * longer than the page has existed is an old document's and is left aside,
+     * as is any message with another token. A stuck report with the page's token
+     * is acted on (the one reload), and its record is kept.
+     */
+    @Test
+    public void bootMessagesAreTakenOnlyFromTheirOwnPage() throws Exception {
+        long watchWas = MainActivity.bootWatchMs, followWas = MainActivity.bootReloadFollowMs;
+        NetWatch.testNetOk = true;
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            SharedPreferences prefs = act.get().getSharedPreferences("simplegram", Context.MODE_PRIVATE);
+            prefs.edit().remove("autoReloads").remove("reloadLog").remove("lastStuck").apply();
+            SystemClock.sleep(1000);
+            MainActivity.bootWatchMs = 60_000;            // the page's word, not the app's cap, is under test
+            MainActivity.bootReloadFollowMs = 60_000;     // the reload's fallback would fetch from Instagram
+            localPage(s, STUCK_BASE, STUCK_PAGE, "www.instagram.com");
+            SystemClock.sleep(1200);                      // a record within the first second is an old page's
+            assertNotNull("a watch on the page", fieldOf(s, "watch"));
+            int late = (Integer) fieldOf(s, "bootLate");
+            // An old document's "booted", still on its way: it took longer than this page has existed.
+            message(s, new JSONObject().put("action", "boot").put("token", "old").put("ms", 600_000).toString());
+            idle();
+            assertEquals(late + 1, (int) (Integer) fieldOf(s, "bootLate"));
+            assertEquals(false, watchField(s, "booted"));
+            // The page's own first message names its token...
+            message(s, new JSONObject().put("action", "bootRecord").put("token", "A")
+                    .put("record", new JSONObject().put("rule", "none").put("logo", true)).toString());
+            idle();
+            assertEquals("A", watchField(s, "pageToken"));
+            // ...so a "booted" with another token isn't this page's.
+            message(s, new JSONObject().put("action", "boot").put("token", "B").put("ms", 50).toString());
+            idle();
+            assertEquals(late + 2, (int) (Integer) fieldOf(s, "bootLate"));
+            assertEquals(false, watchField(s, "booted"));
+            assertNotNull("still watched", fieldOf(s, "watch"));
+            // Its own stuck report is acted on: kept with the page's record, then the one reload.
+            message(s, new JSONObject().put("action", "bootStuck").put("token", "A").put("rule", "a")
+                    .put("record", new JSONObject().put("rule", "a").put("logo", true)
+                            .put("scripts", new JSONObject().put("count", 6).put("errored", 1))).toString());
+            assertTrue("a reload by itself", waitFor(() -> ringOf(prefs, "reloadLog").length() >= 1, 5000));
+            assertEquals("reload page a", ringOf(prefs, "reloadLog").getJSONObject(0).getString("what"));
+            JSONObject stuck = new JSONObject(prefs.getString("lastStuck", "{}"));
+            assertEquals("page", stuck.getString("from"));
+            assertEquals("a", stuck.getString("rule"));
+            assertEquals(1, stuck.getJSONObject("record").getJSONObject("scripts").getInt("errored"));
+            assertFalse(stuck.toString(), stuck.toString().contains("b33test"));
+        } finally {
+            MainActivity.bootWatchMs = watchWas;
+            MainActivity.bootReloadFollowMs = followWas;
+            NetWatch.testNetOk = null;
+        }
+    }
+
+    /**
+     * B33: a page that hasn't booted when the app leaves the screen is marked
+     * hurt (its files may have failed or stalled while Android had the network
+     * blocked). Back on screen, once the network is usable and a second has
+     * passed, the page is asked whether the logo is still up; it is, so it gets
+     * the one automatic reload, through the budget, and the record says why.
+     */
+    @Test
+    public void hurtPageIsCheckedAndReloadedOnResume() throws Exception {
+        long watchWas = MainActivity.bootWatchMs, followWas = MainActivity.bootReloadFollowMs;
+        long minShownWas = MainActivity.bootResumeMinShownMs;
+        NetWatch.testNetOk = true;
+        try (ActivityScenario<MainActivity> s = ActivityScenario.launch(MainActivity.class)) {
+            AtomicReference<MainActivity> act = new AtomicReference<>();
+            s.onActivity(act::set);
+            SharedPreferences prefs = act.get().getSharedPreferences("simplegram", Context.MODE_PRIVATE);
+            prefs.edit().remove("autoReloads").remove("reloadLog").remove("bootLog").remove("lastStuck").apply();
+            SystemClock.sleep(1000);
+            MainActivity.bootWatchMs = 60_000;            // the resume check, not the cap, is under test
+            MainActivity.bootReloadFollowMs = 60_000;     // the reload's fallback would fetch from Instagram
+            MainActivity.bootResumeMinShownMs = 0;        // the page has had its stretch on screen
+            localPage(s, STUCK_BASE, STUCK_PAGE, "www.instagram.com");
+            assertEquals(false, watchField(s, "hurt"));
+            // Away and back: the page was still on the logo when the app left the screen.
+            s.moveToState(Lifecycle.State.STARTED);
+            idle();
+            assertEquals(true, watchField(s, "hurt"));
+            assertTrue(String.valueOf(watchField(s, "hurtWhy")), String.valueOf(watchField(s, "hurtWhy")).startsWith("pause"));
+            s.moveToState(Lifecycle.State.RESUMED);
+            assertTrue("one reload on resume", waitFor(() -> ringOf(prefs, "reloadLog").length() >= 1, 10000));
+            JSONObject reload = ringOf(prefs, "reloadLog").getJSONObject(0);
+            assertEquals("reload resume logo", reload.getString("what"));
+            JSONObject stuck = new JSONObject(prefs.getString("lastStuck", "{}"));
+            assertEquals("resume", stuck.getString("from"));
+            assertEquals("logo", stuck.getString("rule"));
+            assertTrue(stuck.getJSONObject("probe").getBoolean("logo"));
+            assertTrue(stuck.getString("hurt").startsWith("pause"));
+            // The page start's own entry says it was hurt, and why.
+            JSONArray log = ringOf(prefs, "bootLog");
+            boolean hurtLogged = false;
+            for (int i = 0; i < log.length(); i++) hurtLogged |= log.getJSONObject(i).optString("hurt").startsWith("pause");
+            assertTrue(log.toString(), hurtLogged);
+        } finally {
+            MainActivity.bootWatchMs = watchWas;
+            MainActivity.bootReloadFollowMs = followWas;
+            MainActivity.bootResumeMinShownMs = minShownWas;
+            NetWatch.testNetOk = null;
+        }
+    }
+
+    /** A field of the page start being watched (B33), or null when nothing is watched. */
+    private static Object watchField(ActivityScenario<MainActivity> s, String name) {
+        Object w = fieldOf(s, "watch");
+        if (w == null) return null;
+        try {
+            Field f = w.getClass().getDeclaredField(name);
+            f.setAccessible(true);
+            return f.get(w);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
