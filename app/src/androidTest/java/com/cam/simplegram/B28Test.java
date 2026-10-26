@@ -260,17 +260,27 @@ public class B28Test {
      * to do with what is under test.
      */
     void send(long down, int action, float x, float y) {
+        send(down, action, x, y, true);
+    }
+
+    /**
+     * sync=false queues the event without waiting for the app to finish with it:
+     * a tap's UP must reach the web engine before its long-press timer (real
+     * time) runs out, and on the loaded emulator a synchronous DOWN alone can
+     * take over a second to come back.
+     */
+    void send(long down, int action, float x, float y, boolean sync) {
         MotionEvent e = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, x, y, 0);
         e.setSource(InputDevice.SOURCE_TOUCHSCREEN);
-        if (!inst.getUiAutomation().injectInputEvent(e, true)) inst.sendPointerSync(e);
+        if (!inst.getUiAutomation().injectInputEvent(e, sync)) inst.sendPointerSync(e);
         e.recycle();
     }
 
     void tapAt(float x, float y) {
         long d = SystemClock.uptimeMillis();
-        send(d, MotionEvent.ACTION_DOWN, x, y);
+        send(d, MotionEvent.ACTION_DOWN, x, y, false);
         SystemClock.sleep(40);
-        send(d, MotionEvent.ACTION_UP, x, y);
+        send(d, MotionEvent.ACTION_UP, x, y, false);
     }
 
     /** B's playback machinery: clock, seeking, readiness, frames decoded/dropped, the fixture's last samples. */
