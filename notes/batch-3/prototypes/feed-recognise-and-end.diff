@@ -1,0 +1,90 @@
+--- a/simplegram.js
++++ b/simplegram.js
+@@ -264,17 +264,20 @@
+   }
+   function recommendedLike(node, m) {
+     const src = m.inventory_source || node.inventory_source;
+-    if (typeof src === 'string' && /recommend|explore|suggest|chaining|netego/i.test(src)) return true;
++    if (typeof src === 'string' && /recommend|explore|suggest|chaining|netego|unconnected/i.test(src)) return true;
+     if (m.is_suggested === true || m.is_recommended === true || node.is_suggested === true) return true;
+     return contextText([node, m], /^\s*suggested (for you|posts?|reels?)\s*$/i);
+   }
++  const UNIT_KEYS = ['media', 'media_or_ad', 'explore_story', 'ad', 'suggested_users', 'suggested_users_v2',
++    'end_of_feed_demarcator', 'stories_netego', 'bloks_netego', 'ad4ad_in_webfeed', 'abra_icebreakers_in_feed_unit'];
+   function feedVerdict(node) {
+-    const v = { drop: false, reason: '', media: false };
++    const v = { drop: false, reason: '', media: false, known: false };
+     const drop = r => { v.drop = true; v.reason = r; return v; };
+     if (!node || typeof node !== 'object') return v;
+-    if (adLike(node)) return drop('ad');
++    v.known = UNIT_KEYS.some(k => node[k] != null);
++    if (adLike(node)) { v.known = true; return drop('ad'); }
+     const m = mediaOf(node);
+-    if (m) v.media = true;
++    if (m) { v.media = true; v.known = true; }
+     if (node.explore_story || node.suggested_users || node.suggested_users_v2) return drop('suggested');
+     if (!m) {
+       if (node.end_of_feed_demarcator) return v;
+@@ -346,13 +349,41 @@
+     stats.feed.pages++;
+     if (streamed) { stats.feed.streamed++; return; }
+     const verdicts = list.map(e => feedVerdict(e && e.node ? e.node : e));
+-    if (list.length && !verdicts.some(x => x.media)) {
++    const onHome0 = route() === 'home' && feedVariant() === 'home';
++    const nodeAt = i => list[i] && (list[i].node || list[i]);
++    const eof = onHome0 ? list.findIndex((e, i) => { const n = nodeAt(i); return n && n.end_of_feed_demarcator; }) : -1;
++    const recsPage = onHome0 && !!(owner.page_info || owner.pageInfo) && typeof owner.pagination_source === 'string' && /recs/i.test(owner.pagination_source);
++    if (eof >= 0 || recsPage) {
++      const fs0 = currentFeed();
++      if (eof >= 0) {
++        const d = nodeAt(eof).end_of_feed_demarcator;
++        const gs = d && d.group_set;
++        if (gs && Array.isArray(gs.groups)) {
++          for (const g of gs.groups) {
++            if (!g || typeof g !== 'object') continue;
++            if (Array.isArray(g.feed_items)) { stats.feed.afterEnd = (stats.feed.afterEnd || 0) + g.feed_items.length; g.feed_items.length = 0; }
++            if ('next_max_id' in g) g.next_max_id = null;
++          }
++        }
++        stats.feed.eof = (stats.feed.eof || 0) + 1;
++      }
++      if (recsPage) stats.feed.recsPages = (stats.feed.recsPages || 0) + 1;
++      verdicts.forEach((x, i) => {
++        if ((eof >= 0 && i > eof) || (recsPage && i !== eof && !x.drop && !(x.media && followState(mediaOf(nodeAt(i))) === true))) {
++          x.drop = true; x.reason = 'afterEnd'; x.known = true;
++        }
++      });
++      if (eof >= 0) verdicts[eof].known = true;
++      stopPagination(owner);
++      fs0.ended = true; fs0.caughtUp = true;
++    }
++    if (list.length && !verdicts.some(x => x.known)) {
+       // Nothing recognisable: Instagram probably changed its format. Fail open.
+       stats.feed.unknownPages++;
+       return;
+     }
+     const media = verdicts.filter(x => x.media);
+-    if (stats.feed.kept === 0 && media.length >= 3 && media.every(x => x.reason === 'notFollowed')) {
++    if (stats.feed.kept === 0 && media.length >= 3 && media.every(x => x.reason === 'notFollowed') && !recsPage) {
+       stats.feed.followSuspect = (stats.feed.followSuspect || 0) + 1;
+       for (const x of media) { x.drop = false; x.reason = ''; }
+     }
+@@ -394,7 +425,8 @@
+       // Only a post or two came through: ask for the next batch early.
+       if (keptMedia <= 2 && more) scheduleNudge(false);
+     }
+-    if (!more) fs.ended = true;
++    const pages = !!(owner.page_info || owner.pageInfo) || ['more_available', 'has_more', 'moreAvailable', 'hasMore'].some(k => k in owner);
++    if (!more && pages) fs.ended = true;
+     setTimeout(safe(checkFeedEnd), 300);
+   }
+   function edgeCode(e) {
+@@ -582,7 +614,7 @@
+     let show = false;
+     const fs = currentFeed();
+     const searching = typeof search !== 'undefined' && search.open;
+-    if (route() === 'home' && feedVariant() === 'home' && fs.homePages > 0 && !searching) {
++    if (route() === 'home' && feedVariant() === 'home' && (fs.homePages > 0 || fs.caughtUp) && !searching) {
+       const se = document.scrollingElement || document.documentElement;
+       const nearBottom = se.scrollHeight - (se.scrollTop + innerHeight) < Math.max(400, innerHeight * 0.6);
+       if (nearBottom) { if (!atBottomSince) atBottomSince = Date.now(); } else atBottomSince = 0;

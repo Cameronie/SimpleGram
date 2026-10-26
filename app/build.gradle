@@ -1,0 +1,68 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.cam.simplegram'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'com.cam.simplegram'
+        minSdk 29
+        targetSdk 35
+        versionCode 6
+        versionName '1.5'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+
+    // The release key stays out of git (see README). With it, every build
+    // installs as an update over the last one, keeping the Instagram login.
+    def keyProps = new Properties()
+    def keyFile = rootProject.file('signing/keystore.properties')
+    if (keyFile.exists()) keyFile.withInputStream { keyProps.load(it) }
+
+    signingConfigs {
+        if (keyProps['storeFile']) {
+            simplegram {
+                storeFile rootProject.file(keyProps['storeFile'])
+                storePassword keyProps['storePassword']
+                keyAlias keyProps['keyAlias']
+                keyPassword keyProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // Without the key the release APK is left unsigned (it won't install),
+            // never quietly signed with the public debug key.
+            if (keyProps['storeFile']) signingConfig signingConfigs.simplegram
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.12.1'
+
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test:core:1.6.1'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}

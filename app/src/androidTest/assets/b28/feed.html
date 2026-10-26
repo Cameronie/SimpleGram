@@ -1,0 +1,102 @@
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;background:#000;color:#fff;font:14px sans-serif}
+#top{position:fixed;top:0;left:0;right:0;height:56px;background:#111;z-index:2}
+#bar{position:fixed;bottom:0;left:0;right:0;height:50px;background:#111;z-index:2}
+main{padding:56px 0 50px}
+article header{height:56px;line-height:56px;padding-left:12px}
+.box{position:relative;width:100vw;height:125vw;background:#000;overflow:hidden}
+.box video{width:100%;height:100%;display:block}
+.tap{position:absolute;inset:0}
+.cap{height:160px;padding:8px 12px}
+</style></head><body>
+<div id="top">Instagram</div>
+<div id="mount"><main>
+<article data-id="A"><header><a href="/friend_a/">friend_a</a></header>
+<div class="box" data-id="A"><div style="position:absolute;inset:0"><video id="A" src="%A%" muted playsinline loop preload="auto"></video></div><div class="tap" role="presentation"></div></div>
+<section class="cap">A: the previous video (red band)</section></article>
+<article data-id="B"><header><a href="/friend_b/">friend_b</a></header>
+<div class="box" data-id="B"><div style="position:absolute;inset:0"><video id="B" src="%B%" muted playsinline loop preload="auto"></video></div><div class="tap" role="presentation"></div></div>
+<section class="cap">B: the one tapped (green band)</section></article>
+<article data-id="C"><header><a href="/friend_c/">friend_c</a></header>
+<div class="box" data-id="C"><div style="position:absolute;inset:0"><video id="C" src="%C%" muted playsinline loop preload="auto"></video></div><div class="tap" role="presentation"></div></div>
+<section class="cap">C: the next video (blue band)</section></article>
+<div style="height:3000px">more posts</div>
+</main></div>
+<div id="bar">home · search · dm · me</div>
+<script>
+// An Instagram-like feed player (a model: Instagram's own code isn't available).
+// The clips are video-only: with an audio track the emulator (no hardware
+// acceleration, no audio device) cannot keep the media clock running, so a
+// playing video's time hardly moves and a seek never completes. Sound here is
+// the muted flag, which is all the page script sets.
+// One video plays at a time: the post most on screen (at least half), with the
+// feed-wide sound setting. A single tap on a video (300 ms after its click, when
+// no second click followed) toggles that sound setting; a double tap likes.
+// MODE: 'box' watches the media boxes, 'video' watches the video elements,
+// 'none' leaves the videos alone (all play muted, as autoplay does).
+(function () {
+  const MODE = '%MODE%';
+  const IG = window.__ig = { mode: MODE, sound: false, active: null, changes: [], ratios: {}, singles: 0, likes: 0, plays: {}, pauses: {} };
+  const ids = ['A', 'B', 'C'];
+  const vid = id => document.getElementById(id);
+  ids.forEach(id => {
+    const v = vid(id);
+    IG.plays[id] = 0; IG.pauses[id] = 0;
+    v.addEventListener('play', () => IG.plays[id]++);
+    v.addEventListener('pause', () => IG.pauses[id]++);
+  });
+  function choose(why) {
+    let best = null, r = 0.5 - 1e-6;
+    for (const id of ids) { const x = IG.ratios[id] || 0; if (x > r) { r = x; best = id; } }
+    if (best === IG.active) return;
+    const prev = IG.active;
+    IG.active = best;
+    IG.changes.push([Math.round(performance.now()), why, prev, best, JSON.stringify(IG.ratios), Math.round(scrollY), innerHeight]);
+    ids.forEach(id => { if (id !== best && !vid(id).paused) vid(id).pause(); });
+    if (best) { const v = vid(best); v.muted = !IG.sound; const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+  }
+  IG.choose = choose;
+  IG.setSound = on => { IG.sound = on; if (IG.active) vid(IG.active).muted = !on; };
+  if (MODE === 'none') {
+    ids.forEach(id => { const p = vid(id).play(); if (p && p.catch) p.catch(() => {}); });
+  } else {
+    const io = new IntersectionObserver(es => {
+      for (const e of es) IG.ratios[e.target.dataset.id || e.target.id] = Math.round(e.intersectionRatio * 100) / 100;
+      choose('io');
+    }, { threshold: [0, 0.25, 0.5, 0.75, 1] });
+    ids.forEach(id => io.observe(MODE === 'video' ? vid(id) : document.querySelector('.box[data-id="' + id + '"]')));
+  }
+  // The tap layer, its handler on the app root like React's.
+  let timer = null, lastClick = 0;
+  document.getElementById('mount').addEventListener('click', e => {
+    const l = e.target.closest && e.target.closest('.tap');
+    if (!l) return;
+    const now = performance.now();
+    if (timer && now - lastClick < 300) { clearTimeout(timer); timer = null; IG.likes++; return; }
+    lastClick = now;
+    timer = setTimeout(() => { timer = null; IG.singles++; IG.setSound(!IG.sound); }, 300);
+  });
+  // A timeline sampled every 100 ms.
+  const T = window.__t = [];
+  const st = id => { const v = vid(id); return (v.paused ? 'P' : '>') + (v.muted ? 'm' : 'S') + v.currentTime.toFixed(1); };
+  setInterval(() => {
+    const fs = document.fullscreenElement;
+    const b = vid('B');
+    let pop = false;
+    try { pop = b.matches(':popover-open'); } catch (e) { pop = 'n/a'; }
+    T.push([Math.round(performance.now()), Math.round(scrollY), innerWidth + 'x' + innerHeight,
+      fs ? (fs === document.documentElement ? 'html' : fs.tagName + '#' + fs.id) : '-', pop ? 'lift' : '-',
+      IG.active || '-', st('A'), st('B'), st('C'),
+      ids.map(id => { const r = document.querySelector('.box[data-id="' + id + '"]').getBoundingClientRect(); return Math.round(r.top); }).join('/')].join(' '));
+    if (T.length > 600) T.shift();
+  }, 100);
+  // Raw touches at the window, for the test's log: did the finger reach the page at all?
+  const R = window.__raw = { ts: 0, te: 0, click: 0, tsAt: 0 };
+  window.addEventListener('touchstart', () => { R.ts++; R.tsAt = Math.round(performance.now()); }, { capture: true, passive: true });
+  window.addEventListener('touchend', () => { R.te++; }, { capture: true, passive: true });
+  window.addEventListener('click', () => { R.click++; }, true);
+  window.b28ready = 1;
+})();
+</script></body></html>

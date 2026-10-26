@@ -1,0 +1,188 @@
+--- a/simplegram.js
++++ b/simplegram.js
+@@ -537,6 +537,39 @@
+     }
+   }
+ 
++  // PROTO: learn Instagram's own GraphQL requests (friendly name -> doc_id, path, provider vars).
++  const learned = {};
++  try { Object.assign(learned, nativeParse(localStorage.getItem('sg_learned_ops') || '{}')); } catch (e) { /* ignore */ }
++  function learnRequest(url, body) {
++    try {
++      if (typeof body !== 'string' || body.indexOf('fb_api_req_friendly_name=') < 0 || body.indexOf('doc_id=') < 0) return;
++      const p = new URL(url, location.href).pathname;
++      if (p !== '/api/graphql' && p !== '/graphql/query' && p !== '/api/graphql/') return;
++      const f = new URLSearchParams(body);
++      const name = f.get('fb_api_req_friendly_name'), id = f.get('doc_id');
++      if (!name || !/^\d+$/.test(id || '') || SG.ownRequest) return;
++      let v = {};
++      try { v = nativeParse(f.get('variables') || '{}'); } catch (e) { /* ignore */ }
++      const pv = {};
++      for (const k in v) if (/^__relay_internal__pv__/.test(k)) pv[k] = v[k];
++      learned[name] = { id: id, path: p, pv: pv, keys: Object.keys(v).filter(k => !/^__relay_internal__pv__/.test(k)), at: Date.now() };
++      try { localStorage.setItem('sg_learned_ops', JSON.stringify(learned)); } catch (e) { /* ignore */ }
++    } catch (e) { /* never break Instagram */ }
++  }
++  SG.learned = learned;
++  if (window.XMLHttpRequest) {
++    const nOpen = XMLHttpRequest.prototype.open, nSend = XMLHttpRequest.prototype.send;
++    XMLHttpRequest.prototype.open = function (m, u) { this.__sgUrl = u; return nOpen.apply(this, arguments); };
++    XMLHttpRequest.prototype.send = function (b) { learnRequest(this.__sgUrl, b); return nSend.apply(this, arguments); };
++  }
++  if (window.fetch) {
++    const nFetch = window.fetch;
++    window.fetch = function (input, init) {
++      try { learnRequest(typeof input === 'string' ? input : input && input.url, init && init.body); } catch (e) { /* ignore */ }
++      return nFetch.apply(this, arguments);
++    };
++  }
++
+   // Instagram loads the next batch when the end of the list comes into
+   // view. When a batch adds little or nothing, the end never "arrives", so
+   // give Instagram a scroll signal. `hard` also handles a page too short to scroll.
+@@ -1267,10 +1300,33 @@
+     PolarisSearchBoxRefetchableQuery: '27706427925724183',
+     PolarisKeywordSearchExplorePageRelayQuery: '37324993597144881',
+     PolarisKeywordSearchExplorePageRelayPaginationQuery: '28656899673911396',
+-    PolarisLocationPageTabContentQuery: '28211016731901625',
++    PolarisLocationPageTabContentQuery: '28586113187724473',
++    PolarisLocationPageTabContentQuery_connection: '29002281179411948',
++    PolarisExploreLocationsContainerQuery: '28572807415659320',
++    PolarisAPITopsearchQuery: '29386906664232128',
++  };
++  // Provided variables ("__relay_internal__pv__<X>relayprovider") each query declares (bundle b385/b417, Oct 2026).
++  const KNOWN_PV = {
++    PolarisLocationPageTabContentQuery: ['PolarisShortDramaEnabled', 'PolarisSEOIsCrawler'],
++    PolarisLocationPageTabContentQuery_connection: ['PolarisShortDramaEnabled', 'PolarisSEOIsCrawler'],
+   };
++  function providedVars(name) {
++    const out = {};
++    for (const p of KNOWN_PV[name] || []) out['__relay_internal__pv__' + p + 'relayprovider'] = false;
++    const gql = igModule(name + '.graphql');
++    const pvs = gql && gql.params && gql.params.providedVariables;
++    if (pvs) for (const k in pvs) {
++      let v = false;
++      try { const m = pvs[k]; const g = m && (m.get || (m.default && m.default.get)); if (g) v = !!g.call(m.default || m); } catch (e) { /* false */ }
++      out[k] = v;
++    }
++    const l = learned[name];
++    if (l && l.pv) Object.assign(out, l.pv);
++    return out;
++  }
+   let scannedBundles = null;
+   async function docIdFor(name) {
++    if (learned[name] && learned[name].id) return learned[name].id;
+     if (docIds[name]) return docIds[name];
+     const op = igModule(name + '_instagramRelayOperation');
+     if (typeof op === 'string' && /^\d+$/.test(op)) return (docIds[name] = op);
+@@ -1312,9 +1368,11 @@
+     return '';
+   }
+   // Returns data[root] (the answer's main object), or null.
+-  async function igGraphQL(name, variables, root) {
++  SG.gqlLog = [];
++  async function igGraphQL(name, variables, root, retried) {
+     const id = await docIdFor(name);
+     if (!id) return null;
++    variables = Object.assign(providedVars(name), variables);
+     const lsd = await pageToken('LSD', /"LSD",\[\],\{"token":"([^"]+)"/);
+     const body = new URLSearchParams({
+       doc_id: id, variables: JSON.stringify(variables),
+@@ -1324,7 +1382,8 @@
+     // The website uses /api/graphql; some requests only answer on /graphql/query.
+     for (const path of ['/api/graphql', '/graphql/query']) {
+       try {
+-        const res = await fetch(path, {
++        SG.ownRequest = true;
++        const pending = fetch(path, {
+           method: 'POST', credentials: 'include',
+           headers: {
+             'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': csrf(), 'X-IG-App-ID': '936619743392459',
+@@ -1332,11 +1391,21 @@
+           },
+           body: body,
+         });
+-        if (!res.ok) continue;
+-        const data = parseIg(await res.text());
++        SG.ownRequest = false;
++        const res = await pending;
++        if (!res.ok) { SG.gqlLog.push({ name, id, path, status: res.status }); continue; }
++        const text = await res.text();
++        const data = parseIg(text);
+         if (data && typeof data === 'object') ownCleanse(data);
+         const out = data && data.data && data.data[root];
+         if (out) return out;
++        const err = data && Array.isArray(data.errors) && data.errors[0];
++        SG.gqlLog.push({ name, id, path, status: res.status, error: err ? String(err.message || err.code).slice(0, 200) : 'no ' + root });
++        const missing = (text.match(/__relay_internal__pv__\w+?relayprovider/g) || []).filter(k => !(k in variables));
++        if (missing.length && !retried) {
++          for (const k of missing) variables[k] = false;
++          return igGraphQL(name, variables, root, true);
++        }
+       } catch (e) { /* try the other path */ }
+     }
+     return null;
+@@ -1710,6 +1779,17 @@
+     let list = [];
+     if (tab === 'accounts') list = blended ? users(blended.users) : [];
+     if (tab === 'tags') {
++      const typed = q.replace(/^#+/, '').replace(/\s+/g, '').toLowerCase();
++      const own = await cached(c, 'tagsGql', () => igGraphQL('PolarisAPITopsearchQuery', {
++        data: { context: 'hashtag', include_reel: 'true', query: typed, rank_token: '', search_session_id: uuid(), search_surface: 'web_top_search' },
++      }, 'xdt_api__v1__fbsearch__topsearch_connection'));
++      const found = own ? hashtags(own.hashtags) : [];
++      if (stale()) return null;
++      const out = typed ? [{ name: typed, media_count: null }] : [];
++      for (const h of found) if (h.name.toLowerCase() !== typed) out.push(h); else out[0] = h;
++      return { list: out };
++    }
++    if (tab === 'tags_old') {
+       list = blended ? hashtags(blended.hashtags) : [];
+       if (!list.length && !stale()) {
+         const r = await cached(c, 'tags', () => igGet('/web/search/topsearch/?context=hashtag&query=' + enc(q.replace(/^#/, ''))));
+@@ -1811,32 +1891,20 @@
+   }
+   async function loadPlace(view, cursor) {
+     const tab = view.sub === 'recent' ? 'recent' : 'ranked';
+-    if (cursor) {
+-      const part = await igPost('/api/v1/locations/' + encodeURIComponent(view.id) + '/sections/', sectionsForm(tab, cursor));
+-      return part ? { media: collectMedia(part.sections || []), more: moreState(part) } : null;
+-    }
+-    const data = await igGet('/api/v1/locations/web_info/?location_id=' + encodeURIComponent(view.id) + '&show_nearby=false');
+-    const body = data && (data.native_location_data || data);
+-    if (body && body.location_info) {
+-      const li = body.location_info;
+-      view.name = li.name || view.name;
+-      view.address = [li.location_address, li.location_city].filter(Boolean).join(', ') || view.address || '';
+-      if (li.slug) view.slug = li.slug;
+-    }
+-    const part = body && body[tab];
+-    const media = part ? collectMedia(part.sections || []) : [];
+-    if (media.length) return { media: media, more: moreState(part) };
+-    // The website's current request for a place's grid.
+-    const c = await igGraphQL('PolarisLocationPageTabContentQuery', {
+-      location_id: String(view.id), first: 24, after: null, tab: tab, page_size_override: null,
+-      __relay_internal__pv__PolarisShortDramaEnabledrelayprovider: false,
+-    }, 'xdt_location_get_web_info_tab');
+-    if (c) {
+-      const gm = collectMedia((c.edges || []).map(e => e && e.node));
+-      if (gm.length) return { media: gm, more: null };
++    const vars = { after: cursor ? cursor.after : null, first: 12, location_id: String(view.id), page_size_override: null, tab: tab };
++    if (!cursor && !view.headerTried) {
++      view.headerTried = true;
++      igGraphQL('PolarisExploreLocationsContainerQuery', { location_id_str: String(view.id), show_nearby: false }, 'xdt_location_get_web_info').then(h => {
++        const li = h && h.native_location_data && h.native_location_data.location_info;
++        if (li) { view.name = li.name || view.name; view.address = [li.location_address, li.location_city].filter(Boolean).join(', ') || view.address; if (li.slug) view.slug = li.slug; render(); }
++      });
+     }
+-    if (part || c) return { media: [], more: null, noRecent: tab === 'recent' };
+-    return null;
++    const c = await igGraphQL(cursor ? 'PolarisLocationPageTabContentQuery_connection' : 'PolarisLocationPageTabContentQuery', vars, 'xdt_location_get_web_info_tab');
++    if (!c) return null;
++    const media = collectMedia((c.edges || []).map(e => e && e.node));
++    const pi = c.page_info || {};
++    const stuck = cursor && (pi.end_cursor === cursor.after);
++    return { media: media, more: pi.has_next_page && pi.end_cursor && !stuck ? { after: pi.end_cursor } : null, noRecent: !media.length && tab === 'recent' };
+   }
+   async function loadTagOrPlace(view, cursor) {
+     return view.kind === 'tag' ? loadTag(view, cursor) : loadPlace(view, cursor);
